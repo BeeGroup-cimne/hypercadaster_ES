@@ -9,9 +9,9 @@ def make_valid(gdf):
     return gdf
 
 
-def get_address_street_name(inspire_dir):
-    address_gdf = gpd.read_file(f"{inspire_dir}/address/unzip/A.ES.SDGC.AD.08900.gml", layer="Address")
-    address_street_names_df = gpd.read_file(f"{inspire_dir}/address/unzip/A.ES.SDGC.AD.08900.gml",
+def get_address_street_name(inspire_dir, code):
+    address_gdf = gpd.read_file(f"{inspire_dir}/address/unzip/A.ES.SDGC.AD.{code}.gml", layer="Address")
+    address_street_names_df = gpd.read_file(f"{inspire_dir}/address/unzip/A.ES.SDGC.AD.{code}.gml",
                                             layer="ThoroughfareName")
     address_street_names_df = address_street_names_df[['gml_id', 'text']]
     address_street_names_df["gml_id"] = address_street_names_df['gml_id'].apply(lambda x: x.split('ES.SDGC.TN.')[1])
@@ -22,8 +22,8 @@ def get_address_street_name(inspire_dir):
     return merge_df
 
 
-def merge_building(address_with_street_names_gdf, inspire_dir):
-    building_gdf = gpd.read_file(f"{inspire_dir}/buildings/unzip/A.ES.SDGC.BU.08900.building.gml", layer="Building")
+def merge_building(address_with_street_names_gdf, inspire_dir, code):
+    building_gdf = gpd.read_file(f"{inspire_dir}/buildings/unzip/A.ES.SDGC.BU.{code}.building.gml", layer="Building")
     address_with_street_names_gdf["cat_ref"] = address_with_street_names_gdf['localId'].apply(
         lambda x: x.split('.')[-1])
     building_gdf.drop(
@@ -33,12 +33,12 @@ def merge_building(address_with_street_names_gdf, inspire_dir):
 
 
 # def merge_parcel(address_building_gdf, inspire_dir):
-#     parcel_gdf = gpd.read_file(f"{inspire_dir}/parcels/unzip/A.ES.SDGC.CP.08900.cadastralparcel.gml", layer="CadastralParcel")
+#     parcel_gdf = gpd.read_file(f"{inspire_dir}/parcels/unzip/A.ES.SDGC.CP.{code}.cadastralparcel.gml", layer="CadastralParcel")
 #     parcel_gdf.drop(["endLifespanVersion", "beginLifespanVersion", "pos", "geometry"], inplace=True, axis=1)
 #     return pd.merge(address_building_gdf, parcel_gdf, left_on="cat_ref", right_on="nationalCadastralReference", how="left")
 
-def merge_zone(address_building_gdf, inspire_dir):
-    zone_gdf = gpd.read_file(f"{inspire_dir}/parcels/unzip/A.ES.SDGC.CP.08900.cadastralzoning.gml",
+def merge_zone(address_building_gdf, inspire_dir, code):
+    zone_gdf = gpd.read_file(f"{inspire_dir}/parcels/unzip/A.ES.SDGC.CP.{code}.cadastralzoning.gml",
                              layer="CadastralZoning")
     zone_gdf.drop(["label", "beginLifespanVersion", "pos", "geometry", "endLifespanVersion"], inplace=True, axis=1)
     zone_gdf.loc[zone_gdf["LocalisedCharacterString"] == "MANZANA ", "gml_id"] = zone_gdf['gml_id'].apply(
@@ -49,15 +49,15 @@ def merge_zone(address_building_gdf, inspire_dir):
                     right_on="nationalCadastalZoningReference", how="left")
 
 
-def merge_inspire_data(inspire_dir="data/inspire"):
+def merge_inspire_data(inspire_dir="data/inspire", code=''):
     # Address
-    address_with_street_names_gdf = get_address_street_name(inspire_dir)
+    address_with_street_names_gdf = get_address_street_name(inspire_dir=inspire_dir, code=code)
     # Buildings
-    address_building_gdf = merge_building(address_with_street_names_gdf, inspire_dir)
+    address_building_gdf = merge_building(address_with_street_names_gdf=address_with_street_names_gdf, inspire_dir=inspire_dir, code=code)
     # Parcels
     # address_building_parcel_gdf = merge_parcel(address_building_gdf, inspire_dir)
     # Zones
-    return merge_zone(address_building_gdf, inspire_dir)
+    return merge_zone(address_building_gdf=address_building_gdf, inspire_dir=inspire_dir, code=code)
 
 
 def merge_raster(raster_path="data/PNOA_MDT200_ETRS89_HU30_Espana.tif", address_building_zone_gdf=None):
@@ -70,6 +70,8 @@ def merge_raster(raster_path="data/PNOA_MDT200_ETRS89_HU30_Espana.tif", address_
 
 def join_by_census_tracts(address_building_zone_height_gdf=None, columns=["CUSEC", "CUMUN", "CUDIS", "geometry"],
                           census_tract_dir="data/census_tracts"):
+    # remove if height
+    address_building_zone_height_gdf = address_building_zone_height_gdf.to_crs(epsg=25830)
     census_tracts_gdf = gpd.read_file(f"{census_tract_dir}/validated_census_2022.gpkg")
     return gpd.sjoin(address_building_zone_height_gdf, census_tracts_gdf[columns],
                      how="left", op="within").drop(["index_right"], axis=1)
@@ -98,4 +100,13 @@ def join_by_postal_codes(address_building_zone_height_census_tracts_neighbourhoo
     postal_codes_gdf = gpd.GeoDataFrame(postal_codes_df, geometry='geometry', crs='EPSG:4326')
     postal_codes_gdf = postal_codes_gdf.to_crs(address_building_zone_height_census_tracts_neighbourhoods_gdf.crs)
     return gpd.sjoin(address_building_zone_height_census_tracts_neighbourhoods_gdf, postal_codes_gdf[columns],
-                     how="left", op="within").drop(["index_right"], axis=1)
+                     how="left", op="within").drop(['gml_id_x', 'localId_x', 'namespace_x', 'specification', 'geometry', 'cat_ref', 'gml_id_y',
+       'conditionOfConstruction', 'reference', 'localId_y', 'namespace_y',
+       'horizontalGeometryEstimatedAccuracy',
+       'horizontalGeometryEstimatedAccuracy_uom', 'currentUse',
+       'numberOfBuildingUnits', 'numberOfDwellings',
+       'numberOfFloorsAboveGround', 'officialAreaReference', 'value',
+       'value_uom', 'cadastral_zonning_reference', 'gml_id',
+       'estimatedAccuracy', 'estimatedAccuracy_uom', 'localId', 'namespace',
+       'LocalisedCharacterString',
+       'originalMapScaleDenominator', 'CUMUN', 'CUDIS', 'PROV', "index_right"], axis=1)
