@@ -7,7 +7,7 @@ import requests
 import pandas as pd
 import fiona
 from fastkml import kml
-from utils import unzip_directory, list_municipalities
+from streetmaps.utils import unzip_directory, list_municipalities
 
 
 def download_file(wd, url, file):
@@ -130,6 +130,3 @@ def download(url, name, save_path):
     else:
         print(get_response)
 
-###
-# Por cada dirección única calle-número, añadir el código postal, parcela cadastral, sección censal, barrio, distrito, municipio, número de viviendas, isla cadastral
-###
