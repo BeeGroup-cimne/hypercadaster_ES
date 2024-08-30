@@ -3,14 +3,14 @@ from setuptools import find_packages, setup
 
 HERE = pathlib.Path(__file__).parent
 
-VERSION = '0.0.1'
-PACKAGE_NAME = 'streetmaps'
+VERSION = '0.0.2'
+PACKAGE_NAME = 'hypercadaster_ES'
 AUTHOR = 'Jose Manuel Broto Vispe'
 AUTHOR_EMAIL = 'jmbrotovispe@gmail.com'
-URL = 'https://github.com/josemanuel97'
+URL = 'https://github.com/BeeGroup-cimne'
 
 LICENSE = 'MIT'
-DESCRIPTION = 'Librería para obtener callejero geolocalizado en España.'
+DESCRIPTION = 'Python library to obtain the Spanish cadaster data joined with external attributes.'
 LONG_DESCRIPTION = (HERE / "README.md").read_text(
     encoding='utf-8')
 LONG_DESC_TYPE = "text/markdown"
@@ -41,6 +41,7 @@ INSTALL_REQUIRES = [
     'urllib3==2.2.1',
     'openpyxl==3.1.2',
     'et-xmlfile==1.1.0'
+    'lxml==5.2.2'
 ]
 
 setup(
