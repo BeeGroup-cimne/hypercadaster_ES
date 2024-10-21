@@ -158,8 +158,6 @@ def download_DEM_raster(raster_dir, bbox, year=2023):
                                 output_file=f"{raster_dir}/DEM.tif")
 
 
-
-
 def download(url, name, save_path):
     get_response = requests.get(url, stream=True)
     if get_response:

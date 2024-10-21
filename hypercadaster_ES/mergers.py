@@ -4,7 +4,7 @@ import rasterio
 from shapely import wkt
 from hypercadaster_ES import utils
 import sys
-
+from charset_normalizer import from_path
 
 def make_valid(gdf):
     gdf.geometry = gdf.geometry.make_valid()
@@ -66,7 +66,8 @@ def get_cadaster_address(cadaster_dir, cadaster_codes):
     return gdf
 
 
-def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, building_parts_plots=False, building_parts_inference=False):
+def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, building_parts_plots=False,
+                           building_parts_inference=False, open_data_layers=False, open_data_layers_dir=None):
 
     sys.stderr.write(f"\nJoining the buildings description for {len(cadaster_codes)} municipalities\n")
 
@@ -112,7 +113,31 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, build
             building_part_gdf_.loc[building_part_gdf_["zone_reference"].isna(), "zone_reference"] = "unknown"
             # building_part_gdf_.drop(columns=["building_part_geometry"]).set_geometry("location").to_file("test.gpkg")
 
-            building_part_gdf_ = utils.process_building_parts(building_part_gdf_, results_dir=results_dir, plots=building_parts_plots)
+            # In case of Barcelona municipality analysis, use commercial establishments and ground premises datasets
+            if code=="08900" and open_data_layers:
+                # establishments = pd.read_csv(
+                #     filepath_or_buffer=f"{open_data_layers_dir}/barcelona_establishments.csv",
+                #     encoding=from_path(f"{open_data_layers_dir}/barcelona_establishments.csv").best().encoding,
+                #     on_bad_lines='skip',
+                #     sep=",")
+                ground_premises = pd.read_csv(
+                    filepath_or_buffer=f"{open_data_layers_dir}/barcelona_ground_premises.csv",
+                    encoding=from_path(f"{open_data_layers_dir}/barcelona_ground_premises.csv").best().encoding,
+                    on_bad_lines='skip',
+                    sep=",")
+                ground_premises = ground_premises.groupby("Referencia_Cadastral").agg(
+                    cases=('Referencia_Cadastral', 'size'),
+                    last_revision=('Data_Revisio', 'max')
+                ).reset_index().rename({"Referencia_Cadastral": "building_reference",
+                                        "cases": "number_of_ground_premises",
+                                        "last_revision": "last_revision_ground_premises"}, axis=1)
+                ground_premises["building_reference"] = ground_premises["building_reference"].astype(str)
+                building_part_gdf_ = building_part_gdf_.join(ground_premises.set_index("building_reference"),
+                                                             on="building_reference", how="left")
+
+            # Process the building parts
+            building_part_gdf_ = utils.process_building_parts(building_part_gdf_, results_dir=results_dir,
+                                                              plots=building_parts_plots)
 
             if "building_part_gdf" in locals():
                 building_part_gdf = pd.concat([building_part_gdf, building_part_gdf_], ignore_index=True)
@@ -214,7 +239,8 @@ def join_adm_div_naming(gdf, cadaster_dir, cadaster_codes):
                     left_on="cadaster_code", right_on="cadaster_code", how="left")
 
 
-def join_cadaster_data(cadaster_dir, cadaster_codes, results_dir, building_parts_plots=False, building_parts_inference=False):
+def join_cadaster_data(cadaster_dir, cadaster_codes, results_dir, building_parts_plots=False,
+                       building_parts_inference=False, open_data_layers=False, open_data_layers_dir=None):
 
     # Address
     gdf = get_cadaster_address(cadaster_dir=cadaster_dir, cadaster_codes=cadaster_codes)
@@ -223,9 +249,11 @@ def join_cadaster_data(cadaster_dir, cadaster_codes, results_dir, building_parts
     # Buildings
     gdf = join_cadaster_building(gdf=gdf, cadaster_dir=cadaster_dir, cadaster_codes=cadaster_codes,
                                  results_dir=results_dir, building_parts_plots=building_parts_plots,
-                                 building_parts_inference=building_parts_inference)
+                                 building_parts_inference=building_parts_inference,
+                                 open_data_layers=open_data_layers, open_data_layers_dir=open_data_layers_dir)
     # Administrative layers naming
     gdf = join_adm_div_naming(gdf=gdf, cadaster_dir=cadaster_dir, cadaster_codes=cadaster_codes)
+
 
     return gdf
 

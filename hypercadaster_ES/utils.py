@@ -27,6 +27,8 @@ from shapely.geometry import (Polygon, Point, LineString, MultiPolygon, MultiPoi
 import itertools
 import math
 from tqdm import tqdm
+import concurrent.futures
+import multiprocessing
 
 def cadaster_dir(wd):
     return f"{wd}/cadaster"
@@ -49,6 +51,9 @@ def postal_codes_dir(wd):
 def neighborhoods_dir(wd):
     return f"{wd}/neighbourhoods"
 
+def open_data_dir(wd):
+    return f"{wd}/open_data"
+
 def create_dirs(data_dir):
     os.makedirs(census_tracts_dir(data_dir), exist_ok=True)
     os.makedirs(districts_dir(data_dir), exist_ok=True)
@@ -69,6 +74,7 @@ def create_dirs(data_dir):
     os.makedirs(neighborhoods_dir(data_dir), exist_ok=True)
     os.makedirs(postal_codes_dir(data_dir), exist_ok=True)
     os.makedirs(f"{postal_codes_dir(data_dir)}/raw", exist_ok=True)
+    os.makedirs(open_data_dir(data_dir), exist_ok=True)
 
 
 def list_municipalities(province_codes=None,
@@ -294,6 +300,62 @@ def process_zone(gdf_building_parts, buffer_neighbours, neighbours_column_name, 
     return gdf_building_parts
 
 
+def process_zone_chunk(chunk, buffer_neighbours, neighbours_column_name, neighbours_id_column_name):
+    G = create_graph(chunk, geometry_name="building_part_geometry", buffer=buffer_neighbours)
+    clusters = list(nx.connected_components(G))
+    cluster_map = {node: i for i, cluster in enumerate(clusters) for node in cluster}
+
+    if neighbours_id_column_name == "single_building_reference":
+        chunk['cluster_id'] = chunk.index.map(cluster_map)
+        chunk['single_building_reference'] = chunk['building_reference'].str.cat(chunk['cluster_id'].astype(str),
+                                                                                 sep='_')
+
+    # Update graph nodes to include the single_building_reference attribute
+    for idx, row in chunk.iterrows():
+        G.nodes[idx][neighbours_id_column_name] = row[neighbours_id_column_name]
+
+    # Create a dictionary to store related single_building_references
+    related_buildings_map = {}
+    for node in G.nodes:
+        single_building_reference = G.nodes[node][neighbours_id_column_name]
+        connected_references = {G.nodes[neighbor][neighbours_id_column_name] for neighbor in G.neighbors(node)}
+
+        if single_building_reference not in related_buildings_map:
+            related_buildings_map[single_building_reference] = connected_references
+        else:
+            related_buildings_map[single_building_reference].update(connected_references)
+
+        # Ensure each single_building_reference includes itself in its related buildings
+        related_buildings_map[single_building_reference].add(single_building_reference)
+
+    # Convert sets to sorted comma-separated strings for display or further processing
+    chunk[neighbours_column_name] = chunk[neighbours_id_column_name].map(
+        lambda x: ','.join(sorted(related_buildings_map[x])))
+
+    return chunk
+
+
+def process_zone_parallel(gdf_building_parts, buffer_neighbours, neighbours_column_name,
+                          neighbours_id_column_name="single_building_reference", num_workers=4):
+    # Split the data into chunks for parallel processing
+    chunks = np.array_split(gdf_building_parts, num_workers)
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # Parallel processing of each chunk
+        futures = [
+            executor.submit(process_zone_chunk, chunk, buffer_neighbours, neighbours_column_name,
+                            neighbours_id_column_name)
+            for chunk in chunks
+        ]
+
+        # Collect the results
+        results = [future.result() for future in concurrent.futures.as_completed(futures)]
+
+    # Concatenate the results into a single GeoDataFrame
+    gdf_building_parts_final = pd.concat(results, ignore_index=True)
+
+    return gdf_building_parts_final
+
 def union_geoseries_with_tolerance(geometries, gap_tolerance=1e-6, resolution=16):
     """
     Unions a GeoSeries with a specified tolerance to fill small gaps between geometries.
@@ -342,6 +404,8 @@ def calculate_floor_footprints(gdf, group_by = None, geometry_name = "geometry",
         unique_groups = gdf[group_by].unique()
     else:
         unique_groups = ['all']
+    if len(unique_groups) > 1000:
+        unique_groups = tqdm(unique_groups, desc="Calculating footprints by building floor...")
 
     for group in unique_groups:
         # Select the grouped buildings
@@ -427,6 +491,7 @@ def get_all_patios(geoseries):
         polygons.append(polygon)
 
     return polygons
+
 
 
 def patios_in_the_building(patios_geoms, building_geom, tolerance=0.95):
@@ -575,8 +640,7 @@ def calculate_wall_outdoor_normal_orientation(segment, orientation_interval=None
     angle_degrees = math.degrees(angle_radians)
 
     if orientation_interval is not None:
-        bin_size = 360 / orientation_interval
-        index = int((angle_degrees + bin_size / 2) % 360 / bin_size)
+        index = int((angle_degrees + orientation_interval / 2) % 360 / orientation_interval)
         angle_degrees = list(range(0,360,orientation_interval))[index]
 
     return angle_degrees
@@ -742,6 +806,48 @@ def distance_from_points_to_polygons_by_orientation(linearring, other_polygons, 
 
     return final_distances_by_orientation, representativity_by_orientation
 
+def distance_from_centroid_to_polygons_by_orientation(linearring, other_polygons, centroid, orientation_interval=5,
+                                                    plots=False, pdf=None, floor=None):
+    direction_angles = list(range(0, 360, orientation_interval))
+    distances_by_orientation = {str(i): np.inf for i in direction_angles}
+
+    for angle in direction_angles:
+
+        ray = create_ray_from_centroid(centroid, angle, length=75)
+        further_point_geom = ray.intersection(linearring)
+        further_point_geom = get_furthest_point(further_point_geom, centroid) if isinstance(further_point_geom,
+                                                                                         MultiPoint) else further_point_geom
+        point_to_linearring_distance = centroid.distance(further_point_geom)
+        other_pol_intersection_point = None
+
+        for other_polygon in other_polygons:
+            polygons = other_polygon.geoms if isinstance(other_polygon, MultiPolygon) else [other_polygon]
+            for polygon in polygons:
+                intersection = ray.intersection(polygon)
+                if not intersection.is_empty:
+                    nearest_point = nearest_points(centroid, intersection)[1]
+                    distance = round(centroid.distance(nearest_point) - point_to_linearring_distance,2)
+                    if distance < 0.2:
+                        distance = 0.0
+                    if distance <= distances_by_orientation[str(angle)]:
+                        other_pol_intersection_point = nearest_point
+                        distances_by_orientation[str(angle)] = distance
+
+        if plots and other_pol_intersection_point is not None and pdf is not None:
+            fig, ax = plt.subplots()
+            plot_shapely_geometries(
+                geometries=list(other_polygons) + [LineString([further_point_geom, other_pol_intersection_point])] +
+                           [centroid],
+                contextual_geometry=Polygon(linearring),
+                title=f"Building shadows, orientation: {angle}º, floor: {floor},\ndistance: "
+                      f"{str(distances_by_orientation[str(angle)])}m",
+                ax=ax
+            )
+            pdf.savefig(fig)
+            plt.close(fig)
+
+    return distances_by_orientation
+
 
 def process_building_parts(building_part_gdf_, results_dir = None, plots = False):
     results = []
@@ -750,14 +856,16 @@ def process_building_parts(building_part_gdf_, results_dir = None, plots = False
             results_dir = "results"
         os.makedirs(f"{results_dir}/plots", exist_ok=True)
 
-    gdf_global = process_zone(gdf_building_parts = building_part_gdf_,
-                              buffer_neighbours = 50,
-                              neighbours_column_name = "nearby_buildings",
-                              neighbours_id_column_name = "building_reference")
+    gdf_global = process_zone_parallel(gdf_building_parts = building_part_gdf_,
+                                       buffer_neighbours = 50,
+                                       neighbours_column_name = "nearby_buildings",
+                                       neighbours_id_column_name = "building_reference",
+                                       num_workers=max(1, math.ceil(multiprocessing.cpu_count()/3)) )
     gdf_footprints_global = calculate_floor_footprints(
         gdf=gdf_global,
         group_by="building_reference",
         geometry_name="building_part_geometry",
+        only_exterior_geometry=True,
         min_hole_area=0.5,
         gap_tolerance=0.05)
 
@@ -823,7 +931,7 @@ def process_building_parts(building_part_gdf_, results_dir = None, plots = False
 
         for single_building_reference, gdf_building in gdf_zone.groupby('single_building_reference'):
             # grouped2 = gdf_zone.groupby("single_building_reference")
-            # single_building_reference = "60609A700BG91F_33"#list(grouped2.groups.keys())[0]
+            # single_building_reference = list(grouped2.groups.keys())[8]
             # gdf_building = grouped2.get_group(single_building_reference).reset_index().drop(['index'], axis=1).copy()
 
             # PDF setup for the building if plots is True
@@ -885,7 +993,7 @@ def process_building_parts(building_part_gdf_, results_dir = None, plots = False
             adiabatic_wall = {}
             patios_wall = {}
             n_floors = gdf_aux_footprint_building.floor.max()
-            orientation_interval = 10
+            orientation_interval = 5
 
             if n_floors is not np.nan:
 
@@ -1015,15 +1123,25 @@ def process_building_parts(building_part_gdf_, results_dir = None, plots = False
                     pdf = None
                 for floor in range(max(gdf_aux_footprint_building.floor.max(),
                                        gdf_aux_footprints_nearby.floor.max()) + 1):
-                    shadows_at_distance[floor] = distance_from_points_to_polygons_by_orientation(
+                    # shadows_at_distance[floor] = distance_from_points_to_polygons_by_orientation(
+                    #     linearring=building_geom.exterior if isinstance(building_geom, Polygon) else (
+                    #         MultiLineString([LineString(polygon.exterior.coords) for polygon in building_geom.geoms])),
+                    #     other_polygons=gdf_aux_footprints_nearby[gdf_aux_footprints_nearby.floor==floor].geometry,
+                    #     num_points = 25,
+                    #     orientation_interval = orientation_interval,
+                    #     plots = plots,
+                    #     pdf = pdf,
+                    #     floor = floor
+                    # )
+                    shadows_at_distance[floor] = distance_from_centroid_to_polygons_by_orientation(
                         linearring=building_geom.exterior if isinstance(building_geom, Polygon) else (
                             MultiLineString([LineString(polygon.exterior.coords) for polygon in building_geom.geoms])),
-                        other_polygons=gdf_aux_footprints_nearby[gdf_aux_footprints_nearby.floor==floor].geometry,
-                        num_points = 25,
-                        orientation_interval = orientation_interval,
-                        plots = plots,
-                        pdf = pdf,
-                        floor = floor
+                        other_polygons=gdf_aux_footprints_nearby[gdf_aux_footprints_nearby.floor == floor].geometry,
+                        centroid=building_geom.centroid,
+                        orientation_interval=orientation_interval,
+                        plots=plots,
+                        pdf=pdf,
+                        floor=floor
                     )
                 if plots:
                     pdf.close()
@@ -1043,10 +1161,12 @@ def process_building_parts(building_part_gdf_, results_dir = None, plots = False
                                          air_contact_wall[0]},
                     'adiabatic_wall': [adiabatic_wall[floor] for floor in range(n_floors + 1)],
                     'patios_wall': [patios_wall[floor] for floor in range(n_floors + 1)],
-                    'shadows_at_distance': {key: [shadows_at_distance[d][0][key] for d in shadows_at_distance] for key in
-                                            shadows_at_distance[0][0]},
-                    'shadows_representativity': {key: [shadows_at_distance[d][1][key] for d in shadows_at_distance] for key in
-                                            shadows_at_distance[0][1]},
+                    'shadows_at_distance': {key: [shadows_at_distance[d][key] for d in shadows_at_distance] for key in
+                                            shadows_at_distance[0]}
+                    # 'shadows_at_distance': {key: [shadows_at_distance[d][0][key] for d in shadows_at_distance] for key in
+                    #                         shadows_at_distance[0][0]},
+                    # 'shadows_representativity': {key: [shadows_at_distance[d][1][key] for d in shadows_at_distance] for key in
+                    #                         shadows_at_distance[0][1]},
                 })
 
 
