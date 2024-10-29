@@ -85,6 +85,24 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, build
             building_gdf = gpd.GeoDataFrame(pd.concat([building_gdf, building_gdf_], ignore_index=True))
         else:
             building_gdf = building_gdf_
+        building_gdf.rename(columns={
+            'geometry': 'building_geometry',
+            'value': 'building_area',
+            'conditionOfConstruction': 'building_status',
+            'currentUse': 'building_use',
+            'numberOfBuildingUnits': 'n_building_units',
+            'numberOfDwellings': 'n_dwellings',
+            'numberOfFloorsAboveGround': 'n_floors_above_ground',
+            'numberOfFloorsBelowGround': 'n_floors_below_ground',
+            'reference': 'building_reference'
+        }, inplace=True)
+        building_gdf.drop(
+            ["localId", "namespace", "officialAreaReference", "value_uom", "horizontalGeometryEstimatedAccuracy",
+             "horizontalGeometryEstimatedAccuracy_uom", "horizontalGeometryReference", "referenceGeometry",
+             "documentLink",
+             "format", "sourceStatus", "beginLifespanVersion", "beginning", "end", "endLifespanVersion",
+             "informationSystem"],
+            inplace=True, axis=1)
 
         if building_parts_inference:
             building_part_gdf_ = gpd.read_file(f"{cadaster_dir}/buildings/unzip/A.ES.SDGC.BU.{code}.buildingpart.gml",
@@ -120,23 +138,12 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, build
                 #     encoding=from_path(f"{open_data_layers_dir}/barcelona_establishments.csv").best().encoding,
                 #     on_bad_lines='skip',
                 #     sep=",")
-                ground_premises = pd.read_csv(
-                    filepath_or_buffer=f"{open_data_layers_dir}/barcelona_ground_premises.csv",
-                    encoding=from_path(f"{open_data_layers_dir}/barcelona_ground_premises.csv").best().encoding,
-                    on_bad_lines='skip',
-                    sep=",")
-                ground_premises = ground_premises.groupby("Referencia_Cadastral").agg(
-                    cases=('Referencia_Cadastral', 'size'),
-                    last_revision=('Data_Revisio', 'max')
-                ).reset_index().rename({"Referencia_Cadastral": "building_reference",
-                                        "cases": "number_of_ground_premises",
-                                        "last_revision": "last_revision_ground_premises"}, axis=1)
-                ground_premises["building_reference"] = ground_premises["building_reference"].astype(str)
+                ground_premises = utils.load_and_transform_barcelona_ground_premises(open_data_layers_dir)
                 building_part_gdf_ = building_part_gdf_.join(ground_premises.set_index("building_reference"),
                                                              on="building_reference", how="left")
 
             # Process the building parts
-            building_part_gdf_ = utils.process_building_parts(building_part_gdf_, results_dir=results_dir,
+            building_part_gdf_ = utils.process_building_parts(building_part_gdf_, building_gdf_, results_dir=results_dir,
                                                               plots=building_parts_plots)
 
             if "building_part_gdf" in locals():
@@ -144,24 +151,7 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, build
             else:
                 building_part_gdf = building_part_gdf_
 
-        building_gdf.rename(columns={
-            'geometry': 'building_geometry',
-            'value': 'building_area',
-            'conditionOfConstruction': 'building_status',
-            'currentUse': 'building_use',
-            'numberOfBuildingUnits': 'n_building_units',
-            'numberOfDwellings': 'n_dwellings',
-            'numberOfFloorsAboveGround': 'n_floors_above_ground',
-            'numberOfFloorsBelowGround': 'n_floors_below_ground',
-            'reference': 'building_reference'
-        }, inplace=True)
-        building_gdf.drop(
-            ["localId", "namespace", "officialAreaReference", "value_uom", "horizontalGeometryEstimatedAccuracy",
-             "horizontalGeometryEstimatedAccuracy_uom", "horizontalGeometryReference", "referenceGeometry",
-             "documentLink",
-             "format", "sourceStatus", "beginLifespanVersion", "beginning", "end", "endLifespanVersion",
-             "informationSystem"],
-            inplace=True, axis=1)
+        # Join Building geodataframe with
         building_gdf = building_gdf.merge(building_part_gdf, left_on="building_reference",
                                           right_on="building_reference", how="left")
 

@@ -29,6 +29,28 @@ import math
 from tqdm import tqdm
 import concurrent.futures
 import multiprocessing
+from charset_normalizer import from_path
+import joblib
+from joblib import Parallel, delayed
+from contextlib import contextmanager
+from joblib.externals.loky import get_reusable_executor
+
+@contextmanager
+def tqdm_joblib(tqdm_object):
+    """Context manager to patch joblib to report into tqdm progress bar given as argument"""
+    class TqdmBatchCompletionCallback(joblib.parallel.BatchCompletionCallBack):
+        def __call__(self, *args, **kwargs):
+            tqdm_object.update(n=self.batch_size)
+            return super().__call__(*args, **kwargs)
+
+    old_batch_callback = joblib.parallel.BatchCompletionCallBack
+    joblib.parallel.BatchCompletionCallBack = TqdmBatchCompletionCallback
+    try:
+        yield tqdm_object
+    finally:
+        joblib.parallel.BatchCompletionCallBack = old_batch_callback
+        tqdm_object.close()
+
 
 def cadaster_dir(wd):
     return f"{wd}/cadaster"
@@ -382,86 +404,163 @@ def union_geoseries_with_tolerance(geometries, gap_tolerance=1e-6, resolution=16
 
     return unioned_geometry
 
-def calculate_floor_footprints(gdf, group_by = None, geometry_name = "geometry", only_exterior_geometry = False,
-                               min_hole_area = 1e-6, gap_tolerance=1e-6):
-    """
-    Generate the 2D footprint geometry for each floor level by merging overlapping geometries.
 
-    Parameters:
-    gdf (GeoDataFrame): A GeoDataFrame containing building parts with geometries and associated floor levels.
-    group_by (str, optional): A column name to group the buildings. Default is None.
-    geometry_name (str): The name of the geometry column. Default is "geometry".
-
-    Returns:
-    floor_footprints_gdf (GeoDataFrame): A GeoDataFrame with the 2D footprint for each floor.
+def process_group(group, gdf, group_by, only_exterior_geometry, min_hole_area, gap_tolerance):
     """
-    # Group building parts by their floor levels
+    Process each group to calculate the 2D footprint geometry for each floor level.
+    """
     floor_footprints = []
 
-    gdf = gdf.set_geometry(geometry_name)
+    # Filter the grouped buildings
+    gdf_ = gdf[gdf[group_by] == group] if group_by else gdf
 
-    if group_by is not None:
-        unique_groups = gdf[group_by].unique()
-    else:
-        unique_groups = ['all']
-    if len(unique_groups) > 1000:
-        unique_groups = tqdm(unique_groups, desc="Calculating footprints by building floor...")
+    # Unique levels of floors
+    unique_floors = list(range(gdf_['n_floors_above_ground'].max()))
+    for floor in unique_floors:
+        floor_geometries = gdf_[gdf_['n_floors_above_ground'] >= (floor + 1)].reset_index(drop=True)
+        unioned_geometry = union_geoseries_with_tolerance(floor_geometries, gap_tolerance=gap_tolerance, resolution=16)
 
-    for group in unique_groups:
-        # Select the grouped buildings
-        if group_by is None:
-            gdf_ = gdf
+        # Handle geometry based on `only_exterior_geometry` and `min_hole_area`
+        if only_exterior_geometry:
+            if isinstance(unioned_geometry, Polygon):
+                unioned_geometry = Polygon(unioned_geometry.exterior)
+            elif isinstance(unioned_geometry, MultiPolygon):
+                unioned_geometry = MultiPolygon([Polygon(poly.exterior) for poly in unioned_geometry.geoms])
         else:
-            gdf_ = gdf[gdf[group_by] == group]
+            if isinstance(unioned_geometry, Polygon):
+                cleaned_interiors = [interior for interior in unioned_geometry.interiors if
+                                     Polygon(interior).area >= min_hole_area]
+                unioned_geometry = Polygon(unioned_geometry.exterior, cleaned_interiors)
+            elif isinstance(unioned_geometry, MultiPolygon):
+                cleaned_polygons = []
+                for poly in unioned_geometry.geoms:
+                    cleaned_interiors = [interior for interior in poly.interiors if
+                                         Polygon(interior).area >= min_hole_area]
+                    cleaned_polygons.append(Polygon(poly.exterior, cleaned_interiors))
+                unioned_geometry = MultiPolygon(cleaned_polygons)
 
-        # Unique levels of floors (could be actual heights or floor numbers)
-        unique_floors = list(range(gdf_['n_floors_above_ground'].max()))  # Include all floors starting from 0
+        floor_footprints.append({
+            'group': group,
+            'floor': floor,
+            'geometry': unioned_geometry
+        })
+
+    return floor_footprints
+
+def calculate_floor_footprints_chunk(chunk, gdf, group_by, only_exterior_geometry, min_hole_area, gap_tolerance):
+    """
+    Process a chunk of groups to calculate the 2D footprint geometry for each floor level.
+    """
+    floor_footprints = []
+
+    for group in chunk:
+        # Filter the grouped buildings
+        gdf_ = gdf[gdf[group_by] == group] if group_by else gdf
+
+        # Unique levels of floors
+        unique_floors = list(range(gdf_['n_floors_above_ground'].max()))
+        unique_underground_floors = list(range(1,gdf_['n_floors_below_ground'].max()))
+
         for floor in unique_floors:
-            # Filter geometries that belong to the current floor level
-            floor_geometries = gdf_[gdf_['n_floors_above_ground'] >= (floor + 1)]
-
-            # Reset the index and prepare geometries for union
-            floor_geometries = floor_geometries.reset_index(drop=True)
-
+            floor_geometries = gdf_[gdf_['n_floors_above_ground'] >= (floor + 1)].reset_index(drop=True)
             unioned_geometry = union_geoseries_with_tolerance(floor_geometries, gap_tolerance=gap_tolerance, resolution=16)
 
-            # Step 2: Subtract any holes (interiors) from the resultant geometry
+            # Handle geometry based on `only_exterior_geometry` and `min_hole_area`
             if only_exterior_geometry:
                 if isinstance(unioned_geometry, Polygon):
-                    # Create a new polygon without the holes
                     unioned_geometry = Polygon(unioned_geometry.exterior)
                 elif isinstance(unioned_geometry, MultiPolygon):
-                    # Process each polygon in the MultiPolygon
                     unioned_geometry = MultiPolygon([Polygon(poly.exterior) for poly in unioned_geometry.geoms])
             else:
-                # Step 2: Process the unioned geometry to remove small holes
                 if isinstance(unioned_geometry, Polygon):
-                    # Remove small holes (interiors)
                     cleaned_interiors = [interior for interior in unioned_geometry.interiors if
                                          Polygon(interior).area >= min_hole_area]
                     unioned_geometry = Polygon(unioned_geometry.exterior, cleaned_interiors)
-
                 elif isinstance(unioned_geometry, MultiPolygon):
                     cleaned_polygons = []
                     for poly in unioned_geometry.geoms:
-                        # Remove small holes (interiors)
                         cleaned_interiors = [interior for interior in poly.interiors if
                                              Polygon(interior).area >= min_hole_area]
                         cleaned_polygons.append(Polygon(poly.exterior, cleaned_interiors))
                     unioned_geometry = MultiPolygon(cleaned_polygons)
 
-            # Append the result to the list with the associated floor level
             floor_footprints.append({
                 'group': group,
                 'floor': floor,
                 'geometry': unioned_geometry
             })
 
-    # Create a new GeoDataFrame from the list of floor footprints
-    floor_footprints_gdf = gpd.GeoDataFrame(floor_footprints, crs=gdf.crs)
+        if gdf_['n_floors_below_ground'].max() > 0:
+            for floor in unique_underground_floors:
+                floor_geometries = gdf_[gdf_['n_floors_below_ground'] >= (floor)].reset_index(drop=True)
+                unioned_geometry = union_geoseries_with_tolerance(floor_geometries, gap_tolerance=gap_tolerance, resolution=16)
+
+                # Handle geometry based on `only_exterior_geometry` and `min_hole_area`
+                if only_exterior_geometry:
+                    if isinstance(unioned_geometry, Polygon):
+                        unioned_geometry = Polygon(unioned_geometry.exterior)
+                    elif isinstance(unioned_geometry, MultiPolygon):
+                        unioned_geometry = MultiPolygon([Polygon(poly.exterior) for poly in unioned_geometry.geoms])
+                else:
+                    if isinstance(unioned_geometry, Polygon):
+                        cleaned_interiors = [interior for interior in unioned_geometry.interiors if
+                                             Polygon(interior).area >= min_hole_area]
+                        unioned_geometry = Polygon(unioned_geometry.exterior, cleaned_interiors)
+                    elif isinstance(unioned_geometry, MultiPolygon):
+                        cleaned_polygons = []
+                        for poly in unioned_geometry.geoms:
+                            cleaned_interiors = [interior for interior in poly.interiors if
+                                                 Polygon(interior).area >= min_hole_area]
+                            cleaned_polygons.append(Polygon(poly.exterior, cleaned_interiors))
+                        unioned_geometry = MultiPolygon(cleaned_polygons)
+
+                floor_footprints.append({
+                    'group': group,
+                    'floor': -floor,
+                    'geometry': unioned_geometry
+                })
+
+    sys.stderr.flush()
+
+    return floor_footprints
+
+def calculate_floor_footprints(gdf, group_by=None, geometry_name="geometry", only_exterior_geometry=False,
+                               min_hole_area=1e-6, gap_tolerance=1e-6, chunk_size=200, num_workers=-1):
+    """
+    Generate the 2D footprint geometry for each floor level by merging overlapping geometries.
+    """
+    gdf = gdf.set_geometry(geometry_name)
+
+    # Determine unique groups and create chunks
+    unique_groups = gdf[group_by].unique() if group_by else ['all']
+    chunks = np.array_split(unique_groups, len(unique_groups) // chunk_size + 1)
+
+    if len(chunks)>2:
+        # Parallel processing of each chunk
+        with tqdm_joblib(tqdm(desc="Processing floor above/below ground footprints...",
+                              total=len(chunks))) as progress_bar:
+            results = Parallel(n_jobs=num_workers)(
+                delayed(calculate_floor_footprints_chunk)(chunk, gdf, group_by, only_exterior_geometry, min_hole_area,
+                                                          gap_tolerance)
+                for chunk in chunks
+            )
+        get_reusable_executor().shutdown(wait=True)
+
+        # Flatten the list of results and create the final GeoDataFrame
+        floor_footprints = [item for sublist in results for item in sublist]
+        floor_footprints_gdf = gpd.GeoDataFrame(floor_footprints, crs=gdf.crs)
+    else:
+        floor_footprints_gdf = gpd.GeoDataFrame()
+        for chunk in chunks:
+            floor_footprints_gdf = pd.concat([
+                floor_footprints_gdf,
+                gpd.GeoDataFrame(
+                    calculate_floor_footprints_chunk(chunk, gdf, group_by, only_exterior_geometry,
+                                                     min_hole_area, gap_tolerance),
+                crs=gdf.crs)]
+            )
 
     return floor_footprints_gdf
-
 
 def get_all_patios(geoseries):
     interiors = []
@@ -494,7 +593,7 @@ def get_all_patios(geoseries):
 
 
 
-def patios_in_the_building(patios_geoms, building_geom, tolerance=0.95):
+def patios_in_the_building(patios_geoms, building_geom, tolerance=0.5):
     """
     Check if patios are nearly totally inside a building.
 
@@ -509,7 +608,7 @@ def patios_in_the_building(patios_geoms, building_geom, tolerance=0.95):
     results = []
 
     for patio_geom in patios_geoms:
-        intersection_area = patio_geom.intersection(building_geom).area
+        intersection_area = patio_geom.buffer(0.5, cap_style=2, join_style=3).intersection(building_geom).area
 
         # Check if the intersection area is greater than or equal to the tolerance threshold
         if intersection_area / patio_geom.area >= tolerance:
@@ -849,8 +948,11 @@ def distance_from_centroid_to_polygons_by_orientation(linearring, other_polygons
     return distances_by_orientation
 
 
-def process_building_parts(building_part_gdf_, results_dir = None, plots = False):
-    results = []
+def process_building_parts(building_part_gdf_, building_gdf_, results_dir = None, plots = False,
+                           ratio_communal_areas=0.1, ratio_usable_private_areas=0.72,
+                           orientation_discrete_interval_in_degrees = 5):
+    results = pd.DataFrame()
+
     if plots:
         if results_dir is None:
             results_dir = "results"
@@ -867,9 +969,12 @@ def process_building_parts(building_part_gdf_, results_dir = None, plots = False
         geometry_name="building_part_geometry",
         only_exterior_geometry=True,
         min_hole_area=0.5,
-        gap_tolerance=0.05)
+        gap_tolerance=0.05,
+        chunk_size=500,
+        num_workers=-1)
 
     grouped = gdf_global.groupby("zone_reference")
+
     for i_zone in tqdm(range(len(grouped)), desc="Inferring attributes of building parts..."):
         zone_reference = list(grouped.groups.keys())[i_zone]
         gdf_zone = grouped.get_group(zone_reference).reset_index().drop(['index'], axis=1).copy()
@@ -878,6 +983,7 @@ def process_building_parts(building_part_gdf_, results_dir = None, plots = False
         if plots:
             pdf = PdfPages(f"{results_dir}/plots/zone_{zone_reference}.pdf")
 
+        # Calculation of the single building references and adjacent buildings
         gdf_zone = process_zone(gdf_building_parts = gdf_zone,
                                buffer_neighbours = 0.5,
                                neighbours_column_name = "adjacent_buildings",
@@ -929,30 +1035,39 @@ def process_building_parts(building_part_gdf_, results_dir = None, plots = False
         if plots:
             pdf.close()
 
-        for single_building_reference, gdf_building in gdf_zone.groupby('single_building_reference'):
+        results_ = []
+
+        for single_building_reference, building_gdf_item in gdf_zone.groupby('single_building_reference'):
             # grouped2 = gdf_zone.groupby("single_building_reference")
             # single_building_reference = list(grouped2.groups.keys())[8]
-            # gdf_building = grouped2.get_group(single_building_reference).reset_index().drop(['index'], axis=1).copy()
+            # building_gdf_item = grouped2.get_group(single_building_reference).reset_index().drop(['index'], axis=1).copy()
 
             # PDF setup for the building if plots is True
             if plots:
                 pdf = PdfPages(f"{results_dir}/plots/building_{single_building_reference}.pdf")
 
             # Obtain a general geometry of the building, considering all floors.
-            building_geom = union_geoseries_with_tolerance(gdf_building['building_part_geometry'], gap_tolerance=0.05,
+            building_geom = union_geoseries_with_tolerance(building_gdf_item['building_part_geometry'], gap_tolerance=0.05,
                                                            resolution=16)
 
             # Extract and clean the set of neighbouring buildings
-            adjacent_buildings_set = {id for ids in gdf_building['adjacent_buildings'] for id in ids.split(",")}
+            adjacent_buildings_set = {id for ids in building_gdf_item['adjacent_buildings'] for id in ids.split(",")}
             adjacent_buildings_set.discard(
                 single_building_reference)  # Safely remove the single_building_reference itself if present
             adjacent_buildings = sorted(adjacent_buildings_set)
 
             # Extract and clean the set of nearby buildings
-            nearby_buildings_set = {id for ids in gdf_building['nearby_buildings'] for id in ids.split(",")}
+            nearby_buildings_set = {id for ids in building_gdf_item['nearby_buildings'] for id in ids.split(",")}
             nearby_buildings_set.discard(
                 single_building_reference.split("_")[0])  # Safely remove the single_building_reference itself if present
             nearby_buildings = sorted(nearby_buildings_set)
+
+            # Is there any premises in ground floor?
+            premises = False
+            if "number_of_ground_premises" in building_gdf_item.columns:
+                if (~np.isfinite(building_gdf_item.iloc[0]["number_of_ground_premises"]) and
+                        building_gdf_item.iloc[0]["number_of_ground_premises"] > 0):
+                    premises = True
 
             # Filter building in study
             gdf_aux_footprint_building = gdf_aux_footprints[gdf_aux_footprints['group'] == single_building_reference]
@@ -984,6 +1099,7 @@ def process_building_parts(building_part_gdf_, results_dir = None, plots = False
                 plt.close(fig)
 
             floor_area = {}
+            underground_floor_area = {}
             roof_area = {}
             patios_area = {}
             patios_n = {}
@@ -993,7 +1109,38 @@ def process_building_parts(building_part_gdf_, results_dir = None, plots = False
             adiabatic_wall = {}
             patios_wall = {}
             n_floors = gdf_aux_footprint_building.floor.max()
-            orientation_interval = 5
+            n_underground_floors = -gdf_aux_footprint_building.floor.min() if gdf_aux_footprint_building.floor.min() < 0 else 0
+            n_dwellings = building_gdf_[
+                    building_gdf_["building_reference"] == building_gdf_item.iloc[0]["building_reference"]
+                ].iloc[0]["n_dwellings"]
+            n_items = building_gdf_[
+                    building_gdf_["building_reference"] == building_gdf_item.iloc[0]["building_reference"]
+                ].iloc[0]["n_building_units"] - n_dwellings
+            n_buildings = len(
+                gdf_zone[
+                        gdf_zone["building_reference"] == building_gdf_item.iloc[0]["building_reference"]
+                    ]["single_building_reference"].unique()
+            )
+            if n_dwellings == 0:
+                building_type = "Non-residential"
+                ratio_communal_areas_ = np.nan
+                ratio_usable_private_areas_ = 0.9
+            elif n_dwellings == 1:
+                building_type = "Single-family"
+                ratio_communal_areas_ = 0.0
+                ratio_usable_private_areas_ = 0.9
+            elif n_dwellings > 1:
+                building_type = "Multi-family"
+                ratio_communal_areas_ = ratio_communal_areas
+                ratio_usable_private_areas_ = ratio_usable_private_areas
+
+            if n_underground_floors > 0:
+
+                for underground_floor in range(n_underground_floors):
+                    underground_floor_area[underground_floor] = round(
+                        gdf_aux_footprint_building[gdf_aux_footprint_building["floor"] == -underground_floor]['geometry'].area.sum(),
+                        2
+                    )
 
             if n_floors is not np.nan:
 
@@ -1017,7 +1164,8 @@ def process_building_parts(building_part_gdf_, results_dir = None, plots = False
                         )
                     patios = patios_in_the_building(
                         patios_geoms=patios_detected[floor],
-                        building_geom=building_geom
+                        building_geom=building_geom,
+                        tolerance=0.05
                     )
                     patios_n[floor] = len(patios)
                     patios_area[floor] = round(sum([patio.area for patio in patios]), 2)
@@ -1029,7 +1177,7 @@ def process_building_parts(building_part_gdf_, results_dir = None, plots = False
 
                     # Initialize the lengths for each type of wall contact and for each orientation
                     air_contact_wall[floor] = {direction: 0.0 for direction in [str(i) for i in
-                                                                                list(range(0, 360, orientation_interval))]}
+                                                                                list(range(0, 360, orientation_discrete_interval_in_degrees))]}
                     adiabatic_wall[floor] = 0.0
                     patios_wall[floor] = 0.0
                     perimeter[floor] = round(sum([peri.exterior.length for peri in walls]), 2)
@@ -1050,7 +1198,7 @@ def process_building_parts(building_part_gdf_, results_dir = None, plots = False
                             # Determine the orientation of this segment
                             segment_orientation = str(calculate_wall_outdoor_normal_orientation(
                                 segment,
-                                orientation_interval=orientation_interval))
+                                orientation_interval=orientation_discrete_interval_in_degrees))
 
                             # Check if the segment is in contact with patios
                             for patio in patios:
@@ -1128,7 +1276,7 @@ def process_building_parts(building_part_gdf_, results_dir = None, plots = False
                     #         MultiLineString([LineString(polygon.exterior.coords) for polygon in building_geom.geoms])),
                     #     other_polygons=gdf_aux_footprints_nearby[gdf_aux_footprints_nearby.floor==floor].geometry,
                     #     num_points = 25,
-                    #     orientation_interval = orientation_interval,
+                    #     orientation_interval = orientation_discrete_interval_in_degrees,
                     #     plots = plots,
                     #     pdf = pdf,
                     #     floor = floor
@@ -1138,7 +1286,7 @@ def process_building_parts(building_part_gdf_, results_dir = None, plots = False
                             MultiLineString([LineString(polygon.exterior.coords) for polygon in building_geom.geoms])),
                         other_polygons=gdf_aux_footprints_nearby[gdf_aux_footprints_nearby.floor == floor].geometry,
                         centroid=building_geom.centroid,
-                        orientation_interval=orientation_interval,
+                        orientation_interval=orientation_discrete_interval_in_degrees,
                         plots=plots,
                         pdf=pdf,
                         floor=floor
@@ -1146,14 +1294,31 @@ def process_building_parts(building_part_gdf_, results_dir = None, plots = False
                 if plots:
                     pdf.close()
 
+                if premises:
+                    floor_area_with_dwellings = [floor_area[floor] for floor in range(1, n_floors + 1)]
+                    if building_type == "Multi-family" and n_floors >= n_dwellings:
+                        n_dwellings = n_dwellings - 1
+                else:
+                    floor_area_with_dwellings = [floor_area[floor] for floor in range(n_floors + 1)]
+
                 # Store results
-                results.append({
+                results_.append({
                     'building_reference': single_building_reference.split("_")[0],
                     'single_building_reference': single_building_reference,
                     'n_floors': n_floors,
-                    'n_underground_floors': gdf_building.n_floors_below_ground.max(),
+                    'total_n_dwellings': n_dwellings,
+                    'total_n_items': n_items,
+                    'n_buildings': n_buildings,
+                    'type': building_type,
+                    'ground_commercial_premises': premises,
+                    'n_underground_floors': n_underground_floors,
+                    'underground_floor_area': underground_floor_area,
+                    'partial_underground_built_area': np.sum([underground_floor_area[floor] for floor in range(n_underground_floors + 1)]),
                     'floor_area': [floor_area[floor] for floor in range(n_floors + 1)],
                     'roof_area': [roof_area[floor] for floor in range(n_floors + 1)],
+                    'partial_built_area': np.sum([floor_area[floor] for floor in range(n_floors + 1)]),
+                    'partial_estimated_usable_private_area': np.sum(floor_area_with_dwellings) * ratio_usable_private_areas_,
+                    'partial_estimated_communal_area': np.sum(floor_area_with_dwellings) * ratio_communal_areas_,
                     'patios_area': [patios_area[floor] for floor in range(n_floors + 1)],
                     'patios_n': [patios_n[floor] for floor in range(n_floors + 1)],
                     'perimeter': [perimeter[floor] for floor in range(n_floors + 1)],
@@ -1163,14 +1328,19 @@ def process_building_parts(building_part_gdf_, results_dir = None, plots = False
                     'patios_wall': [patios_wall[floor] for floor in range(n_floors + 1)],
                     'shadows_at_distance': {key: [shadows_at_distance[d][key] for d in shadows_at_distance] for key in
                                             shadows_at_distance[0]}
-                    # 'shadows_at_distance': {key: [shadows_at_distance[d][0][key] for d in shadows_at_distance] for key in
-                    #                         shadows_at_distance[0][0]},
-                    # 'shadows_representativity': {key: [shadows_at_distance[d][1][key] for d in shadows_at_distance] for key in
-                    #                         shadows_at_distance[0][1]},
                 })
+        results_ = pd.DataFrame(results_)
+        results_["total_estimated_usable_private_area"] = results_.groupby("building_reference")[
+            "partial_estimated_usable_private_area"].transform("sum")
+        results_["ratio_estimated_usable_private_area"] = (results_["partial_estimated_usable_private_area"] /
+                                                           results_["total_estimated_usable_private_area"])
+        results_["partial_n_dwellings"] = int(round(results_["total_n_dwellings"] *
+                                                    results_["ratio_estimated_usable_private_area"], 0))
+        results_["estimated_usable_area_per_dwelling"] = (results_["partial_estimated_usable_private_area"] /
+                                                          results_["partial_n_dwellings"])
+        results = pd.concat([results, results_])
 
-
-    return pd.DataFrame(results)
+    return results
 
 def plot_shapely_geometries(geometries, labels=None, clusters=None, ax=None, title=None, contextual_geometry=None):
     """
@@ -1314,3 +1484,105 @@ def plot_shapely_geometries(geometries, labels=None, clusters=None, ax=None, tit
 
     plt.show()
     return ax
+
+
+def load_and_transform_barcelona_ground_premises(open_data_layers_dir):
+    ground_premises = pd.read_csv(
+        filepath_or_buffer=f"{open_data_layers_dir}/barcelona_ground_premises.csv",
+        encoding=from_path(f"{open_data_layers_dir}/barcelona_ground_premises.csv").best().encoding,
+        on_bad_lines='skip',
+        sep=",", low_memory=False)
+    ground_premises["Nom_Activitat"] = ground_premises["Nom_Activitat"].replace(
+        {
+            'Activitats emmagatzematge': "Activitats d'emmagatzematge@ca\tActividades de almacenamiento@es\tStorage activities@en",
+            'Ensenyament': "Ensenyament@ca\tEnseñanza@es\tEducation@en",
+            'Serveis a les empreses i oficines': "Serveis a les empreses i oficines@ca\tServicios a empresas y oficinas@es\tBusiness and office services@en",
+            'Arts gràfiques': "Arts gràfiques@ca\tArtes gráficas@es\tGraphic arts@en",
+            'Activitats de la construcció': "Activitats de la construcció@ca\tActividades de construcción@es\tConstruction activities@en",
+            'Reparacions (Electrodomèstics i automòbils)': "Reparacions (Electrodomèstics i automòbils)@ca\tReparaciones (Electrodomésticos y automóviles)@es\tRepairs (Appliances and automobiles)@en",
+            'Sanitat i assistència': "Sanitat i assistència@ca\tSanidad y asistencia@es\tHealthcare and assistance@en",
+            'Maquinària': "Maquinària@ca\tMaquinaria@es\tMachinery@en",
+            'Associacions': "Associacions@ca\tAsociaciones@es\tAssociations@en",
+            'Locals buits en venda i lloguer – reanalisi': "Locals buits en venda i lloguer – reanalisi@ca\tLocales vacíos en venta y alquiler – reanálisis@es\tEmpty premises for sale and rent – reanalysis@en",
+            'Vehicles': "Vehicles@ca\tVehículos@es\tVehicles@en",
+            'Vestir': "Vestir@ca\tVestimenta@es\tClothing@en",
+            'Restaurants': "Restaurants@ca\tRestaurantes@es\tRestaurants@en",
+            'Pàrquings i garatges': "Pàrquings i garatges@ca\tAparcamientos y garajes@es\tParking and garages@en",
+            'Locutoris': "Locutoris@ca\tLocutorios@es\tCall centers@en",
+            'Autoservei / Supermercat': "Autoservei / Supermercat@ca\tAutoservicio / Supermercado@es\tSelf-service / Supermarket@en",
+            'Altres': "Altres@ca\tOtros@es\tOthers@en",
+            'Activitats industrials': "Activitats industrials@ca\tActividades industriales@es\tIndustrial activities@en",
+            'Locals buits en venda': "Locals buits en venda@ca\tLocales vacíos en venta@es\tEmpty premises for sale@en",
+            'Bars / CIBERCAFÈ': "Bars / CIBERCAFÈ@ca\tBares / CIBERCAFÉ@es\tBars / CYBERCAFÉ@en",
+            'Farmàcies PARAFARMÀCIA': "Farmàcies PARAFARMÀCIA@ca\tFarmacias PARAFARMACIA@es\tPharmacies and para-pharmacies@en",
+            'Arranjaments': "Arranjaments@ca\tArreglos@es\tAlterations@en",
+            'Equipaments culturals i recreatius': "Equipaments culturals i recreatius@ca\tEquipamientos culturales y recreativos@es\tCultural and recreational facilities@en",
+            "Centres d'estètica": "Centres d'estètica@ca\tCentros de estética@es\tAesthetic centers@en",
+            'Serveis Socials': "Serveis Socials@ca\tServicios Sociales@es\tSocial services@en",
+            'Fruites i verdures': "Fruites i verdures@ca\tFrutas y verduras@es\tFruits and vegetables@en",
+            'Joieria, rellotgeria i bijuteria': "Joieria, rellotgeria i bijuteria@ca\tJoyería, relojería y bisutería@es\tJewelry, watches, and costume jewelry@en",
+            'Perruqueries': "Perruqueries@ca\tPeluquerías@es\tHairdressing@en",
+            'Drogueria i perfumeria': "Drogueria i perfumeria@ca\tDroguería y perfumería@es\tDrugstore and perfumery@en",
+            'Material equipament llar': "Material equipament llar@ca\tMaterial de equipamiento del hogar@es\tHome equipment materials@en",
+            'Basars': "Basars@ca\tBazares@es\tBazaars@en",
+            'Pa, pastisseria i làctics': "Pa, pastisseria i làctics@ca\tPan, pastelería y lácteos@es\tBread, pastries, and dairy@en",
+            'Activitats de transport': "Activitats de transport@ca\tActividades de transporte@es\tTransport activities@en",
+            'Mobles i articles fusta i metall': "Mobles i articles fusta i metall@ca\tMuebles y artículos de madera y metal@es\tFurniture and wood/metal goods@en",
+            'Serveis de telecomunicacions': "Serveis de telecomunicacions@ca\tServicios de telecomunicaciones@es\tTelecommunication services@en",
+            'Plats preparats (no degustació)': "Plats preparats (no degustació)@ca\tPlatos preparados (sin degustación)@es\tPrepared dishes (no tasting)@en",
+            'Bars especials amb actuació / Bars musicals / Discoteques /PUB': "Bars especials amb actuació / Bars musicals / Discoteques /PUB@ca\tBares especiales con actuación / Bares musicales / Discotecas / PUB@es\tSpecial bars with live performance / Music bars / Nightclubs / PUB@en",
+            'Parament ferreteria': "Parament ferreteria@ca\tSuministros de ferretería@es\tHardware supplies@en",
+            'Serveis de menjar take away MENJAR RÀPID': "Serveis de menjar take away MENJAR RÀPID@ca\tServicios de comida para llevar / Comida rápida@es\tTake-away / Fast food services@en",
+            'Locals buits en lloguer': "Locals buits en lloguer@ca\tLocales vacíos en alquiler@es\tEmpty premises for rent@en",
+            'Tintoreries': "Tintoreries@ca\tTintorerías@es\tDry cleaners@en",
+            "serveis d'allotjament": "serveis d'allotjament@ca\tservicios de alojamiento@es\tAccommodation services@en",
+            'Altres equipaments esportius': "Altres equipaments esportius@ca\tOtros equipamientos deportivos@es\tOther sports facilities@en",
+            'Carn i Porc': "Carn i Porc@ca\tCarne y cerdo@es\tMeat and pork@en",
+            'Begudes': "Begudes@ca\tBebidas@es\tBeverages@en",
+            'Herbolaris, dietètica i NUTRICIÓ': "Herbolaris, dietètica i NUTRICIÓ@ca\tHerbolarios, dietética y NUTRICIÓN@es\tHerbalists, dietetics, and NUTRITION@en",
+            'Informàtica': "Informàtica@ca\tInformática@es\tComputing@en",
+            'Aparells domèstics': "Aparells domèstics@ca\tAparatos domésticos@es\tHousehold appliances@en",
+            'Veterinaris / Mascotes': "Veterinaris / Mascotes@ca\tVeterinarios / Mascotas@es\tVeterinarians / Pets@en",
+            'Música': "Música@ca\tMúsica@es\tMusic@en",
+            'Finances i assegurances': "Finances i assegurances@ca\tFinanzas y seguros@es\tFinance and insurance@en",
+            'Activitats immobiliàries': "Activitats immobiliàries@ca\tActividades inmobiliarias@es\tReal estate activities@en",
+            'Equipaments religiosos': "Equipaments religiosos@ca\tEquipamientos religiosos@es\tReligious facilities@en",
+            'Joguines i esports': "Joguines i esports@ca\tJuguetes y deportes@es\tToys and sports@en",
+            'Manteniment, neteja i similars': "Manteniment, neteja i similars@ca\tMantenimiento, limpieza y similares@es\tMaintenance, cleaning, and similar@en",
+            'Administració': "Administració@ca\tAdministración@es\tAdministration@en",
+            'Fotografia': "Fotografia@ca\tFotografía@es\tPhotography@en",
+            'Gimnàs /fitnes': "Gimnàs /fitnes@ca\tGimnasio / fitness@es\tGym / Fitness@en",
+            'Locals buits en venda i lloguer': "Locals buits en venda i lloguer@ca\tLocales vacíos en venta y alquiler@es\tEmpty premises for sale and rent@en",
+            'Combustibles i carburants': "Combustibles i carburants@ca\tCombustibles y carburantes@es\tFuels and combustibles@en",
+            'Fabricació tèxtil': "Fabricació tèxtil@ca\tFabricación textil@es\tTextile manufacturing@en",
+            'Tabac i articles fumadors': "Tabac i articles fumadors@ca\tTabaco y artículos de fumadores@es\tTobacco and smoking articles@en",
+            'Merceria': "Merceria@ca\tMercería@es\tHaberdashery@en",
+            'Floristeries': "Floristeries@ca\tFloristerías@es\tFlorists@en",
+            'Llibres, diaris i revistes': "Llibres, diaris i revistes@ca\tLibros, diarios y revistas@es\tBooks, newspapers, and magazines@en",
+            'Òptiques': "Òptiques@ca\tÓpticas@es\tOptics@en",
+            'Ous i aus': "Ous i aus@ca\tHuevos y aves@es\tEggs and poultry@en",
+            'Agències de viatge': "Agències de viatge@ca\tAgencias de viaje@es\tTravel agencies@en",
+            'Souvenirs': "Souvenirs@ca\tSouvenirs@es\tSouvenirs@en",
+            'Calçat i pell': "Calçat i pell@ca\tCalzado y piel@es\tFootwear and leather@en",
+            'Xocolateries / Geladeries / Degustació': "Xocolateries / Geladeries / Degustació@ca\tChocolaterías / Heladerías / Degustación@es\tChocolate shops / Ice cream parlors / Tasting@en",
+            'Segells, monedes i antiguitats': "Segells, monedes i antiguitats@ca\tSellos, monedas y antigüedades@es\tStamps, coins, and antiques@en",
+            'Peix i marisc': "Peix i marisc@ca\tPescado y marisco@es\tFish and seafood@en",
+            'serveis de menjar i begudes': "serveis de menjar i begudes@ca\tservicios de comida y bebidas@es\tFood and beverage services@en",
+            'Altres ( per exemple VENDING)': "Altres ( per exemple VENDING)@ca\tOtros (por ejemplo, VENDING)@es\tOthers (e.g., VENDING)@en",
+            'altres': "altres@ca\totros@es\tothers@en",
+            'Resta alimentació': "Resta alimentació@ca\tResto alimentación@es\tOther food products@en",
+            'Souvenirs i basars': "Souvenirs i basars@ca\tSouvenirs y bazares@es\tSouvenirs and bazaars@en",
+            'Grans magatzems i hipermercats': "Grans magatzems i hipermercats@ca\tGrandes almacenes e hipermercados@es\tDepartment stores and hypermarkets@en"
+        }
+    )
+    ground_premises = ground_premises.groupby("Referencia_Cadastral").agg(
+        cases=('Referencia_Cadastral', 'size'),
+        activity=('Nom_Activitat', lambda x: list(x)),
+        name=('Nom_Local', lambda x: list(x)),
+        last_revision=('Data_Revisio', 'max')
+    ).reset_index().rename({"Referencia_Cadastral": "building_reference",
+                            "cases": "number_of_ground_premises",
+                            "last_revision": "last_revision_ground_premises"}, axis=1)
+    ground_premises["building_reference"] = ground_premises["building_reference"].astype(str)
+
+    return ground_premises
