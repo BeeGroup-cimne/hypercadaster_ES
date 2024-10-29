@@ -17,3 +17,9 @@ import hypercadaster_ES as hc
 hc.download()
 gdf = hc.merge()
 ```
+
+## Authors
+- Jose Manuel Broto - jmbroto@cimne.upc.edu
+- Gerard Mor - gmor@cimne.upc.edu
+  
+Copyright (c) 2024 Jose Manuel Broto, Gerard Mor
