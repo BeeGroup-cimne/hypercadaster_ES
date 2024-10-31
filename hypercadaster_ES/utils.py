@@ -404,49 +404,6 @@ def union_geoseries_with_tolerance(geometries, gap_tolerance=1e-6, resolution=16
 
     return unioned_geometry
 
-
-def process_group(group, gdf, group_by, only_exterior_geometry, min_hole_area, gap_tolerance):
-    """
-    Process each group to calculate the 2D footprint geometry for each floor level.
-    """
-    floor_footprints = []
-
-    # Filter the grouped buildings
-    gdf_ = gdf[gdf[group_by] == group] if group_by else gdf
-
-    # Unique levels of floors
-    unique_floors = list(range(gdf_['n_floors_above_ground'].max()))
-    for floor in unique_floors:
-        floor_geometries = gdf_[gdf_['n_floors_above_ground'] >= (floor + 1)].reset_index(drop=True)
-        unioned_geometry = union_geoseries_with_tolerance(floor_geometries, gap_tolerance=gap_tolerance, resolution=16)
-
-        # Handle geometry based on `only_exterior_geometry` and `min_hole_area`
-        if only_exterior_geometry:
-            if isinstance(unioned_geometry, Polygon):
-                unioned_geometry = Polygon(unioned_geometry.exterior)
-            elif isinstance(unioned_geometry, MultiPolygon):
-                unioned_geometry = MultiPolygon([Polygon(poly.exterior) for poly in unioned_geometry.geoms])
-        else:
-            if isinstance(unioned_geometry, Polygon):
-                cleaned_interiors = [interior for interior in unioned_geometry.interiors if
-                                     Polygon(interior).area >= min_hole_area]
-                unioned_geometry = Polygon(unioned_geometry.exterior, cleaned_interiors)
-            elif isinstance(unioned_geometry, MultiPolygon):
-                cleaned_polygons = []
-                for poly in unioned_geometry.geoms:
-                    cleaned_interiors = [interior for interior in poly.interiors if
-                                         Polygon(interior).area >= min_hole_area]
-                    cleaned_polygons.append(Polygon(poly.exterior, cleaned_interiors))
-                unioned_geometry = MultiPolygon(cleaned_polygons)
-
-        floor_footprints.append({
-            'group': group,
-            'floor': floor,
-            'geometry': unioned_geometry
-        })
-
-    return floor_footprints
-
 def calculate_floor_footprints_chunk(chunk, gdf, group_by, only_exterior_geometry, min_hole_area, gap_tolerance):
     """
     Process a chunk of groups to calculate the 2D footprint geometry for each floor level.
