@@ -290,7 +290,7 @@ def create_graph(gdf, geometry_name="building_part_geometry", buffer = 0.5):
 
     return G
 
-def process_zone(gdf_building_parts, buffer_neighbours, neighbours_column_name, neighbours_id_column_name = "single_building_reference"):
+def detect_close_buildings(gdf_building_parts, buffer_neighbours, neighbours_column_name, neighbours_id_column_name = "single_building_reference"):
     G = create_graph(gdf_building_parts, geometry_name="building_part_geometry",buffer = buffer_neighbours)
     clusters = list(nx.connected_components(G))
     cluster_map = {node: i for i, cluster in enumerate(clusters) for node in cluster}
@@ -322,7 +322,7 @@ def process_zone(gdf_building_parts, buffer_neighbours, neighbours_column_name, 
     return gdf_building_parts
 
 
-def process_zone_chunk(chunk, buffer_neighbours, neighbours_column_name, neighbours_id_column_name):
+def detect_close_buildings_chunk(chunk, buffer_neighbours, neighbours_column_name, neighbours_id_column_name):
     G = create_graph(chunk, geometry_name="building_part_geometry", buffer=buffer_neighbours)
     clusters = list(nx.connected_components(G))
     cluster_map = {node: i for i, cluster in enumerate(clusters) for node in cluster}
@@ -357,7 +357,7 @@ def process_zone_chunk(chunk, buffer_neighbours, neighbours_column_name, neighbo
     return chunk
 
 
-def process_zone_parallel(gdf_building_parts, buffer_neighbours, neighbours_column_name,
+def detect_close_buildings_parallel(gdf_building_parts, buffer_neighbours, neighbours_column_name,
                           neighbours_id_column_name="single_building_reference", num_workers=4):
     # Split the data into chunks for parallel processing
     chunks = np.array_split(gdf_building_parts, num_workers)
@@ -365,9 +365,9 @@ def process_zone_parallel(gdf_building_parts, buffer_neighbours, neighbours_colu
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
         # Parallel processing of each chunk
         futures = [
-            executor.submit(process_zone_chunk, chunk, buffer_neighbours, neighbours_column_name,
+            executor.submit(detect_close_buildings_chunk, chunk, buffer_neighbours, neighbours_column_name,
                             neighbours_id_column_name)
-            for chunk in chunks
+            for chunk in tqdm(chunks,desc="Detect buildings related with others (Nearby, adjacent... depending the buffer)")
         ]
 
         # Collect the results
@@ -492,10 +492,10 @@ def calculate_floor_footprints(gdf, group_by=None, geometry_name="geometry", onl
     unique_groups = gdf[group_by].unique() if group_by else ['all']
     chunks = np.array_split(unique_groups, len(unique_groups) // chunk_size + 1)
 
-    if len(chunks)>2:
+    if len(chunks)>2 and (num_workers==-1 or num_workers>1):
         # Parallel processing of each chunk
         with tqdm_joblib(tqdm(desc="Processing floor above/below ground footprints...",
-                              total=len(chunks))) as progress_bar:
+                              total=len(chunks))):
             results = Parallel(n_jobs=num_workers)(
                 delayed(calculate_floor_footprints_chunk)(chunk, gdf, group_by, only_exterior_geometry, min_hole_area,
                                                           gap_tolerance)
@@ -866,6 +866,7 @@ def distance_from_centroid_to_polygons_by_orientation(linearring, other_polygons
                                                     plots=False, pdf=None, floor=None):
     direction_angles = list(range(0, 360, orientation_interval))
     distances_by_orientation = {str(i): np.inf for i in direction_angles}
+    contour_by_orientation = {str(i): np.inf for i in direction_angles}
 
     for angle in direction_angles:
 
@@ -874,6 +875,7 @@ def distance_from_centroid_to_polygons_by_orientation(linearring, other_polygons
         further_point_geom = get_furthest_point(further_point_geom, centroid) if isinstance(further_point_geom,
                                                                                          MultiPoint) else further_point_geom
         point_to_linearring_distance = centroid.distance(further_point_geom)
+        contour_by_orientation[str(angle)] = point_to_linearring_distance
         other_pol_intersection_point = None
 
         for other_polygon in other_polygons:
@@ -892,34 +894,35 @@ def distance_from_centroid_to_polygons_by_orientation(linearring, other_polygons
         if plots and other_pol_intersection_point is not None and pdf is not None:
             fig, ax = plt.subplots()
             plot_shapely_geometries(
-                geometries=list(other_polygons) + [LineString([further_point_geom, other_pol_intersection_point])] +
-                           [centroid],
+                geometries=list(other_polygons) + [further_point_geom] +
+                           [LineString([centroid, other_pol_intersection_point])] + [centroid],
                 contextual_geometry=Polygon(linearring),
-                title=f"Building shadows, orientation: {angle}º, floor: {floor},\ndistance: "
-                      f"{str(distances_by_orientation[str(angle)])}m",
+                title=f"Building shadows, orientation: {angle}º, floor: {floor},"
+                      f"\ncontour to shadow distance: {str(distances_by_orientation[str(angle)])}m, "
+                      f"centroid to contour distance: {str(contour_by_orientation[str(angle)])}m",
                 ax=ax
             )
             pdf.savefig(fig)
             plt.close(fig)
 
-    return distances_by_orientation
+    return {"shadows": distances_by_orientation, "contour": contour_by_orientation}
 
 
 def process_building_parts(building_part_gdf_, building_gdf_, results_dir = None, plots = False,
-                           ratio_communal_areas=0.1, ratio_usable_private_areas=0.72,
-                           orientation_discrete_interval_in_degrees = 5):
-    results = pd.DataFrame()
+                           ratio_communal_areas=0.15, ratio_usable_areas=0.9,
+                           orientation_discrete_interval_in_degrees = 5,
+                           num_workers = max(1, math.ceil(multiprocessing.cpu_count()/3))):
 
     if plots:
         if results_dir is None:
             results_dir = "results"
         os.makedirs(f"{results_dir}/plots", exist_ok=True)
 
-    gdf_global = process_zone_parallel(gdf_building_parts = building_part_gdf_,
+    gdf_global = detect_close_buildings_parallel(gdf_building_parts = building_part_gdf_,
                                        buffer_neighbours = 50,
                                        neighbours_column_name = "nearby_buildings",
                                        neighbours_id_column_name = "building_reference",
-                                       num_workers=max(1, math.ceil(multiprocessing.cpu_count()/3)) )
+                                       num_workers=num_workers)
     gdf_footprints_global = calculate_floor_footprints(
         gdf=gdf_global,
         group_by="building_reference",
@@ -932,246 +935,304 @@ def process_building_parts(building_part_gdf_, building_gdf_, results_dir = None
 
     grouped = gdf_global.groupby("zone_reference")
 
-    for i_zone in tqdm(range(len(grouped)), desc="Inferring attributes of building parts..."):
-        zone_reference = list(grouped.groups.keys())[i_zone]
-        gdf_zone = grouped.get_group(zone_reference).reset_index().drop(['index'], axis=1).copy()
+    zone_references = list(grouped.groups.keys())
 
-        # PDF setup for the zone if pdf_plots is True
+    # Define a wrapper for joblib's delayed processing
+    def process_zone_delayed(zone_reference):
+        zone_gdf = grouped.get_group(zone_reference).reset_index(drop=True)
+        return process_zone(
+            zone_gdf,
+            zone_reference,
+            building_gdf_,
+            gdf_footprints_global,
+            results_dir,
+            plots,
+            ratio_communal_areas,
+            ratio_usable_areas,
+            orientation_discrete_interval_in_degrees
+        )
+
+    # Parallel processing for each zone
+    with tqdm_joblib(tqdm(total=len(zone_references), desc="Inferring geometrical KPIs for each building...")):
+        results_list = Parallel(n_jobs=num_workers)(
+            delayed(process_zone_delayed)(zone_reference) for zone_reference in zone_references
+        )
+
+    # Concatenate all results into a single DataFrame
+    results = pd.concat(results_list, ignore_index=True)
+
+    return results
+
+def process_zone(gdf_zone, zone_reference, building_gdf_, gdf_footprints_global, results_dir, plots, ratio_communal_areas, ratio_usable_areas, orientation_discrete_interval_in_degrees):
+
+    # PDF setup for the zone if pdf_plots is True
+    if plots:
+        pdf = PdfPages(f"{results_dir}/plots/zone_{zone_reference}.pdf")
+
+    # Calculation of the single building references and adjacent buildings
+    gdf_zone = detect_close_buildings(gdf_building_parts = gdf_zone,
+                           buffer_neighbours = 0.5,
+                           neighbours_column_name = "adjacent_buildings",
+                           neighbours_id_column_name = "single_building_reference")
+
+    if plots:
+        fig, ax = plt.subplots()
+        plot_shapely_geometries(gdf_zone.building_part_geometry,
+                                labels=gdf_zone.n_floors_above_ground,
+                                clusters=gdf_zone.single_building_reference,
+                                ax=ax)
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    gdf_aux_footprints = calculate_floor_footprints(
+        gdf=gdf_zone,
+        group_by="single_building_reference",
+        geometry_name="building_part_geometry",
+        min_hole_area=0.5,
+        gap_tolerance=0.05,
+        num_workers=1)
+
+    gdf_aux_footprints_global = calculate_floor_footprints(
+        gdf=gdf_zone,
+        geometry_name="building_part_geometry",
+        min_hole_area=0.5,
+        gap_tolerance=0.05,
+        num_workers=1)
+
+    if plots:
+        fig, ax = plt.subplots()
+        plot_shapely_geometries(gdf_aux_footprints.geometry, clusters=gdf_aux_footprints.group, ax=ax)
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    # Detect all the patios in a zone
+    patios_detected = {}
+    for floor in range(gdf_aux_footprints.floor.max() + 1):
+        patios_detected[floor] = (
+            get_all_patios(gdf_aux_footprints_global[gdf_aux_footprints_global['floor']==floor].geometry))
+
+    unique_patios_detected = unique_polygons(list(itertools.chain(*patios_detected.values())),tolerance=0.1)
+
+    if plots:
+        fig, ax = plt.subplots()
+        plot_shapely_geometries([i.exterior for i in gdf_zone.building_part_geometry] + unique_patios_detected, ax=ax)
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    # Close the PDF file for the current zone
+    if plots:
+        pdf.close()
+
+    results_ = []
+
+    for single_building_reference, building_gdf_item in gdf_zone.groupby('single_building_reference'):
+        # grouped2 = gdf_zone.groupby("single_building_reference")
+        # single_building_reference = list(grouped2.groups.keys())[0]
+        # building_gdf_item = grouped2.get_group(single_building_reference).reset_index().drop(['index'], axis=1).copy()
+
+        # PDF setup for the building if plots is True
         if plots:
-            pdf = PdfPages(f"{results_dir}/plots/zone_{zone_reference}.pdf")
+            pdf = PdfPages(f"{results_dir}/plots/building_{single_building_reference}.pdf")
 
-        # Calculation of the single building references and adjacent buildings
-        gdf_zone = process_zone(gdf_building_parts = gdf_zone,
-                               buffer_neighbours = 0.5,
-                               neighbours_column_name = "adjacent_buildings",
-                               neighbours_id_column_name = "single_building_reference")
+        # Obtain a general geometry of the building, considering all floors.
+        building_geom = union_geoseries_with_tolerance(building_gdf_item['building_part_geometry'], gap_tolerance=0.05,
+                                                       resolution=16)
 
+        # Extract and clean the set of neighbouring buildings
+        adjacent_buildings_set = {id for ids in building_gdf_item['adjacent_buildings'] for id in ids.split(",")}
+        adjacent_buildings_set.discard(
+            single_building_reference)  # Safely remove the single_building_reference itself if present
+        adjacent_buildings = sorted(adjacent_buildings_set)
+
+        # Extract and clean the set of nearby buildings
+        nearby_buildings_set = {id for ids in building_gdf_item['nearby_buildings'] for id in ids.split(",")}
+        nearby_buildings_set.discard(
+            single_building_reference.split("_")[0])  # Safely remove the single_building_reference itself if present
+        nearby_buildings = sorted(nearby_buildings_set)
+
+        # Is there any premises in ground floor?
+        premises = False
+        premises_activity_typologies = []
+        premises_names = []
+        premises_last_revision = []
+        if "number_of_ground_premises" in building_gdf_item.columns:
+            if (~np.isfinite(building_gdf_item.iloc[0]["number_of_ground_premises"]) and
+                    building_gdf_item.iloc[0]["number_of_ground_premises"] > 0):
+                premises = True
+                premises_activity_typologies = building_gdf_item.iloc[0]["ground_premises_activities"]
+                premises_names = building_gdf_item.iloc[0]["ground_premises_names"]
+                premises_last_revision = building_gdf_item.iloc[0]["ground_premises_last_revision"]
+
+        # Filter building in study
+        gdf_aux_footprint_building = gdf_aux_footprints[gdf_aux_footprints['group'] == single_building_reference]
         if plots:
             fig, ax = plt.subplots()
-            plot_shapely_geometries(gdf_zone.building_part_geometry,
-                                    labels=gdf_zone.n_floors_above_ground,
-                                    clusters=gdf_zone.single_building_reference,
-                                    ax=ax)
+            plot_shapely_geometries(list(gdf_aux_footprint_building.geometry), ax=ax,
+                                    title = "Building in analysis")
             pdf.savefig(fig)
             plt.close(fig)
 
-        gdf_aux_footprints = calculate_floor_footprints(
-            gdf=gdf_zone,
-            group_by="single_building_reference",
-            geometry_name="building_part_geometry",
-            min_hole_area=0.5,
-            gap_tolerance=0.05)
-
-        gdf_aux_footprints_global = calculate_floor_footprints(
-            gdf=gdf_zone,
-            geometry_name="building_part_geometry",
-            min_hole_area=0.5,
-            gap_tolerance=0.05)
-
+        # Filter related buildings footprint
+        gdf_aux_footprints_ = gdf_aux_footprints[gdf_aux_footprints['group'].isin(adjacent_buildings)]
         if plots:
             fig, ax = plt.subplots()
-            plot_shapely_geometries(gdf_aux_footprints.geometry, clusters=gdf_aux_footprints.group, ax=ax)
+            plot_shapely_geometries(gdf_aux_footprints_.geometry, clusters=gdf_aux_footprints_.group, ax=ax,
+                                    contextual_geometry = building_geom,
+                                    title = "Adjacent buildings")
             pdf.savefig(fig)
             plt.close(fig)
 
-        # Detect all the patios in a zone
-        patios_detected = {}
-        for floor in range(gdf_aux_footprints.floor.max() + 1):
-            patios_detected[floor] = (
-                get_all_patios(gdf_aux_footprints_global[gdf_aux_footprints_global['floor']==floor].geometry))
-
-        unique_patios_detected = unique_polygons(list(itertools.chain(*patios_detected.values())),tolerance=0.1)
-
+        # Filter related buildings footprint
+        gdf_aux_footprints_nearby = gdf_footprints_global[gdf_footprints_global['group'].isin(nearby_buildings)]
         if plots:
             fig, ax = plt.subplots()
-            plot_shapely_geometries([i.exterior for i in gdf_zone.building_part_geometry] + unique_patios_detected, ax=ax)
+            plot_shapely_geometries(gdf_aux_footprints_nearby.geometry, clusters=gdf_aux_footprints_nearby.group, ax=ax,
+                                    contextual_geometry=building_geom,
+                                    title="Nearby buildings")
             pdf.savefig(fig)
             plt.close(fig)
 
-        # Close the PDF file for the current zone
-        if plots:
-            pdf.close()
+        floor_area = {}
+        underground_floor_area = {}
+        roof_area = {}
+        patios_area = {}
+        patios_n = {}
+        perimeter = {}
+        air_contact_wall = {}
+        shadows_at_distance = {}
+        adiabatic_wall = {}
+        patios_wall = {}
+        n_floors = gdf_aux_footprint_building.floor.max() if gdf_aux_footprint_building.floor.max() > 0 else np.nan
+        n_underground_floors = -gdf_aux_footprint_building.floor.min() if gdf_aux_footprint_building.floor.min() < 0 else 0
+        floor_area_with_possible_residential_use = []
+        n_dwellings = building_gdf_[
+                building_gdf_["building_reference"] == building_gdf_item.iloc[0]["building_reference"]
+            ].iloc[0]["n_dwellings"]
+        n_items = building_gdf_[
+                building_gdf_["building_reference"] == building_gdf_item.iloc[0]["building_reference"]
+            ].iloc[0]["n_building_units"] - n_dwellings
+        n_buildings = len(
+            gdf_zone[
+                    gdf_zone["building_reference"] == building_gdf_item.iloc[0]["building_reference"]
+                ]["single_building_reference"].unique()
+        )
+        if n_dwellings == 0:
+            building_type = "Non-residential"
+            ratio_communal_areas_ = 0.0
+            ratio_usable_private_areas_ = 0.0
+        elif n_dwellings == 1:
+            building_type = "Single-family"
+            ratio_communal_areas_ = 0.0
+            ratio_usable_private_areas_ = ratio_usable_areas
+        elif n_dwellings > 1:
+            building_type = "Multi-family"
+            ratio_communal_areas_ = ratio_communal_areas
+            ratio_usable_private_areas_ = ratio_usable_areas - ratio_communal_areas
 
-        results_ = []
+        if n_underground_floors > 0:
 
-        for single_building_reference, building_gdf_item in gdf_zone.groupby('single_building_reference'):
-            # grouped2 = gdf_zone.groupby("single_building_reference")
-            # single_building_reference = list(grouped2.groups.keys())[8]
-            # building_gdf_item = grouped2.get_group(single_building_reference).reset_index().drop(['index'], axis=1).copy()
+            for underground_floor in range(1,(n_underground_floors+1)):
+                underground_floor_area[(underground_floor)] = round(
+                    gdf_aux_footprint_building[gdf_aux_footprint_building["floor"] == -(underground_floor)]['geometry'].area.sum(),
+                    2
+                )
 
-            # PDF setup for the building if plots is True
-            if plots:
-                pdf = PdfPages(f"{results_dir}/plots/building_{single_building_reference}.pdf")
+        if n_floors is not np.nan:
 
-            # Obtain a general geometry of the building, considering all floors.
-            building_geom = union_geoseries_with_tolerance(building_gdf_item['building_part_geometry'], gap_tolerance=0.05,
-                                                           resolution=16)
-
-            # Extract and clean the set of neighbouring buildings
-            adjacent_buildings_set = {id for ids in building_gdf_item['adjacent_buildings'] for id in ids.split(",")}
-            adjacent_buildings_set.discard(
-                single_building_reference)  # Safely remove the single_building_reference itself if present
-            adjacent_buildings = sorted(adjacent_buildings_set)
-
-            # Extract and clean the set of nearby buildings
-            nearby_buildings_set = {id for ids in building_gdf_item['nearby_buildings'] for id in ids.split(",")}
-            nearby_buildings_set.discard(
-                single_building_reference.split("_")[0])  # Safely remove the single_building_reference itself if present
-            nearby_buildings = sorted(nearby_buildings_set)
-
-            # Is there any premises in ground floor?
-            premises = False
-            if "number_of_ground_premises" in building_gdf_item.columns:
-                if (~np.isfinite(building_gdf_item.iloc[0]["number_of_ground_premises"]) and
-                        building_gdf_item.iloc[0]["number_of_ground_premises"] > 0):
-                    premises = True
-
-            # Filter building in study
-            gdf_aux_footprint_building = gdf_aux_footprints[gdf_aux_footprints['group'] == single_building_reference]
-            if plots:
-                fig, ax = plt.subplots()
-                plot_shapely_geometries(list(gdf_aux_footprint_building.geometry), ax=ax,
-                                        title = "Building in analysis")
-                pdf.savefig(fig)
-                plt.close(fig)
-
-            # Filter related buildings footprint
-            gdf_aux_footprints_ = gdf_aux_footprints[gdf_aux_footprints['group'].isin(adjacent_buildings)]
-            if plots:
-                fig, ax = plt.subplots()
-                plot_shapely_geometries(gdf_aux_footprints_.geometry, clusters=gdf_aux_footprints_.group, ax=ax,
-                                        contextual_geometry = building_geom,
-                                        title = "Adjacent buildings")
-                pdf.savefig(fig)
-                plt.close(fig)
-
-            # Filter related buildings footprint
-            gdf_aux_footprints_nearby = gdf_footprints_global[gdf_footprints_global['group'].isin(nearby_buildings)]
-            if plots:
-                fig, ax = plt.subplots()
-                plot_shapely_geometries(gdf_aux_footprints_nearby.geometry, clusters=gdf_aux_footprints_nearby.group, ax=ax,
-                                        contextual_geometry=building_geom,
-                                        title="Nearby buildings")
-                pdf.savefig(fig)
-                plt.close(fig)
-
-            floor_area = {}
-            underground_floor_area = {}
-            roof_area = {}
-            patios_area = {}
-            patios_n = {}
-            perimeter = {}
-            air_contact_wall = {}
-            shadows_at_distance = {}
-            adiabatic_wall = {}
-            patios_wall = {}
-            n_floors = gdf_aux_footprint_building.floor.max()
-            n_underground_floors = -gdf_aux_footprint_building.floor.min() if gdf_aux_footprint_building.floor.min() < 0 else 0
-            n_dwellings = building_gdf_[
-                    building_gdf_["building_reference"] == building_gdf_item.iloc[0]["building_reference"]
-                ].iloc[0]["n_dwellings"]
-            n_items = building_gdf_[
-                    building_gdf_["building_reference"] == building_gdf_item.iloc[0]["building_reference"]
-                ].iloc[0]["n_building_units"] - n_dwellings
-            n_buildings = len(
-                gdf_zone[
-                        gdf_zone["building_reference"] == building_gdf_item.iloc[0]["building_reference"]
-                    ]["single_building_reference"].unique()
-            )
-            if n_dwellings == 0:
-                building_type = "Non-residential"
-                ratio_communal_areas_ = np.nan
-                ratio_usable_private_areas_ = 0.9
-            elif n_dwellings == 1:
-                building_type = "Single-family"
-                ratio_communal_areas_ = 0.0
-                ratio_usable_private_areas_ = 0.9
-            elif n_dwellings > 1:
-                building_type = "Multi-family"
-                ratio_communal_areas_ = ratio_communal_areas
-                ratio_usable_private_areas_ = ratio_usable_private_areas
-
-            if n_underground_floors > 0:
-
-                for underground_floor in range(n_underground_floors):
-                    underground_floor_area[underground_floor] = round(
-                        gdf_aux_footprint_building[gdf_aux_footprint_building["floor"] == -underground_floor]['geometry'].area.sum(),
-                        2
-                    )
-
-            if n_floors is not np.nan:
-
-                for floor in range(n_floors + 1):
-                    floor_area[floor] = round(
+            for floor in range(n_floors + 1):
+                floor_area[floor] = round(
+                    gdf_aux_footprint_building[gdf_aux_footprint_building["floor"] == floor]['geometry'].area.sum(),
+                    2
+                )
+                if floor == n_floors:
+                    roof_area[floor] = round(
                         gdf_aux_footprint_building[gdf_aux_footprint_building["floor"] == floor]['geometry'].area.sum(),
                         2
                     )
-                    if floor == n_floors:
-                        roof_area[floor] = round(
-                            gdf_aux_footprint_building[gdf_aux_footprint_building["floor"] == floor]['geometry'].area.sum(),
-                            2
-                        )
-                    else:
-                        roof_area[floor] = round(
-                            gdf_aux_footprint_building[gdf_aux_footprint_building["floor"] == floor][
-                                'geometry'].area.sum() -
-                            gdf_aux_footprint_building[gdf_aux_footprint_building["floor"] == (floor + 1)][
-                                'geometry'].area.sum(),
-                            2
-                        )
-                    patios = patios_in_the_building(
-                        patios_geoms=patios_detected[floor],
-                        building_geom=building_geom,
-                        tolerance=0.05
+                else:
+                    roof_area[floor] = round(
+                        gdf_aux_footprint_building[gdf_aux_footprint_building["floor"] == floor][
+                            'geometry'].area.sum() -
+                        gdf_aux_footprint_building[gdf_aux_footprint_building["floor"] == (floor + 1)][
+                            'geometry'].area.sum(),
+                        2
                     )
-                    patios_n[floor] = len(patios)
-                    patios_area[floor] = round(sum([patio.area for patio in patios]), 2)
-                    walls = gdf_aux_footprint_building[gdf_aux_footprint_building["floor"] == floor]['geometry']
-                    if isinstance(list(walls)[0], MultiPolygon):
-                        walls = [walls_i for walls_i in list(walls)[0].geoms]
-                    elif isinstance(list(walls)[0], Polygon):
-                        walls = list(walls)
+                patios = patios_in_the_building(
+                    patios_geoms=patios_detected[floor],
+                    building_geom=building_geom,
+                    tolerance=0.8
+                )
+                patios_n[floor] = len(patios)
+                patios_area[floor] = round(sum([patio.area for patio in patios]), 2)
+                walls = gdf_aux_footprint_building[gdf_aux_footprint_building["floor"] == floor]['geometry']
+                if isinstance(list(walls)[0], MultiPolygon):
+                    walls = [walls_i for walls_i in list(walls)[0].geoms]
+                elif isinstance(list(walls)[0], Polygon):
+                    walls = list(walls)
 
-                    # Initialize the lengths for each type of wall contact and for each orientation
-                    air_contact_wall[floor] = {direction: 0.0 for direction in [str(i) for i in
-                                                                                list(range(0, 360, orientation_discrete_interval_in_degrees))]}
-                    adiabatic_wall[floor] = 0.0
-                    patios_wall[floor] = 0.0
-                    perimeter[floor] = round(sum([peri.exterior.length for peri in walls]), 2)
+                # Initialize the lengths for each type of wall contact and for each orientation
+                air_contact_wall[floor] = {direction: 0.0 for direction in [str(i) for i in
+                                                                            list(range(0, 360, orientation_discrete_interval_in_degrees))]}
+                adiabatic_wall[floor] = 0.0
+                patios_wall[floor] = 0.0
+                perimeter[floor] = round(sum([peri.exterior.length for peri in walls]), 2)
 
-                    for geom in walls:
+                for geom in walls:
 
-                        # Indoor patios
-                        patios_wall[floor] += sum([item.length for item in list(geom.interiors)])
+                    # Indoor patios
+                    patios_wall[floor] += sum([item.length for item in list(geom.interiors)])
 
-                        # Break down the exterior into segments
-                        exterior_coords = list(orient(geom, sign=-1.0).exterior.coords)
-                        for i in range(len(exterior_coords) - 1):
-                            segment_assigned = False
-                            segment = LineString([exterior_coords[i], exterior_coords[i + 1]])
-                            if segment.length < 0.001:
-                                continue
+                    # Break down the exterior into segments
+                    exterior_coords = list(orient(geom, sign=-1.0).exterior.coords)
+                    for i in range(len(exterior_coords) - 1):
+                        segment_assigned = False
+                        segment = LineString([exterior_coords[i], exterior_coords[i + 1]])
+                        if segment.length < 0.001:
+                            continue
 
-                            # Determine the orientation of this segment
-                            segment_orientation = str(calculate_wall_outdoor_normal_orientation(
-                                segment,
-                                orientation_interval=orientation_discrete_interval_in_degrees))
+                        # Determine the orientation of this segment
+                        segment_orientation = str(calculate_wall_outdoor_normal_orientation(
+                            segment,
+                            orientation_interval=orientation_discrete_interval_in_degrees))
 
-                            # Check if the segment is in contact with patios
-                            for patio in patios:
+                        # Check if the segment is in contact with patios
+                        for patio in patios:
+                            if segment_intersects_with_tolerance(
+                                    segment, patio,
+                                    buffer_distance=0.1,
+                                    area_percentage_threshold=15
+                            ):
+                                patios_wall[floor] += round(segment.length, 2)
+                                if plots:
+                                    fig, ax = plt.subplots()
+                                    plot_shapely_geometries(
+                                        geometries = [geom] + [segment],
+                                        title = f"Wall ID:{i}, floor: {floor},\n"
+                                                f"orientation: {segment_orientation},"
+                                                f"type: patio",
+                                        ax = ax,
+                                        contextual_geometry = building_geom)
+                                    pdf.savefig(fig)
+                                    plt.close(fig)
+                                segment_assigned = True
+                                break
+
+                        # Check if the segment is in contact with nearby buildings
+                        if not segment_assigned:
+                            for aux_geom in gdf_aux_footprints_[gdf_aux_footprints_.floor == floor].geometry:
                                 if segment_intersects_with_tolerance(
-                                        segment, patio,
+                                        segment, aux_geom,
                                         buffer_distance=0.1,
                                         area_percentage_threshold=15
                                 ):
-                                    patios_wall[floor] += round(segment.length, 2)
+                                    adiabatic_wall[floor] += round(segment.length, 2)
                                     if plots:
                                         fig, ax = plt.subplots()
                                         plot_shapely_geometries(
                                             geometries = [geom] + [segment],
-                                            title = f"Wall ID:{i}, floor: {floor},\n"
-                                                    f"orientation: {segment_orientation},"
-                                                    f"type: patio",
+                                            title = f"Wall ID: {i}, floor: {floor},\n"
+                                                    f"orientation: {segment_orientation}, "
+                                                    f"type: adiabatic",
                                             ax = ax,
                                             contextual_geometry = building_geom)
                                         pdf.savefig(fig)
@@ -1179,125 +1240,134 @@ def process_building_parts(building_part_gdf_, building_gdf_, results_dir = None
                                     segment_assigned = True
                                     break
 
-                            # Check if the segment is in contact with nearby buildings
-                            if not segment_assigned:
-                                for aux_geom in gdf_aux_footprints_[gdf_aux_footprints_.floor == floor].geometry:
-                                    if segment_intersects_with_tolerance(
-                                            segment, aux_geom,
-                                            buffer_distance=0.1,
-                                            area_percentage_threshold=15
-                                    ):
-                                        adiabatic_wall[floor] += round(segment.length, 2)
-                                        if plots:
-                                            fig, ax = plt.subplots()
-                                            plot_shapely_geometries(
-                                                geometries = [geom] + [segment],
-                                                title = f"Wall ID: {i}, floor: {floor},\n"
-                                                        f"orientation: {segment_orientation}, "
-                                                        f"type: adiabatic",
-                                                ax = ax,
-                                                contextual_geometry = building_geom)
-                                            pdf.savefig(fig)
-                                            plt.close(fig)
-                                        segment_assigned = True
-                                        break
+                        # Check if the segment is in contact with outdoor (air contact)
+                        if not segment_assigned:
+                            air_contact_wall[floor][segment_orientation] += round(segment.length, 2)
+                            if plots:
+                                fig, ax = plt.subplots()
+                                plot_shapely_geometries(
+                                    geometries = [geom] + [segment],
+                                    title = f"Wall ID: {i}, floor: {floor},\n"
+                                            f"orientation: {segment_orientation}, "
+                                            f"type: air contact",
+                                    ax = ax,
+                                    contextual_geometry = building_geom)
+                                pdf.savefig(fig)
+                                plt.close(fig)
+            # Close the PDF file for the current building
+            if plots:
+                pdf.close()
 
-                            # Check if the segment is in contact with outdoor (air contact)
-                            if not segment_assigned:
-                                air_contact_wall[floor][segment_orientation] += round(segment.length, 2)
-                                if plots:
-                                    fig, ax = plt.subplots()
-                                    plot_shapely_geometries(
-                                        geometries = [geom] + [segment],
-                                        title = f"Wall ID: {i}, floor: {floor},\n"
-                                                f"orientation: {segment_orientation}, "
-                                                f"type: air contact",
-                                        ax = ax,
-                                        contextual_geometry = building_geom)
-                                    pdf.savefig(fig)
-                                    plt.close(fig)
-
-                # Close the PDF file for the current building
-                if plots:
-                    pdf.close()
-
-                # Shadows depending orientation
-                if plots:
-                    pdf = PdfPages(f"{results_dir}/plots/building_{single_building_reference}_shadows.pdf")
+            if building_type == "Non-residential":
+                starting_residential_floor = np.nan
+            elif premises:
+                starting_residential_floor = 1
+                if building_type == "Multi-family" and n_floors >= n_dwellings:
+                    n_dwellings = n_dwellings - 1
+            else:
+                if n_floors > 6 and building_type == "Multi-family":
+                    starting_residential_floor = 1
                 else:
-                    pdf = None
-                for floor in range(max(gdf_aux_footprint_building.floor.max(),
-                                       gdf_aux_footprints_nearby.floor.max()) + 1):
-                    # shadows_at_distance[floor] = distance_from_points_to_polygons_by_orientation(
-                    #     linearring=building_geom.exterior if isinstance(building_geom, Polygon) else (
-                    #         MultiLineString([LineString(polygon.exterior.coords) for polygon in building_geom.geoms])),
-                    #     other_polygons=gdf_aux_footprints_nearby[gdf_aux_footprints_nearby.floor==floor].geometry,
-                    #     num_points = 25,
-                    #     orientation_interval = orientation_discrete_interval_in_degrees,
-                    #     plots = plots,
-                    #     pdf = pdf,
-                    #     floor = floor
-                    # )
-                    shadows_at_distance[floor] = distance_from_centroid_to_polygons_by_orientation(
-                        linearring=building_geom.exterior if isinstance(building_geom, Polygon) else (
-                            MultiLineString([LineString(polygon.exterior.coords) for polygon in building_geom.geoms])),
-                        other_polygons=gdf_aux_footprints_nearby[gdf_aux_footprints_nearby.floor == floor].geometry,
-                        centroid=building_geom.centroid,
-                        orientation_interval=orientation_discrete_interval_in_degrees,
-                        plots=plots,
-                        pdf=pdf,
-                        floor=floor
-                    )
-                if plots:
-                    pdf.close()
+                    starting_residential_floor = 0
+            floor_area_with_possible_residential_use = [floor_area[floor] if floor >= starting_residential_floor or starting_residential_floor is np.nan else 0.0 for floor in range(n_floors + 1)]
 
-                if premises:
-                    floor_area_with_dwellings = [floor_area[floor] for floor in range(1, n_floors + 1)]
-                    if building_type == "Multi-family" and n_floors >= n_dwellings:
-                        n_dwellings = n_dwellings - 1
-                else:
-                    floor_area_with_dwellings = [floor_area[floor] for floor in range(n_floors + 1)]
+        if max(gdf_aux_footprint_building.floor.max(), gdf_aux_footprints_nearby.floor.max()) > 0:
 
-                # Store results
-                results_.append({
-                    'building_reference': single_building_reference.split("_")[0],
-                    'single_building_reference': single_building_reference,
-                    'n_floors': n_floors,
-                    'total_n_dwellings': n_dwellings,
-                    'total_n_items': n_items,
-                    'n_buildings': n_buildings,
-                    'type': building_type,
-                    'ground_commercial_premises': premises,
-                    'n_underground_floors': n_underground_floors,
-                    'underground_floor_area': underground_floor_area,
-                    'partial_underground_built_area': np.sum([underground_floor_area[floor] for floor in range(n_underground_floors + 1)]),
-                    'floor_area': [floor_area[floor] for floor in range(n_floors + 1)],
-                    'roof_area': [roof_area[floor] for floor in range(n_floors + 1)],
-                    'partial_built_area': np.sum([floor_area[floor] for floor in range(n_floors + 1)]),
-                    'partial_estimated_usable_private_area': np.sum(floor_area_with_dwellings) * ratio_usable_private_areas_,
-                    'partial_estimated_communal_area': np.sum(floor_area_with_dwellings) * ratio_communal_areas_,
-                    'patios_area': [patios_area[floor] for floor in range(n_floors + 1)],
-                    'patios_n': [patios_n[floor] for floor in range(n_floors + 1)],
-                    'perimeter': [perimeter[floor] for floor in range(n_floors + 1)],
-                    'air_contact_wall': {key: [air_contact_wall[d][key] for d in air_contact_wall] for key in
-                                         air_contact_wall[0]},
-                    'adiabatic_wall': [adiabatic_wall[floor] for floor in range(n_floors + 1)],
-                    'patios_wall': [patios_wall[floor] for floor in range(n_floors + 1)],
-                    'shadows_at_distance': {key: [shadows_at_distance[d][key] for d in shadows_at_distance] for key in
-                                            shadows_at_distance[0]}
-                })
+            # Shadows depending orientation
+            if plots:
+                pdf = PdfPages(f"{results_dir}/plots/building_{single_building_reference}_shadows.pdf")
+            else:
+                pdf = None
+            for floor in range(max(gdf_aux_footprint_building.floor.max(),
+                                   gdf_aux_footprints_nearby.floor.max()) + 1):
+                # shadows_at_distance[floor] = distance_from_points_to_polygons_by_orientation(
+                #     linearring=building_geom.exterior if isinstance(building_geom, Polygon) else (
+                #         MultiLineString([LineString(polygon.exterior.coords) for polygon in building_geom.geoms])),
+                #     other_polygons=gdf_aux_footprints_nearby[gdf_aux_footprints_nearby.floor==floor].geometry,
+                #     num_points = 25,
+                #     orientation_interval = orientation_discrete_interval_in_degrees,
+                #     plots = plots,
+                #     pdf = pdf,
+                #     floor = floor
+                # )
+                shadows_at_distance[floor] = distance_from_centroid_to_polygons_by_orientation(
+                    linearring=building_geom.exterior if isinstance(building_geom, Polygon) else (
+                        MultiLineString([LineString(polygon.exterior.coords) for polygon in building_geom.geoms])),
+                    other_polygons=gdf_aux_footprints_nearby[gdf_aux_footprints_nearby.floor == floor].geometry,
+                    centroid=building_geom.centroid,
+                    orientation_interval=orientation_discrete_interval_in_degrees,
+                    plots=plots,
+                    pdf=pdf,
+                    floor=floor
+                )
+            if plots:
+                pdf.close()
+
+        # Store results
+        results_.append({
+            'building_reference': single_building_reference.split("_")[0],
+            'single_building_reference': single_building_reference,
+            'total_n_dwellings': n_dwellings,
+            'total_n_other_building_items': n_items,
+            'n_buildings': n_buildings,
+            'type': building_type,
+            'exists_ground_commercial_premises': premises,
+            'ground_commercial_premises_names': premises_names,
+            'ground_commercial_premises_typology': premises_activity_typologies,
+            'ground_commercial_premises_last_revision': premises_last_revision,
+            'n_floors': n_floors+1,
+            'n_underground_floors': n_underground_floors,
+            'built_area_below_ground_by_floor': [underground_floor_area[floor] for floor in range(1,n_underground_floors + 1)] if n_underground_floors > 0 else [],
+            'built_area_below_ground_total': np.sum([underground_floor_area[floor] for floor in range(1,n_underground_floors + 1)]) if n_underground_floors > 0 else [],
+            'built_area_above_ground_by_floor': [floor_area[floor] for floor in range(n_floors + 1)] if n_floors is not np.nan else [],
+            'built_area_above_ground_total': np.sum([floor_area[floor] for floor in range(n_floors + 1)]) if n_floors is not np.nan else 0.0,
+            'roof_area_above_ground_by_floor': [roof_area[floor] for floor in range(n_floors + 1)] if n_floors is not np.nan else [],
+            'roof_area_above_ground': np.sum([roof_area[floor] for floor in range(n_floors + 1)]) if n_floors is not np.nan else 0.0,
+            'building_footprint_area': round(building_geom.area if isinstance(building_geom, Polygon)
+                                             else sum(polygon.area for polygon in building_geom.geoms) if isinstance(building_geom, MultiPolygon)
+                                             else 0.0, 2),
+            'building_footprint': building_geom.exterior if isinstance(building_geom, Polygon) else (
+                        MultiLineString([LineString(polygon.exterior.coords) for polygon in building_geom.geoms])),
+            'residential_area_by_floor': floor_area_with_possible_residential_use,
+            'usable_residential_area': np.sum(floor_area_with_possible_residential_use) * ratio_usable_private_areas_ if floor_area_with_possible_residential_use != [] else 0.0,
+            'communal_residential_area': np.sum(floor_area_with_possible_residential_use) * ratio_communal_areas_ if floor_area_with_possible_residential_use != [] else 0.0,
+            'patios_area_by_floor': [patios_area[floor] for floor in range(n_floors + 1)] if patios_area != {} else [],
+            'patios_n_by_floor': [patios_n[floor] for floor in range(n_floors + 1)] if patios_n != {} else [],
+            'patios_area_common': np.max([patios_area[floor] for floor in range(n_floors + 1)]) if patios_area != {} else 0.0,
+            'patios_n_common': np.max([patios_n[floor] for floor in range(n_floors + 1)]) if patios_n != {} else 0,
+            'perimeter': [perimeter[floor] for floor in range(n_floors + 1)] if perimeter != {} else [],
+            'air_contact_wall_by_floor': {key: [air_contact_wall[d][key] for d in air_contact_wall] for key in
+                                 air_contact_wall[0]} if air_contact_wall != {} else {},
+            'air_contact_wall_total':  {key: np.sum([air_contact_wall[d][key] for d in air_contact_wall]) for key in
+                                 air_contact_wall[0]} if air_contact_wall != {} else {},
+            'adiabatic_wall_by_floor': [adiabatic_wall[floor] for floor in range(n_floors + 1)] if adiabatic_wall != {} else [],
+            'adiabatic_wall_total': np.sum([adiabatic_wall[floor] for floor in range(n_floors + 1)]) if adiabatic_wall != {} else 0.0,
+            'patios_wall_by_floor': [patios_wall[floor] for floor in range(n_floors + 1)] if patios_wall != {} else [],
+            'patios_wall_total': np.sum([patios_wall[floor] for floor in range(n_floors + 1)]) if patios_wall != {} else 0.0,
+            'shadows_at_distance': {key: [shadows_at_distance[d]['shadows'][key] for d in shadows_at_distance] for key in
+                                    shadows_at_distance[0]['shadows']} if shadows_at_distance != {} else {},
+            'building_contour_at_distance': {key: np.mean([shadows_at_distance[d]['contour'][key] for d in shadows_at_distance]) for key in
+                                    shadows_at_distance[0]['contour']} if shadows_at_distance != {} else {}
+        })
+    if len(results_)>0:
         results_ = pd.DataFrame(results_)
-        results_["total_estimated_usable_private_area"] = results_.groupby("building_reference")[
-            "partial_estimated_usable_private_area"].transform("sum")
-        results_["ratio_estimated_usable_private_area"] = (results_["partial_estimated_usable_private_area"] /
-                                                           results_["total_estimated_usable_private_area"])
-        results_["partial_n_dwellings"] = int(round(results_["total_n_dwellings"] *
-                                                    results_["ratio_estimated_usable_private_area"], 0))
-        results_["estimated_usable_area_per_dwelling"] = (results_["partial_estimated_usable_private_area"] /
-                                                          results_["partial_n_dwellings"])
-        results = pd.concat([results, results_])
+        results_["total_usable_residential_area"] = results_.groupby("building_reference")[
+            "usable_residential_area"].transform("sum")
+        results_["ratio_usable_residential_area"] = (results_["usable_residential_area"] /
+                                                           results_["total_usable_residential_area"])
+        results_["ratio_usable_residential_area"] = np.where(
+            np.isnan(results_["ratio_usable_residential_area"]), 0.0,
+            results_["ratio_usable_residential_area"])
+        results_["n_dwellings"] = (results_["total_n_dwellings"] *
+                                           results_["ratio_usable_residential_area"]).astype(int)
+        results_["n_dwellings_per_floor"] = math.ceil(n_dwellings / np.sum([item>0 for item in floor_area_with_possible_residential_use]))
+        results_["usable_area_per_dwelling"] = (results_["usable_residential_area"] /
+                                                        results_["n_dwellings"])
+        results_["usable_area_per_dwelling"] = np.where(
+            np.isnan(results_["usable_area_per_dwelling"]), 0.0,
+            results_["usable_area_per_dwelling"])
 
-    return results
+    return results_
 
 def plot_shapely_geometries(geometries, labels=None, clusters=None, ax=None, title=None, contextual_geometry=None):
     """
@@ -1534,9 +1604,9 @@ def load_and_transform_barcelona_ground_premises(open_data_layers_dir):
     )
     ground_premises = ground_premises.groupby("Referencia_Cadastral").agg(
         cases=('Referencia_Cadastral', 'size'),
-        activity=('Nom_Activitat', lambda x: list(x)),
-        name=('Nom_Local', lambda x: list(x)),
-        last_revision=('Data_Revisio', 'max')
+        ground_premises_activities=('Nom_Activitat', lambda x: list(x)),
+        ground_premises_names=('Nom_Local', lambda x: list(x)),
+        ground_premises_last_revision=('Data_Revisio', 'max')
     ).reset_index().rename({"Referencia_Cadastral": "building_reference",
                             "cases": "number_of_ground_premises",
                             "last_revision": "last_revision_ground_premises"}, axis=1)
