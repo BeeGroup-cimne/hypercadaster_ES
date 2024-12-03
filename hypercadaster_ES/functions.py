@@ -75,7 +75,8 @@ def download(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
 
 def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
           neighborhood_layer=True, postal_code_layer=True, census_layer=True, elevations_layer=True,
-          open_data_layers=True, building_parts_inference=False, building_parts_plots=False):
+          open_data_layers=True, building_parts_inference=False, building_parts_plots=False,
+          building_parts_inference_using_CAT_files=False, CAT_files_rel_dir="CAT_files"):
 
     # Filter which geographical area to download
     if ine_codes is not None and cadaster_codes is not None:
@@ -98,9 +99,11 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
         cadaster_codes=cadaster_codes,
         results_dir=utils.results_dir(wd),
         building_parts_inference=building_parts_inference,
+        building_parts_inference_using_CAT_files=building_parts_inference_using_CAT_files,
         building_parts_plots=building_parts_plots,
         open_data_layers=open_data_layers,
-        open_data_layers_dir=utils.open_data_dir(wd))
+        open_data_layers_dir=utils.open_data_dir(wd),
+        CAT_files_dir=f"{wd}/{CAT_files_rel_dir}")
 
     if census_layer:
         gdf = mergers.join_by_census_tracts(

@@ -1,10 +1,11 @@
+import os
+
 import geopandas as gpd
 import pandas as pd
 import rasterio
 from shapely import wkt
 from hypercadaster_ES import utils
 import sys
-from charset_normalizer import from_path
 
 def make_valid(gdf):
     gdf.geometry = gdf.geometry.make_valid()
@@ -67,7 +68,8 @@ def get_cadaster_address(cadaster_dir, cadaster_codes):
 
 
 def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, building_parts_plots=False,
-                           building_parts_inference=False, open_data_layers=False, open_data_layers_dir=None):
+                           building_parts_inference=False, building_parts_inference_using_CAT_files=False,
+                           open_data_layers=False, open_data_layers_dir=None, CAT_files_dir=None):
 
     sys.stderr.write(f"\nJoining the buildings description for {len(cadaster_codes)} municipalities\n")
 
@@ -78,6 +80,7 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, build
         sys.stderr.write(f"\r\tCadaster code: {code}")
         sys.stderr.flush()
 
+        # Parse building harmonised to INSPIRE
         building_gdf_ = gpd.read_file(f"{cadaster_dir}/buildings/unzip/A.ES.SDGC.BU.{code}.building.gml", layer="Building")
         if "building_gdf" in locals():
             if building_gdf_.crs != building_gdf.crs:
@@ -105,6 +108,13 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, build
             inplace=True, axis=1)
 
         if building_parts_inference:
+
+            # Parse CAT file, if available
+            if building_parts_inference_using_CAT_files:
+                buildings_CAT = utils.parse_horizontal_division_buildings_CAT_files(code, CAT_files_dir)
+            else:
+                buildings_CAT = None
+
             building_part_gdf_ = gpd.read_file(f"{cadaster_dir}/buildings/unzip/A.ES.SDGC.BU.{code}.buildingpart.gml",
                                           layer="BuildingPart")
 
@@ -143,8 +153,8 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, build
                                                              on="building_reference", how="left")
 
             # Process the building parts
-            building_part_gdf_ = utils.process_building_parts(building_part_gdf_, building_gdf_, results_dir=results_dir,
-                                                              plots=building_parts_plots)
+            building_part_gdf_ = utils.process_building_parts(building_part_gdf_, building_gdf_, buildings_CAT,
+                                                              results_dir=results_dir, plots=building_parts_plots)
 
             if "building_part_gdf" in locals():
                 building_part_gdf = pd.concat([building_part_gdf, building_part_gdf_], ignore_index=True)
@@ -230,7 +240,8 @@ def join_adm_div_naming(gdf, cadaster_dir, cadaster_codes):
 
 
 def join_cadaster_data(cadaster_dir, cadaster_codes, results_dir, building_parts_plots=False,
-                       building_parts_inference=False, open_data_layers=False, open_data_layers_dir=None):
+                       building_parts_inference=False, building_parts_inference_using_CAT_files=False,
+                       open_data_layers=False, open_data_layers_dir=None, CAT_files_dir = None):
 
     # Address
     gdf = get_cadaster_address(cadaster_dir=cadaster_dir, cadaster_codes=cadaster_codes)
@@ -240,7 +251,9 @@ def join_cadaster_data(cadaster_dir, cadaster_codes, results_dir, building_parts
     gdf = join_cadaster_building(gdf=gdf, cadaster_dir=cadaster_dir, cadaster_codes=cadaster_codes,
                                  results_dir=results_dir, building_parts_plots=building_parts_plots,
                                  building_parts_inference=building_parts_inference,
-                                 open_data_layers=open_data_layers, open_data_layers_dir=open_data_layers_dir)
+                                 building_parts_inference_using_CAT_files=building_parts_inference_using_CAT_files,
+                                 open_data_layers=open_data_layers, open_data_layers_dir=open_data_layers_dir,
+                                 CAT_files_dir = CAT_files_dir)
     # Administrative layers naming
     gdf = join_adm_div_naming(gdf=gdf, cadaster_dir=cadaster_dir, cadaster_codes=cadaster_codes)
 
