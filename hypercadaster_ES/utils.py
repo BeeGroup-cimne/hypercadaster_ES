@@ -55,51 +55,51 @@ def tqdm_joblib(tqdm_object):
         tqdm_object.close()
 
 
-def cadaster_dir(wd):
+def cadaster_dir_(wd):
     return f"{wd}/cadaster"
 
-def districts_dir(wd):
+def districts_dir_(wd):
     return f"{wd}/districts"
 
-def census_tracts_dir(wd):
+def census_tracts_dir_(wd):
     return f"{wd}/census_tracts"
 
-def results_dir(wd):
+def results_dir_(wd):
     return f"{wd}/results"
 
-def DEM_raster_dir(wd):
+def DEM_raster_dir_(wd):
     return f"{wd}/DEM_rasters"
 
-def postal_codes_dir(wd):
+def postal_codes_dir_(wd):
     return f"{wd}/postal_codes"
 
-def neighborhoods_dir(wd):
+def neighborhoods_dir_(wd):
     return f"{wd}/neighbourhoods"
 
-def open_data_dir(wd):
+def open_data_dir_(wd):
     return f"{wd}/open_data"
 
 def create_dirs(data_dir):
-    os.makedirs(census_tracts_dir(data_dir), exist_ok=True)
-    os.makedirs(districts_dir(data_dir), exist_ok=True)
-    os.makedirs(cadaster_dir(data_dir), exist_ok=True)
-    os.makedirs(f"{cadaster_dir(data_dir)}/buildings", exist_ok=True)
-    os.makedirs(f"{cadaster_dir(data_dir)}/buildings/zip", exist_ok=True)
-    os.makedirs(f"{cadaster_dir(data_dir)}/buildings/unzip", exist_ok=True)
-    os.makedirs(f"{cadaster_dir(data_dir)}/address", exist_ok=True)
-    os.makedirs(f"{cadaster_dir(data_dir)}/address/zip", exist_ok=True)
-    os.makedirs(f"{cadaster_dir(data_dir)}/address/unzip", exist_ok=True)
-    os.makedirs(f"{cadaster_dir(data_dir)}/parcels", exist_ok=True)
-    os.makedirs(f"{cadaster_dir(data_dir)}/parcels/zip", exist_ok=True)
-    os.makedirs(f"{cadaster_dir(data_dir)}/parcels/unzip", exist_ok=True)
-    os.makedirs(results_dir(data_dir), exist_ok=True)
-    os.makedirs(DEM_raster_dir(data_dir), exist_ok=True)
-    os.makedirs(f"{DEM_raster_dir(data_dir)}/raw", exist_ok=True)
-    os.makedirs(f"{DEM_raster_dir(data_dir)}/uncompressed", exist_ok=True)
-    os.makedirs(neighborhoods_dir(data_dir), exist_ok=True)
-    os.makedirs(postal_codes_dir(data_dir), exist_ok=True)
-    os.makedirs(f"{postal_codes_dir(data_dir)}/raw", exist_ok=True)
-    os.makedirs(open_data_dir(data_dir), exist_ok=True)
+    os.makedirs(census_tracts_dir_(data_dir), exist_ok=True)
+    os.makedirs(districts_dir_(data_dir), exist_ok=True)
+    os.makedirs(cadaster_dir_(data_dir), exist_ok=True)
+    os.makedirs(f"{cadaster_dir_(data_dir)}/buildings", exist_ok=True)
+    os.makedirs(f"{cadaster_dir_(data_dir)}/buildings/zip", exist_ok=True)
+    os.makedirs(f"{cadaster_dir_(data_dir)}/buildings/unzip", exist_ok=True)
+    os.makedirs(f"{cadaster_dir_(data_dir)}/address", exist_ok=True)
+    os.makedirs(f"{cadaster_dir_(data_dir)}/address/zip", exist_ok=True)
+    os.makedirs(f"{cadaster_dir_(data_dir)}/address/unzip", exist_ok=True)
+    os.makedirs(f"{cadaster_dir_(data_dir)}/parcels", exist_ok=True)
+    os.makedirs(f"{cadaster_dir_(data_dir)}/parcels/zip", exist_ok=True)
+    os.makedirs(f"{cadaster_dir_(data_dir)}/parcels/unzip", exist_ok=True)
+    os.makedirs(results_dir_(data_dir), exist_ok=True)
+    os.makedirs(DEM_raster_dir_(data_dir), exist_ok=True)
+    os.makedirs(f"{DEM_raster_dir_(data_dir)}/raw", exist_ok=True)
+    os.makedirs(f"{DEM_raster_dir_(data_dir)}/uncompressed", exist_ok=True)
+    os.makedirs(neighborhoods_dir_(data_dir), exist_ok=True)
+    os.makedirs(postal_codes_dir_(data_dir), exist_ok=True)
+    os.makedirs(f"{postal_codes_dir_(data_dir)}/raw", exist_ok=True)
+    os.makedirs(open_data_dir_(data_dir), exist_ok=True)
 
 # PyCatastro.ConsultaMunicipio("BARCELONA")['consulta_municipalero'][]
 # def dwellings_per_building_reference(province_name, municipality_name, building_reference):
@@ -231,7 +231,7 @@ def untar_directory(tar_directory, untar_directory, files_to_extract):
                     if fnmatch.fnmatch(member.name, files_to_extract):
 
                         # Define the full path for the extracted file
-                        extract_full_path = os.path.join(untar_directory, f"{"" if counter == 0 else str(counter)}{newfile}")
+                        extract_full_path = os.path.join(untar_directory, f"{'' if counter == 0 else str(counter)}{newfile}")
 
                         # Extract the file content to a temporary location
                         extracted_file = tar.extractfile(member)
@@ -1415,12 +1415,12 @@ def process_zone(gdf_zone, zone_reference, building_gdf_, gdf_footprints_global,
             building_gdf_by_floor.columns = ["floor", "geometry"]
             building_gdf_by_floor = building_gdf_by_floor.set_geometry("geometry")
 
-            pdf = PdfPages(f"test.pdf")
-            fig, ax = plt.subplots()
-            plot_shapely_geometries([i[1] for i in ], ax = ax)
-            pdf.savefig(fig)
-            plt.close(fig)
-            pdf.close()
+            # pdf = PdfPages(f"test.pdf")
+            # fig, ax = plt.subplots()
+            # plot_shapely_geometries([i[1] for i in ], ax = ax)
+            # pdf.savefig(fig)
+            # plt.close(fig)
+            # pdf.close()
 
             # Explode MultiPolygons into individual Polygons
             building_gdf_by_floor_exploded = building_gdf_by_floor.explode(index_parts=False).reset_index(drop=True)
@@ -1449,15 +1449,14 @@ def process_zone(gdf_zone, zone_reference, building_gdf_, gdf_footprints_global,
                 pl.concat_str(["street_type", "street_name", "street_number1", "street_letter1", "street_number2",
                  "street_letter2", "km", "building_space_block_name", "building_space_stair_name"], separator=" ").alias("address")
             )
-            ##### HERE!!!!
+
             buildings_CAT_grouped = buildings_CAT_.group_by("address").agg(
-                (pl.col("building_space_floor_name").explode().unique()).alias("unique_floors")
-            ).with_columns(
-                pl.col("unique_floors").map_elements(classify_above_ground_floor_names, return_dtype=pl.Int64).alias(
-                    "order_above_ground_floors"),
-                pl.col("unique_floors").map_elements(classify_below_ground_floor_names, return_dtype=pl.Int64).alias(
-                    "order_below_ground_floors")
-            )
+                (pl.col("building_space_floor_name").unique()).alias("unique_floors")
+            ).to_pandas()
+            buildings_CAT_grouped["order_above_ground_floors"] = buildings_CAT_grouped.unique_floors.apply(
+                lambda v: [classify_above_ground_floor_names(x) for x in v])
+            buildings_CAT_grouped["order_below_ground_floors"] = buildings_CAT_grouped.unique_floors.apply(
+                classify_below_ground_floor_names)
 
             floor_names = buildings_CAT_["building_space_floor_name"].unique()
             df = pd.DataFrame({'floor_name': floor_names})
