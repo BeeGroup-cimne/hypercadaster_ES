@@ -37,6 +37,8 @@ from joblib.externals.loky import get_reusable_executor
 from datetime import date
 import time
 import re
+from sklearn.cluster import DBSCAN
+from sklearn.preprocessing import MinMaxScaler
 
 @contextmanager
 def tqdm_joblib(tqdm_object):
@@ -1411,21 +1413,20 @@ def process_zone(gdf_zone, zone_reference, building_gdf_, gdf_footprints_global,
         if buildings_CAT is not None and len(results_) > 0:
             results_ = pd.DataFrame(results_)
 
-            building_gdf_by_floor = gpd.GeoDataFrame(results_[results_.building_reference == '0208601DF3800G']['building_footprint_by_floor'][0])
-            building_gdf_by_floor.columns = ["floor", "geometry"]
-            building_gdf_by_floor = building_gdf_by_floor.set_geometry("geometry")
-
-            # pdf = PdfPages(f"test.pdf")
-            # fig, ax = plt.subplots()
-            # plot_shapely_geometries([i[1] for i in ], ax = ax)
-            # pdf.savefig(fig)
-            # plt.close(fig)
-            # pdf.close()
-
-            # Explode MultiPolygons into individual Polygons
-            building_gdf_by_floor_exploded = building_gdf_by_floor.explode(index_parts=False).reset_index(drop=True)
-            building_gdf_by_floor_exploded['area'] = building_gdf_by_floor_exploded.area
-            building_gdf_by_floor_exploded = building_gdf_by_floor_exploded.sort_values("floor", ascending=False)
+            # # Try to cluster the building by different parts to assign each space (in CAT files)
+            # building_gdf_by_floor = gpd.GeoDataFrame(results_[results_.building_reference == '0208601DF3800G']['building_footprint_by_floor'][0])
+            # building_gdf_by_floor.columns = ["floor", "geometry"]
+            # building_gdf_by_floor = building_gdf_by_floor.set_geometry("geometry")
+            # building_gdf_by_floor_exploded = building_gdf_by_floor.explode(index_parts=False).reset_index(drop=True)
+            # building_gdf_by_floor_exploded['area'] = building_gdf_by_floor_exploded.area
+            # building_gdf_by_floor_exploded = building_gdf_by_floor_exploded.sort_values("floor", ascending=False)
+            # building_gdf_by_floor_exploded['centroid'] = building_gdf_by_floor_exploded.geometry.centroid
+            # features = np.array([building_gdf_by_floor_exploded['centroid'].x,
+            #                         building_gdf_by_floor_exploded['centroid'].y]).T
+            # scaler = MinMaxScaler()
+            # scaled_features = scaler.fit_transform(features)
+            # db = AgglomerativeClustering(n_clusters=None, distance_threshold=0.2, linkage="single")  # Adjust eps for your data's scale
+            # building_gdf_by_floor_exploded['cluster'] = db.fit_predict(scaled_features)
 
             buildings_CAT_ = buildings_CAT.filter(
                 pl.col("building_reference") == "0208601DF3800G") #single_building_reference.split("_")[0]
@@ -1434,45 +1435,35 @@ def process_zone(gdf_zone, zone_reference, building_gdf_, gdf_footprints_global,
                 (pl.when(pl.col("street_number2")=="0000").then(pl.lit("")).otherwise(pl.col("street_number2").cast(pl.Int16))).alias("street_number2"),
                 (pl.when(pl.col("km")=="00000").then(pl.lit("")).otherwise(pl.col("km").cast(pl.Int16))).alias("km")
             )
-
-            floor_names = buildings_CAT_["building_space_floor_name"].unique()
-            df = pd.DataFrame({'floor_name': floor_names})
-            df['order'] = df['floor_name'].apply(classify_cadaster_floor_names)
-            floor_names_sorted = list(df.sort_values(by='order').reset_index(drop=True).floor_name)
-            order_mapping = {value: index for index, value in enumerate(floor_names_sorted)}
-            buildings_CAT_ = buildings_CAT_.with_columns(
-                pl.col("building_space_floor_name").map_elements(lambda x: order_mapping.get(x, -1),
-                                                                 return_dtype=pl.Int32).alias("custom_sort")
-            ).sort("custom_sort", descending=True).drop("custom_sort")
-
             buildings_CAT_= buildings_CAT_.with_columns(
                 pl.concat_str(["street_type", "street_name", "street_number1", "street_letter1", "street_number2",
-                 "street_letter2", "km", "building_space_block_name", "building_space_stair_name"], separator=" ").alias("address")
+                 "street_letter2", "km", "building_space_block_name", "building_space_stair_name"], separator=" ").
+                str.strip_chars().str.replace_all(r"\s+", " ").alias("address")
             )
-
             buildings_CAT_grouped = buildings_CAT_.group_by("address").agg(
                 (pl.col("building_space_floor_name").unique()).alias("unique_floors")
             ).to_pandas()
+            buildings_CAT_ = buildings_CAT_.to_pandas()
             buildings_CAT_grouped["order_above_ground_floors"] = buildings_CAT_grouped.unique_floors.apply(
                 lambda v: [classify_above_ground_floor_names(x) for x in v])
             buildings_CAT_grouped["order_below_ground_floors"] = buildings_CAT_grouped.unique_floors.apply(
-                classify_below_ground_floor_names)
+                lambda v: [classify_below_ground_floor_names(x) for x in v])
+            def sort_floors(unique_floors, order):
+                # Filter out NaN or None in the order list
+                valid_indices = [i for i, o in enumerate(order) if o is not None and not pd.isna(o)]
+                # Create a list of valid floors and their corresponding order
+                valid_floors = [(unique_floors[i], order[i]) for i in valid_indices]
+                # Sort the valid floors by their order
+                return [floor for floor, _ in sorted(valid_floors, key=lambda x: x[1])]
+            buildings_CAT_grouped["unique_floors_above_ground_ordered"] = buildings_CAT_grouped.apply(
+                lambda row: sort_floors(row["unique_floors"], row["order_above_ground_floors"]), axis=1
+            )
+            buildings_CAT_grouped["unique_floors_below_ground_ordered"] = buildings_CAT_grouped.apply(
+                lambda row: sort_floors(row["unique_floors"], row["order_below_ground_floors"]), axis=1
+            )
 
-            floor_names = buildings_CAT_["building_space_floor_name"].unique()
-            df = pd.DataFrame({'floor_name': floor_names})
-            df['order'] = df['floor_name'].apply(classify_cadaster_floor_names)
-            floor_names_sorted = list(df.sort_values(by='order').reset_index(drop=True).floor_name)
-            order_mapping = {value: index for index, value in enumerate(floor_names_sorted)}
-            buildings_CAT_grouped = buildings_CAT_grouped.with_columns(
-                pl.col("building_space_floor_name").map_elements(lambda x: order_mapping.get(x, -1),
-                                                                 return_dtype=pl.Int32).alias("custom_sort")
-            ).sort("custom_sort", descending=True).drop("custom_sort").to_pandas()
-
-            building_gdf_by_floor_exploded.dtypes
-            buildings_CAT_grouped.dtypes
-
-            # Convert assignments to DataFrame
-            assignments_df = pd.DataFrame(assignments)
+            buildings_CAT_ = buildings_CAT_.merge(buildings_CAT_grouped, on="address")
+            buildings_CAT_ = buildings_CAT_["building_space_floor_name"]
 
             results_["total_usable_residential_area"] = results_.groupby("building_reference")[
                 "usable_residential_area"].transform("sum")
