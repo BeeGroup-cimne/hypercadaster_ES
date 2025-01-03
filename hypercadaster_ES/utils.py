@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import PathPatch
 from matplotlib.path import Path
 from matplotlib.backends.backend_pdf import PdfPages
-from shapely.ops import unary_union, nearest_points
+from shapely.ops import unary_union, nearest_points, linemerge
 from shapely.geometry.polygon import orient
 from shapely.geometry import (Polygon, Point, LineString, MultiPolygon, MultiPoint, MultiLineString, GeometryCollection,
                               LinearRing, JOIN_STYLE)
@@ -37,8 +37,8 @@ from joblib.externals.loky import get_reusable_executor
 from datetime import date
 import time
 import re
-from sklearn.cluster import DBSCAN
-from sklearn.preprocessing import MinMaxScaler
+from itertools import chain
+from itertools import zip_longest
 
 @contextmanager
 def tqdm_joblib(tqdm_object):
@@ -1070,7 +1070,7 @@ def process_zone(gdf_zone, zone_reference, building_gdf_, gdf_footprints_global,
 
         for single_building_reference, building_gdf_item in gdf_zone.groupby('single_building_reference'):
             # grouped2 = gdf_zone.groupby("single_building_reference")
-            # single_building_reference = list(grouped2.groups.keys())[0]
+            # single_building_reference = "0208601DF3800G_0"#list(grouped2.groups.keys())[0]
             # building_gdf_item = grouped2.get_group(single_building_reference).reset_index().drop(['index'], axis=1).copy()
 
             # PDF setup for the building if plots is True
@@ -1148,30 +1148,30 @@ def process_zone(gdf_zone, zone_reference, building_gdf_, gdf_footprints_global,
             significant_orientations_by_floor = {}
             n_floors = gdf_aux_footprint_building.floor.max() if gdf_aux_footprint_building.floor.max() > 0 else np.nan
             n_underground_floors = -gdf_aux_footprint_building.floor.min() if gdf_aux_footprint_building.floor.min() < 0 else 0
-            floor_area_with_possible_residential_use = []
-            n_dwellings = building_gdf_[
-                    building_gdf_["building_reference"] == building_gdf_item.iloc[0]["building_reference"]
-                ].iloc[0]["n_dwellings"]
-            n_items = building_gdf_[
-                    building_gdf_["building_reference"] == building_gdf_item.iloc[0]["building_reference"]
-                ].iloc[0]["n_building_units"] - n_dwellings
+            # floor_area_with_possible_residential_use = []
+            # n_dwellings = building_gdf_[
+            #         building_gdf_["building_reference"] == building_gdf_item.iloc[0]["building_reference"]
+            #     ].iloc[0]["n_dwellings"]
+            # n_items = building_gdf_[
+            #         building_gdf_["building_reference"] == building_gdf_item.iloc[0]["building_reference"]
+            #     ].iloc[0]["n_building_units"] - n_dwellings
             n_buildings = len(
                 gdf_zone[
                         gdf_zone["building_reference"] == building_gdf_item.iloc[0]["building_reference"]
                     ]["single_building_reference"].unique()
             )
-            if n_dwellings == 0:
-                building_type = "Non-residential"
-                ratio_communal_areas_ = 0.0
-                ratio_usable_private_areas_ = 0.0
-            elif n_dwellings == 1:
-                building_type = "Single-family"
-                ratio_communal_areas_ = 0.0
-                ratio_usable_private_areas_ = ratio_usable_areas
-            elif n_dwellings > 1:
-                building_type = "Multi-family"
-                ratio_communal_areas_ = ratio_communal_areas
-                ratio_usable_private_areas_ = ratio_usable_areas - ratio_communal_areas
+            # if n_dwellings == 0:
+            #     building_type = "Non-residential"
+            #     # ratio_communal_areas_ = 0.0
+            #     # ratio_usable_private_areas_ = 0.0
+            # elif n_dwellings == 1:
+            #     building_type = "ResidentialSingleFamily"
+            #     # ratio_communal_areas_ = 0.0
+            #     # ratio_usable_private_areas_ = ratio_usable_areas
+            # elif n_dwellings > 1:
+            #     building_type = "ResidentialMultiFamily"
+            #     # ratio_communal_areas_ = ratio_communal_areas
+            #     # ratio_usable_private_areas_ = ratio_usable_areas - ratio_communal_areas
 
             if n_underground_floors > 0:
 
@@ -1315,18 +1315,18 @@ def process_zone(gdf_zone, zone_reference, building_gdf_, gdf_footprints_global,
                 if plots:
                     pdf.close()
 
-                if building_type == "Non-residential":
-                    starting_residential_floor = np.nan
-                elif premises:
-                    starting_residential_floor = 1
-                    if building_type == "Multi-family" and n_floors >= n_dwellings:
-                        n_dwellings = n_dwellings - 1
-                else:
-                    if n_floors > 6 and building_type == "Multi-family":
-                        starting_residential_floor = 1
-                    else:
-                        starting_residential_floor = 0
-                floor_area_with_possible_residential_use = [floor_area[floor] if floor >= starting_residential_floor or starting_residential_floor is np.nan else 0.0 for floor in range(n_floors + 1)]
+                # if building_type == "Non-residential":
+                #     starting_residential_floor = np.nan
+                # elif premises:
+                #     starting_residential_floor = 1
+                #     if building_type == "Multi-family" and n_floors >= n_dwellings:
+                #         n_dwellings = n_dwellings - 1
+                # else:
+                #     if n_floors > 6 and building_type == "Multi-family":
+                #         starting_residential_floor = 1
+                #     else:
+                #         starting_residential_floor = 0
+                # floor_area_with_possible_residential_use = [floor_area[floor] if floor >= starting_residential_floor or starting_residential_floor is np.nan else 0.0 for floor in range(n_floors + 1)]
 
             if max(gdf_aux_footprint_building.floor.max(), gdf_aux_footprints_nearby.floor.max()) > 0:
 
@@ -1364,106 +1364,360 @@ def process_zone(gdf_zone, zone_reference, building_gdf_, gdf_footprints_global,
             results_.append({
                 'building_reference': single_building_reference.split("_")[0],
                 'single_building_reference': single_building_reference,
-                'total_n_dwellings': n_dwellings,
-                'total_n_other_building_items': n_items,
-                'n_buildings': n_buildings,
-                'type': building_type,
-                'detached': (np.sum([adiabatic_wall[floor] for floor in range(n_floors + 1)]) if adiabatic_wall != {} else 0.0) > 0.0,
-                'exists_ground_commercial_premises': premises,
-                'ground_commercial_premises_names': premises_names,
-                'ground_commercial_premises_typology': premises_activity_typologies,
-                'ground_commercial_premises_last_revision': premises_last_revision,
-                'n_floors': n_floors+1,
-                'n_underground_floors': n_underground_floors,
-                'built_area_below_ground_by_floor': [underground_floor_area[floor] for floor in range(1,n_underground_floors + 1)] if n_underground_floors > 0 else [],
-                'built_area_below_ground_total': np.sum([underground_floor_area[floor] for floor in range(1,n_underground_floors + 1)]) if n_underground_floors > 0 else [],
-                'built_area_above_ground_by_floor': [floor_area[floor] for floor in range(n_floors + 1)] if n_floors is not np.nan else [],
-                'built_area_above_ground_total': np.sum([floor_area[floor] for floor in range(n_floors + 1)]) if n_floors is not np.nan else 0.0,
-                'roof_area_above_ground_by_floor': [roof_area[floor] for floor in range(n_floors + 1)] if n_floors is not np.nan else [],
-                'roof_area_above_ground': np.sum([roof_area[floor] for floor in range(n_floors + 1)]) if n_floors is not np.nan else 0.0,
-                'building_footprint_area': round(building_geom.area if isinstance(building_geom, Polygon)
+                # 'total_n_dwellings': n_dwellings,
+                # 'total_n_other_building_items': n_items,
+                'sbr__n_buildings': n_buildings,
+                # 'type': building_type,
+                'sbr__detached': (np.sum([adiabatic_wall[floor] for floor in range(n_floors + 1)]) if adiabatic_wall != {} else 0.0) > 0.0,
+                'br__exists_ground_commercial_premises': premises,
+                'br__ground_commercial_premises_names': premises_names,
+                'br__ground_commercial_premises_typology': premises_activity_typologies,
+                'br__ground_commercial_premises_last_revision': premises_last_revision,
+                'sbr__floors_above_ground': n_floors+1,
+                'sbr__floors_below_ground': n_underground_floors,
+                'sbr__below_ground_built_area_by_floor': [underground_floor_area[floor] for floor in range(1,n_underground_floors + 1)] if n_underground_floors > 0 else [],
+                'sbr__below_ground_built_area': np.sum([underground_floor_area[floor] for floor in range(1,n_underground_floors + 1)]) if n_underground_floors > 0 else 0.0,
+                'sbr__above_ground_built_area_by_floor': [floor_area[floor] for floor in range(n_floors + 1)] if n_floors is not np.nan else [],
+                'sbr__above_ground_built_area': np.sum([floor_area[floor] for floor in range(n_floors + 1)]) if n_floors is not np.nan else 0.0,
+                'sbr__above_ground_roof_area_by_floor': [roof_area[floor] for floor in range(n_floors + 1)] if n_floors is not np.nan else [],
+                'sbr__above_ground_roof_area': np.sum([roof_area[floor] for floor in range(n_floors + 1)]) if n_floors is not np.nan else 0.0,
+                'sbr__building_footprint_area': round(building_geom.area if isinstance(building_geom, Polygon)
                                                  else sum(polygon.area for polygon in building_geom.geoms) if isinstance(building_geom, MultiPolygon)
                                                  else 0.0, 2),
-                'building_footprint': building_geom.exterior if isinstance(building_geom, Polygon) else (
+                'sbr__building_footprint_geometry': building_geom.exterior if isinstance(building_geom, Polygon) else (
                             MultiLineString([LineString(polygon.exterior.coords) for polygon in building_geom.geoms])),
-                'building_footprint_by_floor': gdf_aux_footprint_building[["floor","geometry"]].to_dict(index=False, orient='split')['data'],
-                'residential_area_by_floor': floor_area_with_possible_residential_use,
-                'usable_residential_area': np.sum(floor_area_with_possible_residential_use) * ratio_usable_private_areas_ if floor_area_with_possible_residential_use != [] else 0.0,
-                'communal_residential_area': np.sum(floor_area_with_possible_residential_use) * ratio_communal_areas_ if floor_area_with_possible_residential_use != [] else 0.0,
-                'patios_area_by_floor': [patios_area[floor] for floor in range(n_floors + 1)] if patios_area != {} else [],
-                'patios_n_by_floor': [patios_n[floor] for floor in range(n_floors + 1)] if patios_n != {} else [],
-                'patios_area_common': np.max([patios_area[floor] for floor in range(n_floors + 1)]) if patios_area != {} else 0.0,
-                'patios_n_common': np.max([patios_n[floor] for floor in range(n_floors + 1)]) if patios_n != {} else 0,
-                'perimeter': [perimeter[floor] for floor in range(n_floors + 1)] if perimeter != {} else [],
-                'air_contact_wall_by_floor': {key: [air_contact_wall[d][key] for d in air_contact_wall] for key in
+                'sbr__building_footprint_by_floor': gdf_aux_footprint_building[["group","floor","geometry"]].to_dict(index=False, orient='split')['data'],
+                'sbr__patios_area_by_floor': [patios_area[floor] for floor in range(n_floors + 1)] if patios_area != {} else [],
+                'sbr__patios_number_by_floor': [patios_n[floor] for floor in range(n_floors + 1)] if patios_n != {} else [],
+                # 'sbr__patios_area_common': np.max([patios_area[floor] for floor in range(n_floors + 1)]) if patios_area != {} else 0.0,
+                # 'sbr__patios_number_common': np.max([patios_n[floor] for floor in range(n_floors + 1)]) if patios_n != {} else 0,
+                'sbr__walls_between_slabs': np.sum([perimeter[floor] for floor in
+                                                     range(n_floors + 1)] if perimeter != {} else []),
+                'sbr__building_perimeter_by_floor': [perimeter[floor] for floor in range(n_floors + 1)] if perimeter != {} else [],
+                'sbr__air_contact_wall_by_floor': {key: [air_contact_wall[d][key] for d in air_contact_wall] for key in
                                      air_contact_wall[0]} if air_contact_wall != {} else {},
-                'air_contact_wall_total':  {key: np.sum([air_contact_wall[d][key] for d in air_contact_wall]) for key in
+                'sbr__air_contact_wall':  {key: np.sum([air_contact_wall[d][key] for d in air_contact_wall]) for key in
                                      air_contact_wall[0]} if air_contact_wall != {} else {},
-                'adiabatic_wall_by_floor': [adiabatic_wall[floor] for floor in range(n_floors + 1)] if adiabatic_wall != {} else [],
-                'adiabatic_wall_total': np.sum([adiabatic_wall[floor] for floor in range(n_floors + 1)]) if adiabatic_wall != {} else 0.0,
-                'patios_wall_by_floor': [patios_wall[floor] for floor in range(n_floors + 1)] if patios_wall != {} else [],
-                'patios_wall_total': np.sum([patios_wall[floor] for floor in range(n_floors + 1)]) if patios_wall != {} else 0.0,
-                'shadows_at_distance': {key: [shadows_at_distance[d]['shadows'][key] for d in shadows_at_distance] for key in
+                'sbr__adiabatic_wall_by_floor': [adiabatic_wall[floor] for floor in range(n_floors + 1)] if adiabatic_wall != {} else [],
+                'sbr__adiabatic_wall': np.sum([adiabatic_wall[floor] for floor in range(n_floors + 1)]) if adiabatic_wall != {} else 0.0,
+                'sbr__patios_wall_by_floor': [patios_wall[floor] for floor in range(n_floors + 1)] if patios_wall != {} else [],
+                'sbr__patios_wall_total': np.sum([patios_wall[floor] for floor in range(n_floors + 1)]) if patios_wall != {} else 0.0,
+                'sbr__shadows_at_distance': {key: [shadows_at_distance[d]['shadows'][key] for d in shadows_at_distance] for key in
                                         shadows_at_distance[0]['shadows']} if shadows_at_distance != {} else {},
-                'building_contour_at_distance': {key: np.mean([shadows_at_distance[d]['contour'][key] for d in shadows_at_distance]) for key in
+                'sbr__building_contour_at_distance': {key: np.mean([shadows_at_distance[d]['contour'][key] for d in shadows_at_distance]) for key in
                                         shadows_at_distance[0]['contour']} if shadows_at_distance != {} else {}
             })
 
-        # Consider the information from CAT files
-        if buildings_CAT is not None and len(results_) > 0:
+        if len(results_) > 0:
             results_ = pd.DataFrame(results_)
 
-            # # Try to cluster the building by different parts to assign each space (in CAT files)
-            # building_gdf_by_floor = gpd.GeoDataFrame(results_[results_.building_reference == '0208601DF3800G']['building_footprint_by_floor'][0])
-            # building_gdf_by_floor.columns = ["floor", "geometry"]
-            # building_gdf_by_floor = building_gdf_by_floor.set_geometry("geometry")
-            # building_gdf_by_floor_exploded = building_gdf_by_floor.explode(index_parts=False).reset_index(drop=True)
-            # building_gdf_by_floor_exploded['area'] = building_gdf_by_floor_exploded.area
-            # building_gdf_by_floor_exploded = building_gdf_by_floor_exploded.sort_values("floor", ascending=False)
-            # building_gdf_by_floor_exploded['centroid'] = building_gdf_by_floor_exploded.geometry.centroid
-            # features = np.array([building_gdf_by_floor_exploded['centroid'].x,
-            #                         building_gdf_by_floor_exploded['centroid'].y]).T
-            # scaler = MinMaxScaler()
-            # scaled_features = scaler.fit_transform(features)
-            # db = AgglomerativeClustering(n_clusters=None, distance_threshold=0.2, linkage="single")  # Adjust eps for your data's scale
-            # building_gdf_by_floor_exploded['cluster'] = db.fit_predict(scaled_features)
+            for building_reference in results_.building_reference.unique():
+                # building_reference = "0208601DF3800G"
 
-            buildings_CAT_ = buildings_CAT.filter(
-                pl.col("building_reference") == "0208601DF3800G") #single_building_reference.split("_")[0]
-            buildings_CAT_ = buildings_CAT_.with_columns(
-                (pl.when(pl.col("street_number1")=="0000").then(pl.lit("")).otherwise(pl.col("street_number1").cast(pl.Int16))).alias("street_number1"),
-                (pl.when(pl.col("street_number2")=="0000").then(pl.lit("")).otherwise(pl.col("street_number2").cast(pl.Int16))).alias("street_number2"),
-                (pl.when(pl.col("km")=="00000").then(pl.lit("")).otherwise(pl.col("km").cast(pl.Int16))).alias("km")
-            )
-            buildings_CAT_= buildings_CAT_.with_columns(
-                pl.concat_str(["street_type", "street_name", "street_number1", "street_letter1", "street_number2",
-                 "street_letter2", "km", "building_space_block_name", "building_space_stair_name"], separator=" ").
-                str.strip_chars().str.replace_all(r"\s+", " ").alias("address")
-            )
-            buildings_CAT_grouped = buildings_CAT_.group_by("address").agg(
-                (pl.col("building_space_floor_name").unique()).alias("unique_floors")
-            ).to_pandas()
-            buildings_CAT_ = buildings_CAT_.to_pandas()
-            buildings_CAT_grouped["order_above_ground_floors"] = buildings_CAT_grouped.unique_floors.apply(
-                lambda v: [classify_above_ground_floor_names(x) for x in v])
-            buildings_CAT_grouped["order_below_ground_floors"] = buildings_CAT_grouped.unique_floors.apply(
-                lambda v: [classify_below_ground_floor_names(x) for x in v])
-            def sort_floors(unique_floors, order):
-                # Filter out NaN or None in the order list
-                valid_indices = [i for i, o in enumerate(order) if o is not None and not pd.isna(o)]
-                # Create a list of valid floors and their corresponding order
-                valid_floors = [(unique_floors[i], order[i]) for i in valid_indices]
-                # Sort the valid floors by their order
-                return [floor for floor, _ in sorted(valid_floors, key=lambda x: x[1])]
-            buildings_CAT_grouped["unique_floors_above_ground_ordered"] = buildings_CAT_grouped.apply(
-                lambda row: sort_floors(row["unique_floors"], row["order_above_ground_floors"]), axis=1
-            )
-            buildings_CAT_grouped["unique_floors_below_ground_ordered"] = buildings_CAT_grouped.apply(
-                lambda row: sort_floors(row["unique_floors"], row["order_below_ground_floors"]), axis=1
-            )
+                sbr_results = results_[results_.building_reference == building_reference]
+                br_results = pd.DataFrame({
+                    'building_reference': [building_reference],
+                    'br__detached': [np.any(sbr_results['sbr__detached'])],
+                    'br__exists_ground_commercial_premises': sbr_results['br__exists_ground_commercial_premises'].first(),
+                    'br__ground_commercial_premises_names': sbr_results['br__ground_commercial_premises_names'].first(),
+                    'br__ground_commercial_premises_typology': sbr_results['br__ground_commercial_premises_typology'].first(),
+                    'br__ground_commercial_premises_last_revision': sbr_results[
+                        'br__ground_commercial_premises_last_revision'].first(),
+                    'br__floors_above_ground': [max(sbr_results['sbr__floors_above_ground'])],
+                    'br__floors_below_ground': [max(sbr_results['sbr__floors_below_ground'])],
+                    'br__below_ground_built_area_by_floor': [sum(values) for values in zip_longest(
+                        *sbr_results['sbr__below_ground_built_area_by_floor'], fillvalue=0)],
+                    'br__below_ground_built_area': [sum(sbr_results['sbr__below_ground_built_area'])],
+                    'br__above_ground_built_area_by_floor': [sum(values) for values in zip_longest(
+                        *sbr_results['sbr__above_ground_built_area_by_floor'], fillvalue=0)],
+                    'br__above_ground_built_area': [sum(sbr_results['sbr__above_ground_built_area'])],
+                    'br__above_ground_roof_area_by_floor': [sum(values) for values in zip_longest(
+                        *sbr_results['sbr__above_ground_roof_area_by_floor'], fillvalue=0)],
+                    'br__above_ground_roof_area': [sum(sbr_results['sbr__above_ground_roof_area'])],
+                    'br__building_footprint_area': [sum(sbr_results['sbr__building_footprint_area'])],
+                    'br__building_footprint_geometry': [linemerge(sbr_results['sbr__building_footprint_geometry'].tolist())],
+                    'br__building_footprint_by_floor':
+                        [item for sublist in sbr_results['sbr__building_footprint_by_floor'] for item in sublist],
+                    'br__patios_area_by_floor': [sum(values) for values in zip_longest(
+                        *sbr_results['sbr__patios_area_by_floor'], fillvalue=0)],
+                    'br__patios_number_by_floor': [sum(values) for values in zip_longest(
+                        *sbr_results['sbr__patios_number_by_floor'], fillvalue=0)],
+                    'br__walls_between_slabs': [sum(sbr_results['sbr__walls_between_slabs'])],
+                    'br__building_perimeter_by_floor': [sum(values) for values in zip_longest(
+                        *sbr_results['sbr__building_perimeter_by_floor'], fillvalue=0)],
+                    'br__air_contact_wall_by_floor': [dict(sorted({
+                        k: [
+                            sum(x)
+                            for x in zip_longest(
+                                *(
+                                    d.get(
+                                        k,
+                                        [0] * (
+                                            max(
+                                                (len(v) for v in d.values() if isinstance(v, list)),
+                                                default=1,  # Default to 1 if no valid lists are found
+                                            )
+                                        )
+                                    )
+                                    for d in sbr_results["sbr__air_contact_wall_by_floor"]
+                                ),
+                                fillvalue=0,
+                            )
+                        ]
+                        for k in set(
+                            chain.from_iterable(
+                                d.keys() for d in sbr_results["sbr__air_contact_wall_by_floor"]
+                            )
+                        )
+                    }.items(), key=lambda item: int(item[0])))],
+                    'br__air_contact_wall': [dict(sorted({
+                        k: sum(
+                            d.get(k, 0)  # Get scalar value or default to 0
+                            for d in sbr_results["sbr__air_contact_wall"]
+                        )
+                        for k in set(
+                            chain.from_iterable(
+                                d.keys() for d in sbr_results["sbr__air_contact_wall"]
+                            )
+                        )
+                    }.items(),key=lambda item: int(item[0])))],
+                    'br__adiabatic_wall_by_floor': [sum(values) for values in zip_longest(
+                        *sbr_results['sbr__adiabatic_wall_by_floor'], fillvalue=0)],
+                    'br__adiabatic_wall': [sum(sbr_results['sbr__patios_wall_total'])],
+                    'br__patios_wall_by_floor': [sum(values) for values in zip_longest(
+                        *sbr_results['sbr__patios_wall_by_floor'], fillvalue=0)],
+                    'br__patios_wall_total': [sum(sbr_results['sbr__patios_wall_total'])],
+                    'br__shadows_at_distance': [dict(sorted({
+                        k: [
+                            np.mean(x)
+                            for x in zip_longest(
+                                *(
+                                    d.get(
+                                        k,
+                                        [0] * (
+                                            max(
+                                                (len(v) for v in d.values() if isinstance(v, list)),
+                                                default=1,  # Default to 1 if no valid lists are found
+                                            )
+                                        )
+                                    )
+                                    for d in sbr_results["sbr__shadows_at_distance"]
+                                ),
+                                fillvalue=0,
+                            )
+                        ]
+                        for k in set(
+                            chain.from_iterable(
+                                d.keys() for d in sbr_results["sbr__shadows_at_distance"]
+                            )
+                        )
+                    }.items(), key=lambda item: int(item[0])))],
+                    'br__building_contour_at_distance': [dict(sorted({
+                        k: np.mean(
+                            list(
+                                d.get(k, 0)  # Get scalar value or default to 0
+                                for d in sbr_results["sbr__building_contour_at_distance"]
+                            )
+                        )
+                        for k in set(
+                            chain.from_iterable(
+                                d.keys() for d in sbr_results["sbr__building_contour_at_distance"]
+                            )
+                        )
+                    }.items(),
+                    key=lambda item: int(item[0])))]
+                })
+                geoms_by_floor = list(sbr_results['building_footprint_by_floor'])
+                building_gdf_by_floor = pd.concat([gpd.GeoDataFrame(geom_by_floor) for geom_by_floor in geoms_by_floor])
+                building_gdf_by_floor.columns = ["single_building_reference", "floor_number", "geometry"]
+                building_gdf_by_floor = building_gdf_by_floor.set_geometry("geometry")
+                building_gdf_by_floor["area_single_building_reference"] = building_gdf_by_floor.area
+                building_aggregates = (
+                    building_gdf_by_floor.groupby("floor_number").agg(
+                        n_single_building_references=("single_building_reference", "nunique"),
+                        area_building_reference=("area_single_building_reference", "sum")
+                    ))
+                building_gdf_by_floor = building_gdf_by_floor.merge(building_aggregates, on="floor_number", how="left")
+                building_gdf_by_floor["building_reference"] = building_reference
 
-            buildings_CAT_ = buildings_CAT_.merge(buildings_CAT_grouped, on="address")
-            buildings_CAT_ = buildings_CAT_["building_space_floor_name"]
+        # Consider the information from CAT files
+        if buildings_CAT is not None and len(results_) > 0:
+
+                # Integrate all CAT file information
+                agg_CAT = aggregate_CAT_file_building_spaces(
+                    building_CAT_df=buildings_CAT.filter(pl.col("building_reference") == building_reference))
+
+                building_gdf_by_floor = building_gdf_by_floor.drop(columns="geometry")
+
+                # Reduce agg_CAT["by_floors"] to each single building reference
+                sbr_with_CAT = building_gdf_by_floor.merge(agg_CAT["by_floors"].to_pandas(),
+                                                                on=["floor_number", "building_reference"])
+                def process_variable(df, variable, summarise_op=None, digits=0, multiplier=1, divider=1):
+                    return {
+                        f"sbr__{variable}_by_floor": agg_op(
+                            df,
+                            funcs=[lambda x: round(x, digits), list],
+                            grouping="use_type",
+                            variable=f"br__{variable}_by_floor",
+                            multiplier=multiplier,
+                            divider=divider
+                        )
+                    }
+                agg_list = [("building_spaces",sum,0,"area_single_building_reference","area_building_reference"),
+                            ("area_with_communals",sum,2,"area_single_building_reference","area_building_reference"),
+                            ("area_without_communals",sum,2,"area_single_building_reference","area_building_reference"),
+                            ("communal_area",sum,2,"area_single_building_reference","area_building_reference"),
+                            ("economic_value",sum,2,"area_single_building_reference","area_building_reference"),
+                            ("mean_building_space_area_with_communals",np.mean,0,1,1),
+                            ("mean_building_space_area_without_communals",np.mean,0,1,1),
+                            ("mean_building_space_communal_area",np.mean,0,1,1),
+                            ("mean_building_space_effective_year",np.mean,0,1,1),
+                            ("mean_building_space_category",np.mean,0,1,1),
+                            ("mean_building_space_economic_value",np.mean,0,1,1),
+                            ]
+                sbr_with_CAT_by_floors = (
+                    sbr_with_CAT.groupby(["single_building_reference","building_reference"])
+                    .apply(lambda df: pd.Series({
+                        key: value
+                        for agg_elem in agg_list
+                        for key, value in process_variable(df, agg_elem[0], agg_elem[1], agg_elem[2], agg_elem[3],
+                                                           agg_elem[4]).items()
+                    }),
+                    include_groups=False)
+                    .reset_index()
+                )
+
+                # Reduce agg_CAT["building"] to each single building reference
+                sbr_with_CAT = building_gdf_by_floor.merge(agg_CAT["building"].to_pandas(),
+                                                                on=["building_reference"])
+                def process_variable(df, variable, summarise_op=None, digits=0, multiplier=1, divider=1):
+                    return {
+                        f"sbr__{variable}": agg_op(
+                            df,
+                            funcs=[summarise_op, lambda x: round(x, digits) if summarise_op is not None else
+                                [lambda x: round(x, digits)]],
+                            grouping="use_type",
+                            variable=f"br__{variable}",
+                            multiplier=multiplier,
+                            divider=divider
+                        )
+                    }
+                agg_list = [("building_spaces",sum,0,"area_single_building_reference","area_building_reference"),
+                            ("area_with_communals",sum,2,"area_single_building_reference","area_building_reference"),
+                            ("area_without_communals",sum,2,"area_single_building_reference","area_building_reference"),
+                            ("communal_area",sum,2,"area_single_building_reference","area_building_reference"),
+                            ("economic_value",sum,2,"area_single_building_reference","area_building_reference"),
+                            ("mean_building_space_area_with_communals",np.mean,0,1,1),
+                            ("mean_building_space_area_without_communals",np.mean,0,1,1),
+                            ("mean_building_space_communal_area",np.mean,0,1,1),
+                            ("mean_building_space_effective_year",np.mean,0,1,1),
+                            ("mean_building_space_category",np.mean,0,1,1),
+                            ("mean_building_space_economic_value",np.mean,0,1,1)
+                            ]
+                sbr_with_CAT_summarised = (
+                    sbr_with_CAT.groupby(["single_building_reference","building_reference"])
+                    .apply(lambda df: pd.Series({
+                        key: value
+                        for agg_elem in agg_list
+                        for key, value in process_variable(df, agg_elem[0], agg_elem[1], agg_elem[2], agg_elem[3],
+                                                           agg_elem[4]).items()
+                    }),
+                    include_groups=False)
+                    .reset_index()
+                )
+
+                # Reduce agg_CAT["by_floors"] to each building reference
+                def process_variable(df, variable, summarise_ops=None, multiplier=1, divider=1):
+                    return {
+                        f"br__{variable}_by_floor": agg_op(
+                            df,
+                            funcs=summarise_ops,
+                            grouping="use_type",
+                            variable=f"br__{variable}_by_floor",
+                            multiplier=multiplier,
+                            divider=divider
+                        )
+                    }
+
+                agg_list = [("building_spaces", [sum], 1, 1),
+                            ("area_with_communals", [sum], 1, 1),
+                            ("area_without_communals", [sum], 1, 1),
+                            ("communal_area", [sum], 1, 1),
+                            ("economic_value", [sum], 1, 1),
+                            ("mean_building_space_area_with_communals", [sum], 1, 1),
+                            ("mean_building_space_area_without_communals", [sum], 1, 1),
+                            ("mean_building_space_communal_area", [sum], 1, 1),
+                            ("mean_building_space_effective_year", [sum], 1, 1),
+                            ("mean_building_space_category", [sum], 1, 1),
+                            ("mean_building_space_economic_value", [sum], 1, 1)
+                            ]
+                br_with_CAT_by_floors = (
+                    agg_CAT["by_floors"].to_pandas().groupby(["building_reference"])
+                    .apply(lambda df: pd.Series({
+                        key: value
+                        for agg_elem in agg_list
+                        for key, value in
+                        process_variable(df, agg_elem[0], agg_elem[1], agg_elem[2], agg_elem[3]).items()
+                    }),
+                           include_groups=False)
+                    .reset_index()
+                )
+
+                # Reduce agg_CAT["building"] to each building reference
+                def process_variable(df, variable, summarise_ops=None, multiplier=1, divider=1):
+                    return {
+                        f"br__{variable}": agg_op(
+                            df,
+                            funcs=summarise_ops,
+                            grouping="use_type",
+                            variable=f"br__{variable}",
+                            multiplier=multiplier,
+                            divider=divider
+                        )
+                    }
+                agg_list = [("building_spaces",[sum],1,1),
+                            ("area_with_communals",[sum],1,1),
+                            ("area_without_communals",[sum],1,1),
+                            ("communal_area",[sum],1,1),
+                            ("economic_value",[sum],1,1),
+                            ("mean_building_space_area_with_communals",[sum],1,1),
+                            ("mean_building_space_area_without_communals",[sum],1,1),
+                            ("mean_building_space_communal_area",[sum],1,1),
+                            ("mean_building_space_effective_year",[sum],1,1),
+                            ("mean_building_space_category",[sum],1,1),
+                            ("mean_building_space_economic_value",[sum],1,1),
+                            ('building_spaces_reference',[chain.from_iterable, list],1,1),
+                            ('building_spaces_postal_address',[chain.from_iterable, list],1,1),
+                            ('building_spaces_inner_address',[chain.from_iterable, list],1,1),
+                            ('building_spaces_floor_number',[chain.from_iterable, list],1,1),
+                            ('building_spaces_category',[chain.from_iterable, list],1,1),
+                            ('building_spaces_effective_year',[chain.from_iterable, list],1,1),
+                            ('building_spaces_area_without_communal',[chain.from_iterable, list],1,1),
+                            ('building_spaces_area_with_communal',[chain.from_iterable, list],1,1),
+                            ('building_spaces_economic_value',[chain.from_iterable, list],1,1),
+                            ('building_spaces_detailed_use_type',[chain.from_iterable, list],1,1)
+                            ]
+                br_with_CAT_summarised = (
+                    agg_CAT["building"].to_pandas().groupby(["building_reference"])
+                    .apply(lambda df: pd.Series({
+                        key: value
+                        for agg_elem in agg_list
+                        for key, value in process_variable(df, agg_elem[0], agg_elem[1], agg_elem[2], agg_elem[3]).items()
+                    }),
+                           include_groups=False)
+                    .reset_index()
+                )
+
+                sbr_with_CAT = (sbr_results.
+                    merge(sbr_with_CAT_by_floors, on="single_building_reference", how="left").
+                    merge(sbr_with_CAT_summarised, on="single_building_reference", how="left")
+
+                br_with_CAT = (br_results.
+                    merge(br_with_CAT_by_floors, on="building_reference", how="left").
+                    merge(br_with_CAT_summarised, on="building_reference", how="left"))
+
+                # Results by single building reference
+                results_building = results_building.merge(building_with_CAT, on="single_building_reference")
 
             results_["total_usable_residential_area"] = results_.groupby("building_reference")[
                 "usable_residential_area"].transform("sum")
@@ -3102,13 +3356,14 @@ def classify_cadaster_floor_names(floor):
         return agf
     else:
         return classify_below_ground_floor_names(floor)
+
 def parse_horizontal_division_buildings_CAT_files(cadaster_code, CAT_files_dir):
 
     combined_dfs = parse_CAT_file(cadaster_code, CAT_files_dir, allowed_dataset_types=[14, 15])
+
+    # Join the building space and building spaces detailed datasets. Order the items by floor.
     building_spaces_detailed = combined_dfs[14]
     building_spaces = combined_dfs[15]
-
-    # Filter
     building_spaces = building_spaces.with_columns(
         pl.concat_str(['building_reference', 'space1_reference'], separator=""
                       ).alias("building_space_reference"),
@@ -3146,6 +3401,8 @@ def parse_horizontal_division_buildings_CAT_files(cadaster_code, CAT_files_dir):
                                                          return_dtype=pl.Int32).alias("custom_sort")
     )
     building_spaces_detailed = building_spaces_detailed.sort("custom_sort").drop("custom_sort").sort("building_space_reference")
+
+    # Calculate areas and affected communal areas per building space
     building_spaces_detailed = building_spaces_detailed.join(
         building_spaces_detailed.group_by("building_space_reference").agg(
             pl.col("building_space_area_without_communal").sum().alias("building_space_total_area_without_communal"),
@@ -3153,20 +3410,23 @@ def parse_horizontal_division_buildings_CAT_files(cadaster_code, CAT_files_dir):
         ),
         on = "building_space_reference"
     )
-
     building_spaces_detailed = building_spaces_detailed.with_columns(
         (pl.col("building_space_participation_rate") / 1000000).alias("building_space_participation_rate"),
         pl.concat_str(['building_space_reference', 'building_space_reference_last_digits'], separator=""
                       ).alias("building_space_reference"),
         ((pl.col("building_space_total_area") - pl.col("building_space_total_area_without_communal")) *
-         pl.col("building_space_area_without_communal") / pl.col("building_space_total_area_without_communal")).alias("building_space_communal_area"),
-        pl.col("building_space_typology").str.tail(1).alias("building_space_typology_category"),
-        pl.col("building_space_typology").str.head(4).alias("building_space_typology_id"),
-        (pl.lit(date.today().year) - pl.col("building_space_effective_year")).alias("building_space_age")
-    )
+         pl.col("building_space_area_without_communal") / pl.col("building_space_total_area_without_communal")).alias(
+            "building_space_communal_area"))
     building_spaces_detailed = building_spaces_detailed.with_columns(
         (pl.col("building_space_communal_area") + pl.col("building_space_area_without_communal")).alias(
             "building_space_area_with_communal")
+    )
+
+    # Rename items of categorical columns (Typology, category, use...)
+    building_spaces_detailed = building_spaces_detailed.with_columns(
+        pl.col("building_space_typology").str.tail(1).alias("building_space_typology_category"),
+        pl.col("building_space_typology").str.head(4).alias("building_space_typology_id"),
+        (pl.lit(date.today().year) - pl.col("building_space_effective_year")).alias("building_space_age")
     )
     building_spaces_detailed = building_spaces_detailed.with_columns(
         pl.col("building_space_typology_id").replace(
@@ -3184,7 +3444,11 @@ def parse_horizontal_division_buildings_CAT_files(cadaster_code, CAT_files_dir):
         pl.when(pl.col("building_space_age") >= 90).
             then(pl.lit(90).cast(pl.Int16).cast(pl.Utf8)).
             otherwise(((pl.col("building_space_age") / 5).floor() * 5).cast(pl.Int16).cast(pl.Utf8)).
-            alias("building_space_age_key")
+            alias("building_space_age_key"),
+        pl.col("building_space_use_type").replace(building_space_use_types).
+            alias("building_space_use_type"),
+        pl.col("building_space_detailed_use_type").replace(building_space_detailed_use_types).
+            alias("building_space_detailed_use_type")
     )
     building_space_age_value_dict = \
         {str(entry["Age"][0]): {k: v for k, v in entry.items() if k != "Age"} for entry in building_space_age_value}
@@ -3211,7 +3475,29 @@ def parse_horizontal_division_buildings_CAT_files(cadaster_code, CAT_files_dir):
 
     # Calculate relative economic value
     building_spaces_detailed = building_spaces_detailed.with_columns(
-        (pl.col("construction_relative_economic_value") * pl.col("age_correction_relative_economic_value")).alias("relative_economic_value")
+        (pl.col("construction_relative_economic_value") * pl.col("age_correction_relative_economic_value")).alias("building_space_relative_economic_value")
+    )
+    building_spaces_detailed = building_spaces_detailed.with_columns(
+        (pl.col("building_space_relative_economic_value") * pl.col("building_space_area_with_communal")).alias("building_space_economic_value")
+    )
+
+    # Calculate the complete address
+    building_spaces_detailed = building_spaces_detailed.with_columns(
+        (pl.when(pl.col("street_number1") == "0000").then(pl.lit("")).otherwise(
+            pl.col("street_number1").cast(pl.Int16))).alias("street_number1"),
+        (pl.when(pl.col("street_number2") == "0000").then(pl.lit("")).otherwise(
+            pl.col("street_number2").cast(pl.Int16))).alias("street_number2"),
+        (pl.when(pl.col("km") == "00000").then(pl.lit("")).otherwise(pl.col("km").cast(pl.Int16))).alias("km")
+    )
+    building_spaces_detailed = building_spaces_detailed.with_columns(
+        pl.concat_str(["street_type", "street_name", "street_number1", "street_letter1", "street_number2",
+                       "street_letter2", "km", "building_space_block_name", "building_space_stair_name"],
+                      separator=" ").
+        str.strip_chars().str.replace_all(r"\s+", " ").alias("building_space_address"),
+        pl.concat_str(['building_space_block_name', 'building_space_stair_name', 'building_space_floor_name',
+                       'building_space_door_name'],
+                      separator=" ").
+        str.strip_chars().str.replace_all(r"\s+", " ").alias("building_space_inner_address")
     )
 
     return building_spaces_detailed
@@ -3242,3 +3528,223 @@ def parse_horizontal_division_buildings_CAT_files(cadaster_code, CAT_files_dir):
     # result["building_floor_name_right"].to_list()
     # result.write_csv("joined_spaces.csv",quote_style='always')
 
+
+def aggregate_CAT_file_building_spaces(building_CAT_df):
+    building_CAT_df = building_CAT_df.with_columns(
+        pl.col("building_space_floor_name").map_elements(
+            lambda x: classify_above_ground_floor_names(x) if x is not None else None,
+            return_dtype=pl.Int32
+        ).alias("building_space_floor_order_above_ground"),
+        pl.col("building_space_floor_name").map_elements(
+            lambda x: classify_below_ground_floor_names(x) if x is not None else None,
+            return_dtype=pl.Int32
+        ).alias("building_space_floor_order_below_ground")
+    )
+
+    # Map the original Series to ordered values
+    unique_values = building_CAT_df[
+        "building_space_floor_order_above_ground"].unique().drop_nulls().sort()
+    value_to_order = {val: i for i, val in enumerate(unique_values)}
+    building_CAT_df = building_CAT_df.with_columns(
+        building_CAT_df["building_space_floor_order_above_ground"]
+        .map_elements(lambda x: value_to_order.get(x, None), return_dtype=pl.Int32)
+        .alias("building_space_floor_order_above_ground")
+    )
+    unique_values = building_CAT_df[
+        "building_space_floor_order_below_ground"].unique().drop_nulls().sort()
+    value_to_order = {val: -(i + 1) for i, val in enumerate(unique_values)}
+    building_CAT_df = building_CAT_df.with_columns(
+        building_CAT_df["building_space_floor_order_below_ground"]
+        .map_elements(lambda x: value_to_order.get(x, None), return_dtype=pl.Int32)
+        .alias("building_space_floor_order_below_ground")
+    )
+
+    # Join floor orders below and above ground
+    building_CAT_df = building_CAT_df.with_columns(
+        pl.when(pl.col("building_space_floor_order_above_ground").is_null()).
+        then(pl.col("building_space_floor_order_below_ground")).
+        otherwise(pl.col("building_space_floor_order_above_ground")).alias(
+            "building_space_floor_order"
+        )
+    )
+
+    def adjust_to_consecutive_floor(series):
+        unique_sorted = series.unique().sort()
+        unique_sorted = unique_sorted.drop_nulls()
+        value_to_consecutive = {val: idx + unique_sorted[0] for idx, val in enumerate(unique_sorted)}
+        return series.map_elements(lambda x: value_to_consecutive[x], return_dtype=pl.Int32)
+
+    adjusted_floors = building_CAT_df.group_by("building_space_address").agg(
+        [
+            pl.col("building_space_floor_name"),
+            pl.col("building_space_floor_order").map_elements(adjust_to_consecutive_floor,
+                                                              return_dtype=pl.List(pl.Int32)).alias(
+                "building_space_floor_number")
+        ]
+    )
+    adjusted_floors = (
+        adjusted_floors.explode(["building_space_floor_name", "building_space_floor_number"]).
+        unique().sort(["building_space_address", "building_space_floor_number"]))
+    building_CAT_df = building_CAT_df.join(adjusted_floors,
+                                           on=["building_space_address", "building_space_floor_name"])
+
+    # Compute total areas of the buildings
+    building_CAT_df = building_CAT_df.join(
+        building_CAT_df.group_by("building_space_floor_number").agg(
+            pl.col("building_space_area_with_communal").sum().alias("building_floor_total_area")
+        ), on=["building_space_floor_number"])
+    building_CAT_df = building_CAT_df.join(
+        building_CAT_df.group_by("building_reference").agg(
+            pl.col("building_space_area_with_communal").sum().alias("building_total_area")
+        ), on=["building_reference"])
+    building_CAT_df = building_CAT_df.with_columns(
+        pl.col("building_space_area_without_communal").round(2).alias(
+            "building_space_area_without_communal"),
+        pl.col("building_space_area_with_communal").round(2).alias("building_space_area_with_communal"),
+        pl.col("building_space_economic_value").round(2).alias("building_space_economic_value"),
+    )
+
+    # Sort the dataset
+    building_CAT_df = building_CAT_df.sort(
+        ["building_space_address", "building_space_inner_address"]
+    )
+
+    agg_CAT_by_floors = (
+        building_CAT_df.group_by("building_space_floor_number", "building_space_use_type").agg(
+            pl.col("building_reference").first().alias("building_reference"),
+            pl.col("building_space_reference").count().alias("br__building_spaces_by_floor"),
+            # Average values per building space
+            pl.col("building_space_area_with_communal").mean().round(2).alias(
+                "br__mean_building_space_area_with_communals_by_floor"),
+            pl.col("building_space_area_without_communal").mean().round(2).alias(
+                "br__mean_building_space_area_without_communals_by_floor"),
+            pl.col("building_space_communal_area").mean().round(2).alias(
+                "br__mean_building_space_communal_area_by_floor"),
+            pl.col("building_space_effective_year").mean().round(1).alias(
+                "br__mean_building_space_effective_year_by_floor"),
+            pl.col("building_space_typology_category").cast(pl.Int8).mean().round(1).alias(
+                "br__mean_building_space_category_by_floor"),
+            pl.col("building_space_economic_value").mean().round(2).alias(
+                "br__mean_building_space_economic_value_by_floor"),
+            # Total value for the whole building
+            pl.col("building_space_area_with_communal").sum().alias("br__area_with_communals_by_floor"),
+            pl.col("building_space_area_without_communal").sum().alias(
+                "br__area_without_communals_by_floor"),
+            pl.col("building_space_communal_area").sum().alias("br__communal_area_by_floor"),
+            pl.col("building_space_economic_value").sum().alias("br__economic_value_by_floor"),
+            ((pl.col("building_space_area_with_communal").sum() / pl.col(
+                "building_floor_total_area").mean()).round(2) * 100).alias(
+                "br__relative_area_with_communals_by_floor"),
+            ((pl.col("building_space_area_without_communal").sum() / pl.col(
+                "building_floor_total_area").mean()).round(2) * 100).alias(
+                "br__relative_area_without_communals_by_floor"),
+            ((pl.col("building_space_communal_area").sum() / pl.col(
+                "building_floor_total_area").mean()).round(2) * 100).alias(
+                "br__relative_communal_area_by_floor")
+        ))
+    agg_CAT_by_floors = agg_CAT_by_floors.rename(
+        {"building_space_floor_number": "floor_number", "building_space_use_type": "use_type"})
+    agg_CAT_by_floors = agg_CAT_by_floors.sort("floor_number")
+
+    agg_CAT_building = building_CAT_df.group_by("building_space_use_type").agg(
+        pl.col("building_reference").first().alias("building_reference"),
+        pl.col("building_space_reference").count().alias("br__building_spaces"),
+        pl.col("building_space_floor_number").unique().sort().alias("br__floors"),
+        # Average values per building space
+        pl.col("building_space_area_with_communal").mean().round(2).alias(
+            "br__mean_building_space_area_with_communals"),
+        pl.col("building_space_area_without_communal").mean().round(2).alias(
+            "br__mean_building_space_area_without_communals"),
+        pl.col("building_space_communal_area").mean().round(2).alias(
+            "br__mean_building_space_communal_area"),
+        pl.col("building_space_effective_year").mean().round(1).alias(
+            "br__mean_building_space_effective_year"),
+        pl.col("building_space_typology_category").cast(pl.Int8).mean().round(1).alias(
+            "br__mean_building_space_category"),
+        pl.col("building_space_economic_value").mean().round(2).alias(
+            "br__mean_building_space_economic_value"),
+        # Total value for the whole building
+        pl.col("building_space_area_with_communal").sum().alias("br__area_with_communals"),
+        pl.col("building_space_area_without_communal").sum().alias(
+            "br__area_without_communals"),
+        pl.col("building_space_communal_area").sum().alias("br__communal_area"),
+        pl.col("building_space_economic_value").sum().alias("br__economic_value"),
+        ((pl.col("building_space_area_with_communal").sum() / pl.col(
+            "building_total_area").mean()).round(2) * 100).alias(
+            "br__relative_area_with_communals"),
+        ((pl.col("building_space_area_without_communal").sum() / pl.col(
+            "building_total_area").mean()).round(2) * 100).alias(
+            "br__relative_area_without_communals"),
+        ((pl.col("building_space_communal_area").sum() / pl.col("building_total_area").mean()).round(
+            2) * 100).alias("br__relative_communal_area"),
+        # Arrays of values per building
+        pl.col("building_space_reference").alias("br__building_spaces_reference"),
+        pl.col("building_space_address").alias("br__building_spaces_postal_address"),
+        pl.col("building_space_inner_address").alias("br__building_spaces_inner_address"),
+        pl.col("building_space_floor_number").alias("br__building_spaces_floor_number"),
+        pl.col("building_space_typology_category").cast(pl.Int8).alias("br__building_spaces_category"),
+        pl.col("building_space_effective_year").alias("br__building_spaces_effective_year"),
+        pl.col("building_space_area_without_communal").alias(
+            "br__building_spaces_area_without_communal"),
+        pl.col("building_space_area_with_communal").alias("br__building_spaces_area_with_communal"),
+        pl.col("building_space_economic_value").alias("br__building_spaces_economic_value"),
+        pl.col("building_space_detailed_use_type").alias("br__building_spaces_detailed_use_type")
+    )
+    agg_CAT_building = agg_CAT_building.rename(
+        {"building_space_use_type": "use_type"})
+
+    return {
+        "by_floors": agg_CAT_by_floors,
+        "building": agg_CAT_building
+    }
+
+
+def agg_op(df, funcs, grouping, variable, multiplier=1, divider=1):
+    """
+    Enhanced aggregation function to support multiple operations.
+
+    Args:
+    - df: Input DataFrame (pandas.DataFrame).
+    - funcs: List of functions to apply sequentially (e.g., [sum, lambda x: round(x, 0)]).
+    - grouping: Column name to group by (str).
+    - variable: Target variable for the operation (str).
+    - multiplier: Optional multiplier column or scalar (default: 1).
+    - divider: Optional divider column or scalar (default: 1).
+
+    Returns:
+    - A dictionary with results of applying the functions grouped by `grouping`.
+    """
+    # Drop rows with NaN in relevant columns
+    relevant_columns = [grouping, variable]
+    if isinstance(multiplier, str):
+        relevant_columns.append(multiplier)
+    if isinstance(divider, str):
+        relevant_columns.append(divider)
+    df = df.dropna(subset=relevant_columns)
+
+    # Define helper function to apply functions sequentially
+    def apply_funcs(series,funcs):
+        for func in funcs:
+            series = func(series)
+        return series
+
+    # Prepare multiplier and divider
+    def get_values(column_or_scalar, group):
+        if isinstance(column_or_scalar, str):
+            return df.loc[df[grouping] == group, column_or_scalar]
+        return column_or_scalar
+
+    # Perform grouped calculations
+    result = {}
+    for group in df[grouping].unique():
+        group_data = df.loc[df[grouping] == group, variable]
+        mult = get_values(multiplier, group)
+        div = get_values(divider, group)
+
+        # Apply multiplier and divider
+        if group_data.dtype=='object':
+            result[group] = apply_funcs(group_data,funcs)
+        else:
+            result[group] = apply_funcs(group_data * mult / div,funcs)
+
+    return result

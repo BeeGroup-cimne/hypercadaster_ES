@@ -82,13 +82,7 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, build
 
         # Parse building harmonised to INSPIRE
         building_gdf_ = gpd.read_file(f"{cadaster_dir}/buildings/unzip/A.ES.SDGC.BU.{code}.building.gml", layer="Building")
-        if "building_gdf" in locals():
-            if building_gdf_.crs != building_gdf.crs:
-                building_gdf_ = building_gdf_.to_crs(building_gdf.crs)
-            building_gdf = gpd.GeoDataFrame(pd.concat([building_gdf, building_gdf_], ignore_index=True))
-        else:
-            building_gdf = building_gdf_
-        building_gdf.rename(columns={
+        building_gdf_.rename(columns={
             'geometry': 'building_geometry',
             'value': 'building_area',
             'conditionOfConstruction': 'building_status',
@@ -99,13 +93,19 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, build
             'numberOfFloorsBelowGround': 'n_floors_below_ground',
             'reference': 'building_reference'
         }, inplace=True)
-        building_gdf.drop(
+        building_gdf_.drop(
             ["localId", "namespace", "officialAreaReference", "value_uom", "horizontalGeometryEstimatedAccuracy",
              "horizontalGeometryEstimatedAccuracy_uom", "horizontalGeometryReference", "referenceGeometry",
              "documentLink",
              "format", "sourceStatus", "beginLifespanVersion", "beginning", "end", "endLifespanVersion",
              "informationSystem"],
             inplace=True, axis=1)
+        if "building_gdf" in locals():
+            if building_gdf_.crs != building_gdf.crs:
+                building_gdf_ = building_gdf_.to_crs(building_gdf.crs)
+            building_gdf = gpd.GeoDataFrame(pd.concat([building_gdf, building_gdf_], ignore_index=True))
+        else:
+            building_gdf = building_gdf_
 
         if building_parts_inference:
 
