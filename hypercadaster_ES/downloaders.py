@@ -106,9 +106,9 @@ def download_census_tracts(census_tracts_dir, year):
 def cadaster_downloader(cadaster_dir, cadaster_codes=None):
 
     inspire_dict = {
-        "parcels": "https://www.catastro.minhap.es/INSPIRE/CadastralParcels/ES.SDGC.CP.atom.xml",
-        "address": "https://www.catastro.minhap.es/INSPIRE/Addresses/ES.SDGC.AD.atom.xml",
-        "buildings": "https://www.catastro.minhap.es/INSPIRE/buildings/ES.SDGC.BU.atom.xml"
+        "parcels": "https://www.catastro.hacienda.gob.es/INSPIRE/CadastralParcels/ES.SDGC.CP.atom.xml",
+        "address": "https://www.catastro.hacienda.gob.es/INSPIRE/Addresses/ES.SDGC.AD.atom.xml",
+        "buildings": "https://www.catastro.hacienda.gob.es/INSPIRE/buildings/ES.SDGC.BU.atom.xml"
     }
 
     for k, v in inspire_dict.items():

@@ -141,6 +141,8 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, build
             building_part_gdf_.loc[building_part_gdf_["zone_reference"].isna(), "zone_reference"] = "unknown"
             # building_part_gdf_.drop(columns=["building_part_geometry"]).set_geometry("location").to_file("test.gpkg")
 
+            # building_part_gdf_ = building_part_gdf_.merge(building_gdf_[['building_reference','building_status']])
+
             # In case of Barcelona municipality analysis, use commercial establishments and ground premises datasets
             if code=="08900" and open_data_layers:
                 # establishments = pd.read_csv(
@@ -151,19 +153,25 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, build
                 ground_premises = utils.load_and_transform_barcelona_ground_premises(open_data_layers_dir)
                 building_part_gdf_ = building_part_gdf_.join(ground_premises.set_index("building_reference"),
                                                              on="building_reference", how="left")
+            # building_part_gdf_.loc[
+            #    ((building_part_gdf_.n_floors_above_ground == 0) &
+            #     (building_part_gdf_.n_floors_below_ground == 1)),
+            #    "n_floors_above_ground"] = 1
 
             # Process the building parts
-            building_part_gdf_ = utils.process_building_parts(building_part_gdf_, building_gdf_, buildings_CAT,
+            building_part_gdf_ = utils.process_building_parts(code, building_part_gdf_, buildings_CAT,
                                                               results_dir=results_dir, plots=building_parts_plots)
 
             if "building_part_gdf" in locals():
-                building_part_gdf = pd.concat([building_part_gdf, building_part_gdf_], ignore_index=True)
+                building_part_gdf = pd.concat([building_part_gdf, building_part_gdf_[1]], ignore_index=True)
             else:
-                building_part_gdf = building_part_gdf_
+                building_part_gdf = building_part_gdf_[1]
 
         # Join Building geodataframe with
-        building_gdf = building_gdf.merge(building_part_gdf, left_on="building_reference",
-                                          right_on="building_reference", how="left")
+        building_gdf = (building_gdf[['gml_id', 'building_status', 'building_reference', 'building_use',
+                                     'building_area', 'building_geometry']].
+                        merge(building_part_gdf, left_on="building_reference",
+                              right_on="building_reference", how="left"))
 
     return pd.merge(gdf, building_gdf, left_on="building_reference", right_on="building_reference", how="left")
 
