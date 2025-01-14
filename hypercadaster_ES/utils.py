@@ -951,8 +951,8 @@ def process_building_parts(cadaster_code, building_part_gdf_, buildings_CAT, res
                            plots = False, orientation_discrete_interval_in_degrees = 5,
                            num_workers = max(1, math.ceil(multiprocessing.cpu_count()/2))):
 
-    if (not os.path.exists(f"{results_dir}/{cadaster_code}_sbr_results.pickle") and
-        not os.path.exists(f"{results_dir}/{cadaster_code}_br_results.pickle")):
+    if (not os.path.exists(f"{results_dir}/{cadaster_code}_sbr_results.pkl") and
+        not os.path.exists(f"{results_dir}/{cadaster_code}_br_results.pkl")):
 
         if plots:
             if results_dir is None:
@@ -1010,17 +1010,22 @@ def process_building_parts(cadaster_code, building_part_gdf_, buildings_CAT, res
             results = Parallel(n_jobs=num_workers)(
                 delayed(process_zone_delayed)(zone_reference) for zone_reference in zone_references
             )
+        get_reusable_executor().shutdown(wait=True)
 
         # Concatenate all results into a single DataFrame
         sbr_results = pd.concat([i[0] for i in results if i is not None])[results[0][0].columns]
         br_results = pd.concat([i[1] for i in results if i is not None])[results[0][1].columns]
+        del results
 
-        sbr_results.to_pickle(f"{results_dir}/{cadaster_code}_sbr_results.pickle")
-        br_results.to_pickle(f"{results_dir}/{cadaster_code}_br_results.pickle")
+
+        sbr_results.to_pickle(f"{results_dir}/{cadaster_code}_sbr_results.pkl",
+                              compression={'method': 'gzip', 'compresslevel': 1, 'mtime': 1})
+        br_results.to_pickle(f"{results_dir}/{cadaster_code}_br_results.pkl",
+                             compression={'method': 'gzip', 'compresslevel': 1, 'mtime': 1})
 
     else:
-        sbr_results = pd.read_pickle(f"{results_dir}/{cadaster_code}_sbr_results.pickle")
-        br_results = pd.read_pickle(f"{results_dir}/{cadaster_code}_br_results.pickle")
+        sbr_results = pd.read_pickle(f"{results_dir}/{cadaster_code}_sbr_results.pkl", compression="gzip")
+        br_results = pd.read_pickle(f"{results_dir}/{cadaster_code}_br_results.pkl", compression="gzip")
 
     return sbr_results, br_results
 
@@ -3165,6 +3170,7 @@ def parse_CAT_file(cadaster_code, CAT_files_dir, allowed_dataset_types = [14, 15
                 parsed_rows = Parallel(n_jobs=-1)(
                     delayed(process_line)(line, allowed_dataset_types) for line in lines
                 )
+            get_reusable_executor().shutdown(wait=True)
 
             # Combine all parsed rows into DataFrames
             combined_dfs = combine_dataframes(parsed_rows)
