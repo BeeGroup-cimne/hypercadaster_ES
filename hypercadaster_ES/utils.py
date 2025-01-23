@@ -3742,3 +3742,11 @@ def agg_op(df, funcs, grouping, variable, multiplier=1, divider=1):
             result[group] = apply_funcs(group_data * mult / div,funcs)
 
     return result
+
+def read_br_inferred_indicators(cadaster_code, wd):
+    result_dir = results_dir_(wd)
+    return pd.read_pickle(f"{result_dir}/{cadaster_code}_br_results.pkl", compression="gzip")
+
+def read_sbr_inferred_indicators(cadaster_code, wd):
+    result_dir = results_dir_(wd)
+    return pd.read_pickle(f"{result_dir}/{cadaster_code}_sbr_results.pkl", compression="gzip")
