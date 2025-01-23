@@ -1,3 +1,5 @@
 dist
 hypercadaster_ES.egg-info
 all_directions_barcelona.py
+.idea
+.DS_Store
