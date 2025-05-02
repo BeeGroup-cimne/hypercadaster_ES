@@ -3,6 +3,7 @@ import geopandas as gpd
 from hypercadaster_ES import mergers
 from hypercadaster_ES import utils
 from hypercadaster_ES import downloaders
+from zipfile import ZipFile, BadZipFile
 
 def download(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
              neighborhood_layer=True, postal_code_layer=True, census_layer=True,
@@ -72,6 +73,18 @@ def download(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
                                       "5a-ddea901be8bc/resource/99764d55-b1be-4281-b822-4277442cc721/download/22093"
                                       "0_censcomercialbcn_opendata_2022_v10_mod.csv",
                                   file="barcelona_ground_premises.csv")
+        downloaders.download_file(dir=utils.open_data_dir_(wd),
+                                  url="https://opendata-ajuntament.barcelona.cat/data/dataset/6b5cfa7b-1d8d-45f0-990a-"
+                                      "d1844d43ffd1/resource/26c6be33-44f5-4596-8a29-7ac152546ca7/download",
+                                  file="barcelona_carrerer.zip")
+        try:
+            with ZipFile(f"{utils.open_data_dir_(wd)}/barcelona_carrerer.zip", 'r') as zip:
+                zip.extractall(utils.open_data_dir_(wd))
+                os.rename(f"{utils.open_data_dir_(wd)}/Adreces_elementals.gpkg",
+                          f"{utils.open_data_dir_(wd)}/barcelona_carrerer.gpkg")
+                os.remove(f"{utils.open_data_dir_(wd)}/barcelona_carrerer.zip")
+        except BadZipFile:
+            os.remove(f"{utils.open_data_dir_(wd)}/barcelona_carrerer.zip")
 
 def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
           neighborhood_layer=True, postal_code_layer=True, census_layer=True, elevations_layer=True,
@@ -94,10 +107,17 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
     elif cadaster_codes is None:
         cadaster_codes = utils.ine_to_cadaster_codes(utils.cadaster_dir_(wd), ine_codes)
 
+    # cadaster_dir = utils.cadaster_dir_(wd)
+    # results_dir = utils.results_dir_(wd)
+    # open_street_dir = utils.open_street_dir_(wd)
+    # open_data_layers_dir = utils.open_data_dir_(wd)
+    # CAT_files_dir = f"{wd}/{CAT_files_rel_dir}"
+
     gdf = mergers.join_cadaster_data(
         cadaster_dir=utils.cadaster_dir_(wd),
         cadaster_codes=cadaster_codes,
         results_dir=utils.results_dir_(wd),
+        open_street_dir=utils.open_street_dir_(wd),
         building_parts_inference=building_parts_inference,
         use_CAT_files=use_CAT_files,
         building_parts_plots=building_parts_plots,

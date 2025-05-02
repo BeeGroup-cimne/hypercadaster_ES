@@ -1,21 +1,23 @@
-import os
-
+from hypercadaster_ES import utils
+from hypercadaster_ES import building_inference
+from hypercadaster_ES import downloaders
 import geopandas as gpd
 import pandas as pd
 import polars as pl
 import rasterio
 from shapely import wkt
-from shapely.geometry import MultiPoint
-from hypercadaster_ES import utils
+from shapely.geometry import Point
 import sys
 import numpy as np
+import regex as re
 
 def make_valid(gdf):
     gdf.geometry = gdf.geometry.make_valid()
     return gdf
 
 
-def get_cadaster_address(cadaster_dir, cadaster_codes, directions_from_CAT_files, CAT_files_dir):
+def get_cadaster_address(cadaster_dir, cadaster_codes, directions_from_CAT_files=True, CAT_files_dir="CAT_files",
+                         directions_from_open_data=True, open_data_layers_dir="open_data"):
     sys.stderr.write(f"\nReading the cadaster addresses for {len(cadaster_codes)} municipalities\n")
 
     address_gdf = gpd.GeoDataFrame()
@@ -48,7 +50,6 @@ def get_cadaster_address(cadaster_dir, cadaster_codes, directions_from_CAT_files
         else:
             address_street_names_df = address_street_names_df_
 
-
     sys.stderr.write("\r" + " " * 60)
 
     address_street_names_df = address_street_names_df[['gml_id', 'text']].copy()
@@ -68,13 +69,14 @@ def get_cadaster_address(cadaster_dir, cadaster_codes, directions_from_CAT_files
         ["gml_id", "namespace", "localId", "beginLifespanVersion", "validFrom", "level", "type", "method", "default"],
         inplace=True, axis=1)
     gdf = gdf.set_geometry("location")
+    _, parcels_gdf = join_cadaster_parcel(gdf, cadaster_dir, cadaster_codes, how="left")
 
     if directions_from_CAT_files:
         addresses_CAT = pd.DataFrame()
 
         for code in cadaster_codes:
             # Parse CAT file, if available
-            buildings_CAT = utils.parse_horizontal_division_buildings_CAT_files(code, CAT_files_dir)
+            buildings_CAT = building_inference.parse_horizontal_division_buildings_CAT_files(code, CAT_files_dir)
             addresses_CAT_ = (pl.concat([
                 buildings_CAT[["building_reference", "street_type", "street_name", "street_number1"]].rename(
                     {"street_number1": "street_number"}),
@@ -84,10 +86,19 @@ def get_cadaster_address(cadaster_dir, cadaster_codes, directions_from_CAT_files
             addresses_CAT_['street_number_clean'] = addresses_CAT_['street_number'].str.extract(r'(\d+(?=.*))').fillna(0).astype(int)
             addresses_CAT = pd.concat([addresses_CAT, addresses_CAT_], ignore_index=True)
             addresses_CAT['cadaster_code'] = code
+
         def calculate_centroid(group):
-            # Combine points into a MultiPoint and compute the centroid
-            multipoint = MultiPoint(group["location"].tolist())
-            return pd.Series({"location": multipoint.centroid})
+            valid_points = [pt for pt in group["location"] if isinstance(pt, Point)]
+
+            if not valid_points:
+                return pd.Series({"location": None})
+
+            x_coords = [pt.x for pt in valid_points]
+            y_coords = [pt.y for pt in valid_points]
+
+            centroid = Point(np.mean(x_coords), np.mean(y_coords))
+
+            return pd.Series({"location": centroid})
 
         addresses_CAT = addresses_CAT.merge(
                 gdf[["building_reference", "location"]].
@@ -109,10 +120,67 @@ def get_cadaster_address(cadaster_dir, cadaster_codes, directions_from_CAT_files
         gdf = pd.concat([gdf, addresses_CAT], ignore_index=True)
         gdf = gdf.drop_duplicates(subset=["street_name", "street_number", "street_type", "cadaster_code"], keep="first", ignore_index=True)
 
+    if directions_from_open_data and "08900" in cadaster_codes:
+        bcn_open_data_streets = gpd.read_file(f"{open_data_layers_dir}/barcelona_carrerer.gpkg")
+        def extract_up_to_second_capital_or_number(text):
+            # Find all positions of capitalized words
+            capital_matches = list(re.finditer(r'\b\p{Lu}[^\s]*', text))
+            # Find all positions of numbers
+            number_match = re.search(r'\b\d+', text)
+            # Determine cut-off point: min of second capital or first number
+            cutoff_indices = []
+            if len(capital_matches) >= 2:
+                cutoff_indices.append(capital_matches[1].start())
+            if number_match:
+                cutoff_indices.append(number_match.start())
+            if cutoff_indices:
+                return text[:min(cutoff_indices)]
+            return None
+        bcn_open_data_streets['streetType'] = bcn_open_data_streets['NOM_CARRER'].apply(
+            extract_up_to_second_capital_or_number)
+        bcn_open_data_streets['streetName'] = bcn_open_data_streets.apply(
+            lambda row: row['NOM_CARRER'][len(row['streetType']):].strip() if pd.notnull(row['streetType']) else None,
+            axis=1
+        )
+
+        # Step 1: Ensure CRS matches
+        if bcn_open_data_streets.crs != parcels_gdf.crs:
+            bcn_open_data_streets = bcn_open_data_streets.to_crs(parcels_gdf.crs)
+
+        # Step 2: Spatial join - points inside parcels
+        bcn_open_data_streets = gpd.sjoin(
+            bcn_open_data_streets, parcels_gdf[['building_reference', 'parcel_geometry']],
+            how="left", predicate="within"
+        )
+
+        # Step 3: Find unmatched (not inside any parcel)
+        unmatched = bcn_open_data_streets[bcn_open_data_streets['building_reference'].isna()].copy()
+
+        if not unmatched.empty:
+            # Create a spatial index for parcels
+            parcels_gdf = parcels_gdf.set_geometry('parcel_geometry')
+            parcel_sindex = parcels_gdf.sindex
+
+            # Function to find closest parcel geometry
+            def find_closest_parcel(point):
+                # Ensure input is a Shapely Point
+                nearest_idx = list(parcel_sindex.nearest(point, 1))
+                closest_geom = parcels_gdf.iloc[nearest_idx[0]]
+                return closest_geom['building_reference']
+
+            # Apply to unmatched geometries
+            unmatched['building_reference'] = unmatched['geometry'].apply(find_closest_parcel)
+
+            # Step 4: Merge results back
+            bcn_open_data_streets.update(unmatched)
+
+        bcn_open_data_streets.geometry = bcn_open_data_streets.geometry.centroid
+        gdf.iloc[0]
+
     return gdf
 
 
-def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, building_parts_plots=False,
+def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_street_dir, building_parts_plots=False,
                            building_parts_inference=False, building_parts_inference_using_CAT_files=False,
                            open_data_layers=False, open_data_layers_dir=None, CAT_files_dir=None):
 
@@ -127,7 +195,7 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, build
 
         # Parse building harmonised to INSPIRE
         building_gdf_ = gpd.read_file(f"{cadaster_dir}/buildings/unzip/A.ES.SDGC.BU.{code}.building.gml", layer="Building")
-        building_gdf_.rename(columns={
+        building_gdf_= building_gdf_.rename(columns={
             'geometry': 'building_geometry',
             'value': 'building_area',
             'conditionOfConstruction': 'building_status',
@@ -136,15 +204,20 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, build
             'numberOfDwellings': 'n_dwellings',
             'numberOfFloorsAboveGround': 'n_floors_above_ground',
             'numberOfFloorsBelowGround': 'n_floors_below_ground',
-            'reference': 'building_reference'
-        }, inplace=True)
+            'reference': 'building_reference',
+            'beginning': 'year_of_construction'
+        })
+        building_gdf_['year_of_construction'] = building_gdf_['year_of_construction'].str[0:4]
+        building_gdf_['year_of_construction'] = pd.to_numeric(
+            building_gdf_['year_of_construction'], errors='coerce').astype('Int64')
         building_gdf_.drop(
             ["localId", "namespace", "officialAreaReference", "value_uom", "horizontalGeometryEstimatedAccuracy",
              "horizontalGeometryEstimatedAccuracy_uom", "horizontalGeometryReference", "referenceGeometry",
-             "documentLink",
-             "format", "sourceStatus", "beginLifespanVersion", "beginning", "end", "endLifespanVersion",
+             "documentLink", "format", "sourceStatus", "beginLifespanVersion", "end", "endLifespanVersion",
              "informationSystem"],
             inplace=True, axis=1)
+        building_gdf_ = building_gdf_.set_geometry("building_geometry")
+
         if "building_gdf" in locals():
             if building_gdf_.crs != building_gdf.crs:
                 building_gdf_ = building_gdf_.to_crs(building_gdf.crs)
@@ -154,7 +227,7 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, build
 
         # Parse CAT file, if available
         if building_parts_inference_using_CAT_files:
-            buildings_CAT = utils.parse_horizontal_division_buildings_CAT_files(code, CAT_files_dir)
+            buildings_CAT = building_inference.parse_horizontal_division_buildings_CAT_files(code, CAT_files_dir)
         else:
             buildings_CAT = None
 
@@ -195,7 +268,7 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, build
                 #     encoding=from_path(f"{open_data_layers_dir}/barcelona_establishments.csv").best().encoding,
                 #     on_bad_lines='skip',
                 #     sep=",")
-                ground_premises = utils.load_and_transform_barcelona_ground_premises(open_data_layers_dir)
+                ground_premises = downloaders.load_and_transform_barcelona_ground_premises(open_data_layers_dir)
                 building_part_gdf_ = building_part_gdf_.join(ground_premises.set_index("building_reference"),
                                                              on="building_reference", how="left")
             # building_part_gdf_.loc[
@@ -203,9 +276,14 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, build
             #     (building_part_gdf_.n_floors_below_ground == 1)),
             #    "n_floors_above_ground"] = 1
 
+            # Join the parcel
+            building_part_gdf_, parcels_gdf = join_cadaster_parcel(building_part_gdf_, cadaster_dir, [code])
+
             # Process the building parts
-            building_part_gdf_ = utils.process_building_parts(code, building_part_gdf_, buildings_CAT,
-                                                              results_dir=results_dir, plots=building_parts_plots)
+            building_part_gdf_ = building_inference.process_building_parts(
+                code=code, building_part_gdf_=building_part_gdf_, buildings_CAT=buildings_CAT,
+                parcels_gdf=parcels_gdf, results_dir=results_dir, cadaster_dir=cadaster_dir,
+                open_street_dir=open_street_dir, plots=building_parts_plots)
 
             if "building_part_gdf" in locals():
                 building_part_gdf = pd.concat([building_part_gdf, building_part_gdf_[1]], ignore_index=True)
@@ -214,7 +292,7 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, build
 
             # Join Building geodataframe with
             building_gdf = (building_gdf[['gml_id', 'building_status', 'building_reference', 'building_use',
-                                         'building_area', 'building_geometry']].
+                                         'building_area', 'building_geometry','year_of_construction']].
                             merge(building_part_gdf, left_on="building_reference",
                                   right_on="building_reference", how="left"))
 
@@ -324,6 +402,32 @@ def join_cadaster_zone(gdf, cadaster_dir, cadaster_codes):
 
     return joined
 
+def join_cadaster_parcel(gdf, cadaster_dir, cadaster_codes, how="left"):
+
+    for code in cadaster_codes:
+
+        sys.stderr.write("\r" + " " * 60)
+        sys.stderr.flush()
+        sys.stderr.write(f"\r\tJoining cadastral parcels for buildings in cadaster code: {code}")
+        sys.stderr.flush()
+
+        parcel_gdf_ = gpd.read_file(f"{cadaster_dir}/parcels/unzip/A.ES.SDGC.CP.{code}.cadastralparcel.gml",
+                             layer="CadastralParcel")
+        if "parcel_gdf" in locals():
+            if parcel_gdf_.crs != parcel_gdf.crs:
+                parcel_gdf_ = parcel_gdf_.to_crs(parcel_gdf.crs)
+            parcel_gdf = gpd.GeoDataFrame(pd.concat([parcel_gdf, parcel_gdf_], ignore_index=True))
+        else:
+            parcel_gdf = parcel_gdf_
+
+    parcel_gdf = parcel_gdf.rename({"geometry": "parcel_geometry", "localId": "building_reference"}, axis=1)
+    parcel_gdf = parcel_gdf[["building_reference", "parcel_geometry"]]
+    parcel_gdf = parcel_gdf.drop_duplicates(subset="building_reference", keep="first")
+    gdf_joined = gdf.merge(parcel_gdf, on="building_reference", how=how)
+    parcel_gdf = parcel_gdf.set_geometry("parcel_geometry")
+    parcel_gdf["parcel_centroid"] = parcel_gdf.centroid
+
+    return (gdf_joined,parcel_gdf)
 
 def join_adm_div_naming(gdf, cadaster_dir, cadaster_codes):
 
@@ -331,19 +435,27 @@ def join_adm_div_naming(gdf, cadaster_dir, cadaster_codes):
                     left_on="cadaster_code", right_on="cadaster_code", how="left")
 
 
-def join_cadaster_data(cadaster_dir, cadaster_codes, results_dir, building_parts_plots=False,
+def join_cadaster_data(cadaster_dir, cadaster_codes, results_dir, open_street_dir, building_parts_plots=False,
                        building_parts_inference=False, use_CAT_files=False,
                        open_data_layers=False, open_data_layers_dir=None, CAT_files_dir = None):
 
     # Address
     gdf = get_cadaster_address(cadaster_dir=cadaster_dir, cadaster_codes=cadaster_codes,
                                directions_from_CAT_files=use_CAT_files,
-                               CAT_files_dir=CAT_files_dir)
+                               CAT_files_dir=CAT_files_dir,
+                               directions_from_open_data=open_data_layers,
+                               open_data_layers_dir=open_data_layers_dir)
+
+
+
     # Zones
     gdf = join_cadaster_zone(gdf=gdf, cadaster_dir=cadaster_dir, cadaster_codes=cadaster_codes)
     # Buildings
+    # building_parts_inference_using_CAT_files = use_CAT_files
+    # code = "08900"
     gdf = join_cadaster_building(gdf=gdf, cadaster_dir=cadaster_dir, cadaster_codes=cadaster_codes,
-                                 results_dir=results_dir, building_parts_plots=building_parts_plots,
+                                 results_dir=results_dir, open_street_dir=open_street_dir,
+                                 building_parts_plots=building_parts_plots,
                                  building_parts_inference=building_parts_inference,
                                  building_parts_inference_using_CAT_files=use_CAT_files,
                                  open_data_layers=open_data_layers, open_data_layers_dir=open_data_layers_dir,
@@ -353,6 +465,8 @@ def join_cadaster_data(cadaster_dir, cadaster_codes, results_dir, building_parts
 
     gdf["building_centroid"] = gdf["building_geometry"].centroid
     gdf["building_centroid"] = np.where(gdf["building_geometry"] == None, gdf["location"], gdf["building_centroid"])
+    gdf["address_location"] = np.where(gdf["location"] == None, gdf["parcel_centroid"], gdf["location"])
+    gdf = gdf.drop(columns = ["location"])
     gdf = gdf.set_geometry("building_centroid")
     gdf = gdf.set_crs(gdf.location.crs)
 

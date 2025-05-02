@@ -26,7 +26,7 @@ gdf = hc.merge(
     cadaster_codes=cadaster_codes, 
     building_parts_inference=False, 
     building_parts_plots=False,
-    use_CAT_files = True
+    use_CAT_files=True
 )
 gdf.to_pickle(f"{wd}/{'~'.join(cadaster_codes)}_no_inference.pkl", compression="gzip")
 ```
