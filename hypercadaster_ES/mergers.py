@@ -136,12 +136,14 @@ def get_cadaster_address(cadaster_dir, cadaster_codes, directions_from_CAT_files
             if cutoff_indices:
                 return text[:min(cutoff_indices)]
             return None
-        bcn_open_data_streets['streetType'] = bcn_open_data_streets['NOM_CARRER'].apply(
+        bcn_open_data_streets['street_type'] = bcn_open_data_streets['NOM_CARRER'].apply(
             extract_up_to_second_capital_or_number)
-        bcn_open_data_streets['streetName'] = bcn_open_data_streets.apply(
-            lambda row: row['NOM_CARRER'][len(row['streetType']):].strip() if pd.notnull(row['streetType']) else None,
+        bcn_open_data_streets['street_name'] = bcn_open_data_streets.apply(
+            lambda row: row['NOM_CARRER'][len(row['street_type']):].strip() if pd.notnull(row['street_type']) else None,
             axis=1
         )
+        bcn_open_data_streets['street_type'] = bcn_open_data_streets['street_type'].str.upper()
+        bcn_open_data_streets['street_name'] = bcn_open_data_streets['street_name'].str.upper()
 
         # Step 1: Ensure CRS matches
         if bcn_open_data_streets.crs != parcels_gdf.crs:
@@ -174,8 +176,36 @@ def get_cadaster_address(cadaster_dir, cadaster_codes, directions_from_CAT_files
             # Step 4: Merge results back
             bcn_open_data_streets.update(unmatched)
 
-        bcn_open_data_streets.geometry = bcn_open_data_streets.geometry.centroid
-        gdf.iloc[0]
+        bcn_open_data_streets["location"] = bcn_open_data_streets.geometry.centroid
+        bcn_open_data_streets["specification"] = "OpenDataBCN"
+        bcn_open_data_streets["cadaster_code"] = "08900"
+        bcn_open_data_streets["street_number"] = pd.to_numeric(bcn_open_data_streets["NUMPOST"],
+                                                                     errors='coerce').astype(str)
+        bcn_open_data_streets["street_number_clean"] = pd.to_numeric(bcn_open_data_streets["NUMPOST"],
+                                                                     errors='coerce').astype('Int64')
+
+        aggregated = (
+            bcn_open_data_streets.groupby('geometry')['street_number_clean']
+            .agg(['min', 'max'])
+            .reset_index()
+        )
+
+        aggregated['street_number_clean_label'] = aggregated.apply(
+            lambda row: str(int(row['min'])) if row['min'] == row['max']
+            else f"{int(row['min'])}-{int(row['max'])}",
+            axis=1
+        )
+
+        bcn_open_data_streets = bcn_open_data_streets.merge(aggregated[['geometry', 'street_number_clean_label']],
+                                                            on='geometry', how='left')
+        bcn_open_data_streets["street_number_odbcn_label"] = bcn_open_data_streets["ETIQUETA"]
+
+        bcn_open_data_streets = bcn_open_data_streets[
+            ['location', 'specification', 'cadaster_code', 'street_type', 'street_name', 'street_number_clean_label',
+             'street_number_odbcn_label', 'street_number', 'street_number_clean', 'building_reference']]
+
+        gdf = gdf[gdf["cadaster_code"]!="08900"]
+        gdf = pd.concat([gdf, bcn_open_data_streets])
 
     return gdf
 
@@ -292,9 +322,68 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_
 
             # Join Building geodataframe with
             building_gdf = (building_gdf[['gml_id', 'building_status', 'building_reference', 'building_use',
-                                         'building_area', 'building_geometry','year_of_construction']].
+                                          'building_geometry','year_of_construction']].
                             merge(building_part_gdf, left_on="building_reference",
                                   right_on="building_reference", how="left"))
+
+        else:
+            ['n_building_units', 'n_dwellings', 'n_floors_above_ground', 'building_area']
+            building_gdf = building_gdf[['gml_id', 'building_status', 'building_reference', 'building_use',
+                           'building_geometry','year_of_construction']]
+
+            use_types = buildings_CAT["building_space_inferred_use_type"].unique().to_list()
+
+            # Function to convert use type to snake_case with prefix
+            def to_snake_case_prefix(use_type: str) -> str:
+                return "building_area_" + re.sub(r'[^a-zA-Z0-9]+', '_', use_type.strip().lower()).strip('_')
+
+            # Create the use type column mapping
+            use_type_mapping = {
+                use_type: to_snake_case_prefix(use_type) for use_type in use_types
+            }
+
+            # First, summarize total area per building and use type
+            area_per_use = (
+                buildings_CAT
+                .group_by(["building_reference", "building_space_inferred_use_type"])
+                .agg(pl.col("building_space_area_with_communal").sum().alias("area_by_use"))
+            )
+
+            # Pivot so each use type becomes a column
+            area_pivot = (
+                area_per_use
+                .pivot(
+                    values="area_by_use",
+                    index="building_reference",
+                    columns="building_space_inferred_use_type"
+                )
+                .rename(use_type_mapping)  # rename columns
+                .fill_null(0.0)  # optional: replace nulls with 0 for missing use types
+            )
+
+            # Add additional metrics: total units, dwellings, floors, total area
+            summary = (
+                buildings_CAT
+                .group_by("building_reference")
+                .agg([
+                    pl.count().alias("n_building_units"),
+                    pl.col("building_space_inferred_use_type")
+                    .map_elements(lambda x: x == "Residential", return_dtype=pl.Utf8)
+                    .sum()
+                    .alias("n_dwellings"),
+                    pl.col("building_space_floor_name")
+                    .unique()
+                    .count()
+                    .alias("n_floors_above_ground"),
+                    pl.col("building_space_area_with_communal")
+                    .sum()
+                    .alias("building_area")
+                ])
+            )
+
+            # Join both tables
+            final_df = summary.join(area_pivot, on="building_reference", how="left").to_pandas()
+            building_gdf = pd.merge(building_gdf, final_df, on="building_reference", how="left")
 
     return pd.merge(gdf, building_gdf, left_on="building_reference", right_on="building_reference", how="left")
 
@@ -446,8 +535,6 @@ def join_cadaster_data(cadaster_dir, cadaster_codes, results_dir, open_street_di
                                directions_from_open_data=open_data_layers,
                                open_data_layers_dir=open_data_layers_dir)
 
-
-
     # Zones
     gdf = join_cadaster_zone(gdf=gdf, cadaster_dir=cadaster_dir, cadaster_codes=cadaster_codes)
     # Buildings
@@ -465,10 +552,14 @@ def join_cadaster_data(cadaster_dir, cadaster_codes, results_dir, open_street_di
 
     gdf["building_centroid"] = gdf["building_geometry"].centroid
     gdf["building_centroid"] = np.where(gdf["building_geometry"] == None, gdf["location"], gdf["building_centroid"])
+    if not "parcel_centroid" in gdf.columns:
+        gdf = join_cadaster_parcel(gdf, cadaster_dir, cadaster_codes)[0]
+        gdf["parcel_centroid"] = gdf["parcel_geometry"].centroid
     gdf["address_location"] = np.where(gdf["location"] == None, gdf["parcel_centroid"], gdf["location"])
+    crs = gdf.crs
     gdf = gdf.drop(columns = ["location"])
     gdf = gdf.set_geometry("building_centroid")
-    gdf = gdf.set_crs(gdf.location.crs)
+    gdf = gdf.set_crs(crs)
 
     return gdf
 
@@ -487,7 +578,6 @@ def join_DEM_raster(gdf, raster_dir):
         gdf = gdf.to_crs(ini_crs)
 
     return gdf
-
 
 def join_by_census_tracts(gdf, census_tract_dir, columns=None, geometry_column = "census_geometry", year = 2022):
 
