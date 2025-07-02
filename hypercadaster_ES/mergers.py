@@ -326,10 +326,11 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_
                             merge(building_part_gdf, left_on="building_reference",
                                   right_on="building_reference", how="left"))
 
-        else:
-            ['n_building_units', 'n_dwellings', 'n_floors_above_ground', 'building_area']
+        elif buildings_CAT is not None:
+            #['n_building_units', 'n_dwellings', 'n_floors_above_ground', 'building_area']
+
             building_gdf = building_gdf[['gml_id', 'building_status', 'building_reference', 'building_use',
-                           'building_geometry','year_of_construction']]
+                                         'building_geometry', 'year_of_construction']]
 
             use_types = buildings_CAT["building_space_inferred_use_type"].unique().to_list()
 
@@ -338,15 +339,15 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_
                 return "building_area_" + re.sub(r'[^a-zA-Z0-9]+', '_', use_type.strip().lower()).strip('_')
 
             # Create the use type column mapping
-            use_type_mapping = {
-                use_type: to_snake_case_prefix(use_type) for use_type in use_types
-            }
+            use_type_mapping = {use_type: to_snake_case_prefix(use_type) for use_type in use_types}
 
             # First, summarize total area per building and use type
             area_per_use = (
                 buildings_CAT
                 .group_by(["building_reference", "building_space_inferred_use_type"])
-                .agg(pl.col("building_space_area_with_communal").sum().alias("area_by_use"))
+                .agg(
+                    pl.col("building_space_area_with_communal").sum().alias("area_by_use")
+                )
             )
 
             # Pivot so each use type becomes a column
@@ -355,7 +356,7 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_
                 .pivot(
                     values="area_by_use",
                     index="building_reference",
-                    columns="building_space_inferred_use_type"
+                    on="building_space_inferred_use_type"
                 )
                 .rename(use_type_mapping)  # rename columns
                 .fill_null(0.0)  # optional: replace nulls with 0 for missing use types
@@ -366,24 +367,23 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_
                 buildings_CAT
                 .group_by("building_reference")
                 .agg([
-                    pl.count().alias("n_building_units"),
-                    pl.col("building_space_inferred_use_type")
-                    .map_elements(lambda x: x == "Residential", return_dtype=pl.Utf8)
+                    pl.len().alias("n_building_units"),
+                    (pl.col("building_space_inferred_use_type") == "Residential")
                     .sum()
                     .alias("n_dwellings"),
-                    pl.col("building_space_floor_name")
-                    .unique()
-                    .count()
-                    .alias("n_floors_above_ground"),
-                    pl.col("building_space_area_with_communal")
-                    .sum()
-                    .alias("building_area")
+                    pl.col("building_space_floor_name").unique().count().alias("n_floors_above_ground"),
+                    pl.col("building_space_area_with_communal").sum().alias("building_area")
                 ])
             )
 
             # Join both tables
             final_df = summary.join(area_pivot, on="building_reference", how="left").to_pandas()
             building_gdf = pd.merge(building_gdf, final_df, on="building_reference", how="left")
+
+        else:
+            building_gdf = building_gdf[['gml_id', 'building_status', 'building_reference', 'building_use',
+                                         'building_geometry', 'year_of_construction', 'n_building_units', 'n_dwellings',
+                                         'n_floors_above_ground', 'building_area']]
 
     return pd.merge(gdf, building_gdf, left_on="building_reference", right_on="building_reference", how="left")
 
@@ -558,7 +558,7 @@ def join_cadaster_data(cadaster_dir, cadaster_codes, results_dir, open_street_di
     gdf["address_location"] = np.where(gdf["location"] == None, gdf["parcel_centroid"], gdf["location"])
     crs = gdf.crs
     gdf = gdf.drop(columns = ["location"])
-    gdf = gdf.set_geometry("building_centroid")
+    gdf = gdf.set_geometry("address_location")
     gdf = gdf.set_crs(crs)
 
     return gdf

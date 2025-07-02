@@ -144,6 +144,7 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
         )
     if "index" in gdf.columns:
         gdf.drop("index", axis=1, inplace=True)
+    gdf = gdf.drop_duplicates()
 
     return gdf
 

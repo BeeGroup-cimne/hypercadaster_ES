@@ -8,7 +8,7 @@ cadaster_codes = ["08900"]
 gdf = pd.read_pickle(f"{wd}/{'~'.join(cadaster_codes)}.pkl", compression="gzip")
 gdf = gdf[gdf["location"].notnull()]
 
-building_reference = "9628926DF2892H"
+building_reference = "8523515DF2882D"
 gdf_ = gdf[gdf.building_reference == building_reference]
 # pprint.pp(gdf_.iloc[0].to_dict())
 
