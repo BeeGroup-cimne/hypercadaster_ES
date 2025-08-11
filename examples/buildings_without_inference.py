@@ -1,7 +1,7 @@
 import hypercadaster_ES as hc
 
 wd = "/home/gmor/Nextcloud2/Beegroup/data/hypercadaster_ES"
-cadaster_codes = ["08900"]
+cadaster_codes = ["25900"]
 
 hc.download(
     wd=wd,
@@ -17,7 +17,7 @@ elevations_layer=True
 open_data_layers=True
 building_parts_inference=False
 building_parts_plots=False
-use_CAT_files=True
+use_CAT_files=False
 CAT_files_rel_dir="CAT_files"
 
 gdf = hc.merge(
