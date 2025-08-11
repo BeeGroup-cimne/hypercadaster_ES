@@ -64,7 +64,7 @@ INSTALL_REQUIRES = [
     "scikit-learn==1.6.0",
     "scipy==1.14.1",
     "setuptools==70.3.0",
-    "shapely==2.0.4",
+    "shapely==2.1.1",
     "six==1.16.0",
     "snuggs==1.4.7",
     "soupsieve==2.5",
