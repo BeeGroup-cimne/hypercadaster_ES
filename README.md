@@ -49,6 +49,49 @@ gdf = hc.merge(
 gdf.to_pickle(f"{wd}/{'~'.join(cadaster_codes)}.pkl", compression="gzip")
 ```
 
+# Install PDAL (optional) and GDAL on your system
+
+Make sure the unstable PPA of Ubuntu GIS is present
+```
+sudo add-apt-repository -y ppa:ubuntugis/ubuntugis-unstable
+sudo apt update
+# in your venv: hypercadaster_ES
+python3 -m pip install setuptools wheel
+```
+
+## GDAL installation in Ubuntu 24.04
+```
+sudo apt install gdal-bin libgdal-dev
+
+# make sure headers are visible (usually not strictly needed, but safe)
+export CPLUS_INCLUDE_PATH=/usr/include/gdal
+export C_INCLUDE_PATH=/usr/include/gdal
+
+# match the system GDAL version to avoid ABI issues
+GDAL_VERSION=$(gdal-config --version)
+python3 -m pip install --no-binary=GDAL "GDAL==${GDAL_VERSION}.*"
+```
+
+## (optional) PDAL installation in Ubuntu 24.04 without CONDA
+
+Install PDAL (CLI + dev headers)
+```
+
+sudo apt install -y pdal libpdal-dev
+```
+Python bindings
+```
+# in your venv: hypercadaster_ES
+python3 -m pip install pdal
+```
+Sanity checks
+```
+pdal --version
+pdal info --summary
+# in your venv: hypercadaster_ES
+python3 -c "import pdal; print('python pdal OK')"
+```
+
 ## Authors
 - Jose Manuel Broto - jmbroto@cimne.upc.edu
 - Gerard Mor - gmor@cimne.upc.edu

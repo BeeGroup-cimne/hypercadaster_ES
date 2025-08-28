@@ -180,15 +180,6 @@ def municipality_name(ine_code):
 
     return list(df.loc[df["Municipality code"]==ine_code ,"Municipality name"])[0]
 
-def cadaster_to_ine_codes(cadaster_dir, cadaster_codes):
-    if cadaster_codes is not None:
-        map_code_dict = pd.read_excel(f"{cadaster_dir}/ine_inspire_codes.xlsx", dtype=object, engine='openpyxl').set_index(
-            'CÓDIGO CATASTRO').to_dict()['CÓDIGO INE']
-        ine_codes = [map_code_dict[key] for key in cadaster_codes]
-    else:
-        ine_codes = None
-    return ine_codes
-
 def get_administrative_divisions_naming(cadaster_dir, cadaster_codes):
     municipalities = pd.read_excel(f"{cadaster_dir}/ine_inspire_codes.xlsx", dtype=object, engine='openpyxl')
     municipalities.drop(['INMUEBLES TOTALES', 'INMUEBLES URBANOS', 'INMUEBLES RÚSTICOS',

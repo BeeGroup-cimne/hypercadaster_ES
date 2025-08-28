@@ -43,10 +43,8 @@ def get_cadaster_address(cadaster_dir, cadaster_codes, directions_from_CAT_files
                                                  layer="ThoroughfareName")
 
         if not address_street_names_df.empty:
-            if address_street_names_df_.crs != address_street_names_df.crs:
-                address_street_names_df_ = address_street_names_df_.to_crs(address_street_names_df.crs)
-            address_street_names_df = gpd.GeoDataFrame(
-                pd.concat([address_street_names_df, address_street_names_df_], ignore_index=True))
+            address_street_names_df = pd.concat([address_street_names_df, address_street_names_df_],
+                                                ignore_index=True)
         else:
             address_street_names_df = address_street_names_df_
 
@@ -598,6 +596,28 @@ def join_by_census_tracts(gdf, census_tract_dir, columns=None, geometry_column =
 
     return census_gdf
 
+
+def get_census_gdf(census_tract_dir, columns=None, geometry_column="geometry", year=2022, crs="EPSG:4326"):
+
+    if columns is None:
+        columns = {
+            "CUMUN": "ine_municipality_code",
+            "NMUN": "municipality_name",
+            "NPRO": "province_name",
+            "NCA": "autonomous_community_name",
+            "CUSEC": "section_code",
+            "CUDIS": "district_code",
+            "geometry": "geometry"
+        }
+    sys.stderr.write(f"\nReading census administrative divisions\n")
+
+    census_gdf = gpd.read_file(f"{census_tract_dir}/validated_census_{year}.gpkg")
+    census_gdf.rename(columns = columns, inplace = True)
+    census_gdf = census_gdf[columns.values()]
+    census_gdf = census_gdf.set_geometry(geometry_column)
+    census_gdf = census_gdf.to_crs(crs)
+
+    return census_gdf
 
 def join_by_neighbourhoods(gdf, neighbourhoods_dir, columns=None, geometry_column="neighborhood_geometry"):
 

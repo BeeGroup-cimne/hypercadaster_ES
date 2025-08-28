@@ -15,7 +15,7 @@ import geopandas as gpd
 import matplotlib
 matplotlib.use('Agg')  # Use a non-interactive backend
 import matplotlib.pyplot as plt
-from shapely.ops import unary_union, linemerge
+from shapely.ops import linemerge
 from shapely.geometry.polygon import orient
 from shapely.geometry import (Polygon, LineString, LinearRing, MultiPolygon, MultiLineString)
 import math
