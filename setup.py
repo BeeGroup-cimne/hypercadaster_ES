@@ -9,7 +9,7 @@ AUTHOR = "Jose Manuel Broto Vispe"
 AUTHOR_EMAIL = "jmbrotovispe@gmail.com"
 URL = "https://github.com/BeeGroup-cimne"
 
-LICENSE = "MIT"
+LICENSE = "EUPL-1.2"
 DESCRIPTION = "Python library to obtain the Spanish cadaster data joined with external attributes."
 LONG_DESCRIPTION = (HERE / "README.md").read_text(encoding="utf-8")
 LONG_DESC_TYPE = "text/markdown"
@@ -99,8 +99,23 @@ setup(
     license=LICENSE,
     packages=find_packages(),
     include_package_data=True,
+    license_files=("LICENSE",),
     install_requires=INSTALL_REQUIRES,
     python_requires=">=3.10",
+    classifiers=[
+        "Development Status :: 4 - Beta",
+        "Intended Audience :: Developers",
+        "Intended Audience :: Science/Research", 
+        "License :: OSI Approved :: European Union Public Licence 1.2 (EUPL 1.2)",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Topic :: Scientific/Engineering :: GIS",
+        "Topic :: Software Development :: Libraries :: Python Modules",
+        "Operating System :: OS Independent",
+    ],
+    keywords="cadastral data, geospatial, spain, gis, real estate",
     extras_require={
         "dev": ["black>=24.0", "ruff>=0.4", "pytest>=7.0", "pytest-cov>=4.0"],
         # "pdal": ["pdal>=3.0"],  # if/when you wire PDAL features

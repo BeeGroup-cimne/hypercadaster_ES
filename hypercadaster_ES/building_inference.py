@@ -1,39 +1,119 @@
-from hypercadaster_ES import utils
-from hypercadaster_ES import downloaders
-from matplotlib.backends.backend_pdf import PdfPages
-import itertools
-import multiprocessing
-from datetime import date
-from itertools import chain
-from itertools import zip_longest
-import tqdm
-import sys
+"""Building inference and analysis module for hypercadaster_ES.
+
+This module provides advanced functionality for analyzing and inferring building
+characteristics from Spanish cadastral data, including:
+
+- Building parts processing and geometric analysis
+- Floor footprint calculation and space inference
+- Orientation analysis and street relationship detection
+- CAT file parsing for detailed building information
+- Building space aggregation and classification
+
+Main functions:
+    - process_building_parts(): Main orchestrator for building analysis pipeline
+    - process_zone(): Detailed analysis for individual cadastral zones
+    - parse_horizontal_division_buildings_CAT_files(): Parse CAT files for building data
+    - aggregate_CAT_file_building_spaces(): Aggregate building space information
+
+Note: This module contains computationally intensive functions that process
+large amounts of geometric and cadastral data.
+"""
+
+# Core libraries
 import os
+import sys
+import math
+import multiprocessing
+import re
+import warnings
+from datetime import date
+from itertools import chain, zip_longest
+import itertools
+import random
+
+# Data processing
 import numpy as np
 import pandas as pd
+import polars as pl
+from tqdm import tqdm
+
+# Geospatial libraries
 import geopandas as gpd
-import matplotlib
-matplotlib.use('Agg')  # Use a non-interactive backend
-import matplotlib.pyplot as plt
 from shapely.ops import linemerge
 from shapely.geometry.polygon import orient
 from shapely.geometry import (Polygon, LineString, LinearRing, MultiPolygon, MultiLineString)
-import math
-from tqdm import tqdm
-import polars as pl
-import warnings
-import re
+
+# Visualization
+import matplotlib
+matplotlib.use('Agg')  # Use a non-interactive backend
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+
+# Internal modules
+from hypercadaster_ES import utils
+from hypercadaster_ES import downloaders
+
+# Configure warnings
 warnings.simplefilter(action='ignore', category=pd.errors.SettingWithCopyWarning)
 warnings.filterwarnings(
     "ignore",
     message=re.escape("FigureCanvasAgg is non-interactive, and thus cannot be shown")
 )
+
+# Note: Parallel processing imports commented out for performance
 # from joblib import Parallel, delayed
 # from joblib.externals.loky import get_reusable_executor
 
+
+# ==========================================
+# MAIN BUILDING ANALYSIS PIPELINE
+# ==========================================
+
 def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf, results_dir=None, cadaster_dir=None,
-                           open_street_dir=None, plots=False, orientation_discrete_interval_in_degrees=5,
+                           open_street_dir=None, plots=False, plot_zones_ratio=0.01, 
+                           orientation_discrete_interval_in_degrees=5,
                            num_workers=max(1, math.ceil(multiprocessing.cpu_count()/3))):
+    """
+    Main function to process building parts and perform comprehensive building analysis.
+    
+    This function orchestrates the entire building inference pipeline including:
+    - Building proximity detection and clustering
+    - Floor footprint calculation  
+    - Orientation analysis and street relationship detection
+    - Building space classification and aggregation
+    - Shadow analysis and environmental factors
+    
+    Parameters:
+    -----------
+    code : str
+        Cadastral municipality code
+    building_part_gdf_ : geopandas.GeoDataFrame
+        Building parts geodataframe with geometric information
+    buildings_CAT : polars.DataFrame or None
+        CAT file data with detailed building information
+    parcels_gdf : geopandas.GeoDataFrame
+        Cadastral parcels geodataframe
+    results_dir : str, optional
+        Directory to save analysis results and cache files
+    cadaster_dir : str, optional  
+        Directory containing cadastral data files
+    open_street_dir : str, optional
+        Directory containing OpenStreetMap data
+    plots : bool, default False
+        Whether to generate visualization plots
+    plot_zones_ratio : float, default 0.01
+        Ratio of zones to randomly select for plotting when plots=True (0.01 = 1%, minimum 1 zone)
+    orientation_discrete_interval_in_degrees : int, default 5
+        Degree interval for orientation discretization
+    num_workers : int, default calculated
+        Number of parallel workers for processing
+        
+    Returns:
+    --------
+    tuple
+        (processed_gdf, analysis_results) containing processed building data
+        and comprehensive analysis results
+    """
 
     if (not os.path.exists(f"{results_dir}/{code}_sbr_results.pkl") and
         not os.path.exists(f"{results_dir}/{code}_br_results.pkl")):
@@ -84,6 +164,22 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
 
         grouped = gdf_global.groupby("zone_reference")
         zone_references = list(grouped.groups.keys())
+        
+        # Random zone selection for plots when building_parts_plots is True
+        if plots:
+            total_zones = len(zone_references)
+            # Calculate number of zones to plot: at least 1, or the specified ratio
+            num_zones_to_plot = max(1, int(total_zones * plot_zones_ratio))
+            if num_zones_to_plot < total_zones:
+                # Randomly select zones for plotting
+                zones_to_plot = set(random.sample(zone_references, num_zones_to_plot))
+                print(f"Randomly selected {num_zones_to_plot} out of {total_zones} zones for plotting ({plot_zones_ratio*100:.1f}%)")
+            else:
+                # Plot all zones if ratio results in all zones
+                zones_to_plot = set(zone_references)
+                print(f"Plotting all {total_zones} zones")
+        else:
+            zones_to_plot = set()
 
         ine_code = utils.cadaster_to_ine_codes(cadaster_dir, [code])[0]
         streets_gdf = utils.get_municipality_open_street_maps(
@@ -92,10 +188,11 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
             crs=gdf_global.crs)
         streets_gdf = streets_gdf[streets_gdf.geometry.apply(lambda geom: isinstance(geom, LineString))]
 
-        # Define a wrapper for joblib's delayed processing
+        # Define zone processing function
         def process_zone_delayed(zone_reference):
-            #zone_reference='00112DF3801A'#"00329DF3803A"#"00054DF3800E"
             gdf_zone = grouped.get_group(zone_reference).reset_index(drop=True)
+            # Determine if this zone should be plotted based on selection
+            zone_plots = plots and (zone_reference in zones_to_plot)
             return process_zone(
                 gdf_zone,
                 zone_reference,
@@ -104,19 +201,17 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
                 streets_gdf,
                 buildings_CAT,
                 results_dir,
-                plots,
+                zone_plots,
                 orientation_discrete_interval_in_degrees
             )
 
-        # Parallel processing for each zone
+        # Process each zone sequentially with progress tracking
         results = []
         for zone_reference in tqdm(zone_references, desc="Inferring geometrical KPIs for each building..."):
             results.append(process_zone_delayed(zone_reference))
-            # with utils.tqdm_joblib(tqdm(total=len(zone_references), desc="Inferring geometrical KPIs for each building...")):
-        #     results = Parallel(n_jobs=num_workers)(
-        #         delayed(process_zone_delayed)(zone_reference) for zone_reference in zone_references
-        #     )
-        # get_reusable_executor().shutdown(wait=True)
+            
+        # Note: Parallel processing commented out for performance reasons
+        # Alternative parallel implementation available if needed
 
         # del streets_gdf
         # del gdf_global
@@ -140,8 +235,46 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
     return sbr_results, br_results
 
 
+# ==========================================
+# ZONE-LEVEL ANALYSIS FUNCTIONS  
+# ==========================================
+
 def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, streets_gdf, buildings_CAT,
                  results_dir, plots, orientation_discrete_interval_in_degrees):
+    """
+    Perform detailed analysis for an individual cadastral zone.
+    
+    This function processes all buildings within a specific cadastral zone,
+    analyzing their geometric properties, orientations, relationships with
+    streets, and shadow patterns.
+    
+    Parameters:
+    -----------
+    gdf_zone : geopandas.GeoDataFrame
+        Buildings within the specific zone to analyze
+    zone_reference : str
+        Unique identifier for the cadastral zone
+    gdf_footprints_global : geopandas.GeoDataFrame
+        Global floor footprints for shadow analysis
+    parcels_gdf : geopandas.GeoDataFrame
+        Cadastral parcels within the zone
+    streets_gdf : geopandas.GeoDataFrame
+        Street network data for orientation analysis
+    buildings_CAT : polars.DataFrame or None
+        CAT file building data
+    results_dir : str
+        Directory for saving cache and plot outputs
+    plots : bool
+        Whether to generate analysis plots
+    orientation_discrete_interval_in_degrees : int
+        Orientation discretization interval
+        
+    Returns:
+    --------
+    dict
+        Comprehensive analysis results for the zone including building
+        metrics, orientations, and environmental factors
+    """
 
     try:
         if (not os.path.exists(f"{results_dir}/cache/{zone_reference}_sbr_results.pkl") and
@@ -1061,7 +1194,31 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
     except Exception as e:
         print(f" This cadastral zone failed: '{zone_reference}'. Error: {e}", file=sys.stderr)
 
+# ==========================================
+# CAT FILE PROCESSING FUNCTIONS
+# ==========================================
+
 def parse_horizontal_division_buildings_CAT_files(cadaster_code, CAT_files_dir):
+    """
+    Parse CAT files to extract horizontal division building information.
+    
+    This function processes CAT files (Spanish cadastral data format) to extract
+    detailed building information including spaces, floors, usage types, and
+    geometric properties for horizontal property divisions.
+    
+    Parameters:
+    -----------
+    cadaster_code : str
+        Municipality cadastral code
+    CAT_files_dir : str
+        Directory containing CAT files
+        
+    Returns:
+    --------
+    polars.DataFrame
+        Processed building data with inferred space types, areas,
+        floor information, and usage classifications
+    """
 
     combined_dfs = downloaders.parse_CAT_file(cadaster_code, CAT_files_dir, allowed_dataset_types=[14, 15])
 
@@ -1128,9 +1285,32 @@ def parse_horizontal_division_buildings_CAT_files(cadaster_code, CAT_files_dir):
 
     # Rename items of categorical columns (Typology, category, use...)
     building_spaces_detailed = building_spaces_detailed.with_columns(
-        pl.col("building_space_typology").str.tail(1).alias("building_space_typology_category"),
+        pl.col("building_space_typology").str.slice(4,length=3).alias("building_space_typology_category"),
         pl.col("building_space_typology").str.head(4).alias("building_space_typology_id"),
         (pl.lit(date.today().year) - pl.col("building_space_effective_year")).alias("building_space_age")
+    )
+    building_spaces_detailed = building_spaces_detailed.with_columns(
+        # Create booster column based on category
+        pl.when(pl.col("building_space_typology_category") == "A")
+        .then(1.5)
+        .when(pl.col("building_space_typology_category") == "B")
+        .then(1.3)
+        .when(pl.col("building_space_typology_category") == "C")
+        .then(1.15)
+        .otherwise(1.0)
+        .alias("building_space_typology_category_booster")
+    ).with_columns(
+        # Create booster column based on category
+        pl.when(pl.col("building_space_typology_category") == "A")
+        .then(1)
+        .when(pl.col("building_space_typology_category") == "B")
+        .then(1)
+        .when(pl.col("building_space_typology_category") == "C")
+        .then(1)
+        .when(pl.col("building_space_typology_category") == "O")
+        .then(1)
+        .otherwise(pl.col("building_space_typology_category"))
+        .alias("building_space_typology_category")
     )
     building_spaces_detailed = building_spaces_detailed.with_columns(
         pl.col("building_space_typology_id").replace(
@@ -1179,7 +1359,9 @@ def parse_horizontal_division_buildings_CAT_files(cadaster_code, CAT_files_dir):
 
     # Calculate relative economic value
     building_spaces_detailed = building_spaces_detailed.with_columns(
-        (pl.col("construction_relative_economic_value") * pl.col("age_correction_relative_economic_value")).alias("building_space_relative_economic_value")
+        (pl.col("construction_relative_economic_value") *
+         pl.col("age_correction_relative_economic_value") *
+         pl.col("building_space_typology_category_booster")).alias("building_space_relative_economic_value")
     )
     building_spaces_detailed = building_spaces_detailed.with_columns(
         (pl.col("building_space_relative_economic_value") * pl.col("building_space_area_with_communal")).alias("building_space_economic_value")
@@ -1337,34 +1519,25 @@ def parse_horizontal_division_buildings_CAT_files(cadaster_code, CAT_files_dir):
 
     return building_spaces_detailed
 
-    # rc = building_spaces_detailed.filter((building_spaces_detailed["building_floor_name"] == 'CUB'))["building_reference"][0]
-    # result = (building_spaces.filter(building_spaces["building_reference"] == rc)[
-    #     ["building_reference","building_stair_name","building_space_reference","building_floor_name","building_door_name","building_space_area"]].join(
-    #     building_spaces_detailed.filter(building_spaces_detailed["building_reference"] == rc)[
-    #         ["building_space_reference","building_stair_name","building_floor_name", "building_door_name", "building_space_area_without_communal","building_space_detailed_use_type"]],
-    #     on="building_space_reference").sort("building_space_reference").join(
-    #         pl.DataFrame({
-    #             "building_reference": rc,
-    #             "area": building_part_gdf_[
-    #                 building_part_gdf_["building_reference"] == rc
-    #                 ]["building_part_geometry"].area,
-    #             "n_floors_above_ground": building_part_gdf_[
-    #                 building_part_gdf_["building_reference"] == rc
-    #                 ]["n_floors_above_ground"],
-    #             "n_floors_below_ground": building_part_gdf_[
-    #                 building_part_gdf_["building_reference"] == rc
-    #                 ]["n_floors_below_ground"],
-    #         }).select(
-    #             pl.col("building_reference").first(),
-    #             pl.col("n_floors_above_ground").max().alias("max_floors_above"),
-    #             pl.col("n_floors_below_ground").max().alias("max_floors_below"),
-    #         ),
-    #         on="building_reference"))
-    # result["building_floor_name_right"].to_list()
-    # result.write_csv("joined_spaces.csv",quote_style='always')
-
 
 def aggregate_CAT_file_building_spaces(building_CAT_df):
+    """
+    Aggregate building space information from CAT file data.
+    
+    This function processes detailed building space data and aggregates it
+    by building reference, calculating total areas by usage type and
+    floor distributions.
+    
+    Parameters:
+    -----------
+    building_CAT_df : polars.DataFrame
+        Detailed building space data from CAT files
+        
+    Returns:
+    --------
+    polars.DataFrame
+        Aggregated building data with space summaries and usage statistics
+    """
     building_CAT_df = building_CAT_df.with_columns(
         pl.col("building_space_floor_name").map_elements(
             lambda x: utils.classify_above_ground_floor_names(x) if x is not None else None,

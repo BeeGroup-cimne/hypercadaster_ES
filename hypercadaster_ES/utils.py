@@ -1,40 +1,62 @@
+# Imports organized by category
+# Core libraries
 import copy
 import sys
 import os
 import shutil
 import fnmatch
-import networkx as nx
-import numpy as np
-import pandas as pd
+import math
+import re
+from contextlib import contextmanager
 from zipfile import ZipFile, BadZipFile
 import tarfile
-import requests
-from bs4 import BeautifulSoup
-import rasterio
+import json
+
+# Data processing
+import numpy as np
+import pandas as pd
+
+# Geospatial libraries
 import geopandas as gpd
 from geopandas import sjoin
+from shapely.ops import unary_union, nearest_points, linemerge
+from shapely.geometry.polygon import orient
+from shapely.geometry import (Polygon, Point, LineString, MultiPolygon, MultiPoint, 
+                              MultiLineString, GeometryCollection, LinearRing, JOIN_STYLE)
+from shapely.errors import GEOSException
+from shapely.geometry import mapping
+from shapely.geometry.base import BaseGeometry
+from fastkml import kml
+
+# Network and graph libraries
+import networkx as nx
+import osmnx as ox
+
+# Raster processing
+import rasterio
 from rasterio.merge import merge
+
+# Parallel processing
+import joblib
+from joblib import Parallel, delayed
+from joblib.externals.loky import get_reusable_executor
+from tqdm import tqdm
+
+# Web requests
+import requests
+from bs4 import BeautifulSoup
+
+# Visualization
 import matplotlib
 matplotlib.use('Agg')  # Use a non-interactive backend
 import matplotlib.pyplot as plt
 from matplotlib.patches import PathPatch
 from matplotlib.path import Path
-from shapely.ops import unary_union, nearest_points, linemerge, polygonize
-from shapely.geometry.polygon import orient
-from shapely.geometry import (Polygon, Point, LineString, MultiPolygon, MultiPoint, MultiLineString, GeometryCollection,
-                              LinearRing, JOIN_STYLE)
-from shapely.errors import GEOSException
-import math
-from tqdm import tqdm
-import joblib
-from joblib import Parallel, delayed
-from contextlib import contextmanager
-from joblib.externals.loky import get_reusable_executor
-import re
-import osmnx as ox
-from shapely.geometry import mapping
 import matplotlib.patches as patches
-from shapely.geometry.base import BaseGeometry
+
+# ==========================================
+# PARALLEL PROCESSING UTILITIES
+# ==========================================
 
 @contextmanager
 def tqdm_joblib(tqdm_object):
@@ -51,6 +73,11 @@ def tqdm_joblib(tqdm_object):
     finally:
         joblib.parallel.BatchCompletionCallBack = old_batch_callback
         tqdm_object.close()
+
+
+# ==========================================
+# DIRECTORY MANAGEMENT
+# ==========================================
 
 
 def cadaster_dir_(wd):
@@ -111,6 +138,10 @@ def create_dirs(data_dir):
 #     dnprc_df["pt"].sort_values()
 
 
+# ==========================================
+# DATA CONVERSION & CODE MAPPING
+# ==========================================
+
 def list_municipalities(province_codes=None,
                         inspire_url="https://www.catastro.hacienda.gob.es/INSPIRE/buildings/ES.SDGC.BU.atom.xml",
                         echo=True):
@@ -122,7 +153,8 @@ def list_municipalities(province_codes=None,
     list_municipalities = []
     for j in range(len(municipalities)):
         x = municipalities[j]
-        url = urls[j]
+        p_code = re.search(r'(\d{2})\d{3}-', x.get_text()).group(1)
+        url = [url for url in urls if url.split('/')[5]==p_code][0]
 
         if province_codes is None or url.split('/')[5] in province_codes:
             if echo:
@@ -197,6 +229,50 @@ def get_administrative_divisions_naming(cadaster_dir, cadaster_codes):
 
     return municipalities
 
+def kml_to_geojson(kml_file):
+    features = []
+    k = kml.KML()
+    k.from_string(kml_file)
+    for doc in k.features():
+        for feature in doc.features():
+            for placemark in feature.features():
+                properties = {}
+                if hasattr(placemark, 'extended_data') and placemark.extended_data:
+                    for data in placemark.extended_data.elements:
+                        if isinstance(data, kml.SchemaData):
+                            for simple_data in data.data:
+                                properties[simple_data['name']] = simple_data['value']
+                coordinates = []
+                if hasattr(placemark, 'geometry') and placemark.geometry:
+                    if placemark.geometry._type in ['MultiPolygon']:
+
+                        for polygon in placemark.geometry.geoms:
+                            outer_boundary = polygon.exterior.coords
+                            coordinates.append([[list(point)[:2] for point in outer_boundary]])
+
+                    elif placemark.geometry._type in ['Polygon']:
+                        outer_boundary = placemark.geometry.exterior.coords
+                        coordinates.append([list(point)[:2] for point in outer_boundary])
+
+                feature_json = {
+                    "type": "Feature",
+                    "properties": properties,
+                    "geometry": {
+                        "type": placemark.geometry.geom_type if coordinates else None,
+                        "coordinates": coordinates
+                    }
+                }
+                features.append(feature_json)
+
+    feature_collection = {
+        "type": "FeatureCollection",
+        "features": features
+    }
+    return json.dumps(feature_collection)
+
+# ==========================================
+# FILE OPERATIONS
+# ==========================================
 
 def unzip_directory(zip_directory, unzip_directory):
     for file in os.listdir(zip_directory):
@@ -254,6 +330,14 @@ def untar_directory(tar_directory, untar_directory, files_to_extract):
         except Exception:
             os.remove(f"{tar_directory}{file}")
 
+
+# ==========================================
+# GEOMETRIC UTILITIES
+# ==========================================
+
+def make_valid(gdf):
+    gdf.geometry = gdf.geometry.make_valid()
+    return gdf
 
 def get_bbox(gdf):
     bbox_gdf = gdf.bounds
@@ -1508,6 +1592,10 @@ def classify_cadaster_floor_names(floor):
     else:
         return classify_below_ground_floor_names(floor)
 
+# ==========================================
+# DATA ANALYSIS & PROCESSING
+# ==========================================
+
 def agg_op(df, funcs, grouping, variable, multiplier=1, divider=1):
     """
     Enhanced aggregation function to support multiple operations and nested groupings.
@@ -1586,6 +1674,10 @@ def read_sbr_inferred_indicators(cadaster_code, wd):
 def read_addresses_indicators(cadaster_code, wd):
     result_dir = results_dir_(wd)
     return pd.read_pickle(f"{result_dir}/{cadaster_code}_no_inference.pkl", compression="gzip")
+
+# ==========================================
+# VISUALIZATION UTILITIES
+# ==========================================
 
 def plot_points_with_indices(points, pdf_file):
     x, y = zip(*points)

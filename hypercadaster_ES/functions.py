@@ -1,9 +1,20 @@
+"""Main functions module for hypercadaster_ES.
+
+This module provides the primary entry points for downloading and merging
+Spanish cadastral data with external geographic datasets.
+
+Main functions:
+    - download(): Downloads cadastral and related geographic data
+    - merge(): Merges all downloaded data into a unified GeoDataFrame
+"""
+
 import os
 import geopandas as gpd
+from zipfile import ZipFile, BadZipFile
+
 from hypercadaster_ES import mergers
 from hypercadaster_ES import utils
 from hypercadaster_ES import downloaders
-from zipfile import ZipFile, BadZipFile
 
 def download(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
              neighborhood_layer=True, postal_code_layer=True, census_layer=True,
@@ -19,24 +30,42 @@ def download(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
                               url="https://www.catastro.minhap.es/regularizacion/Regularizacion_municipios_finalizados.xlsx",
                               file="ine_inspire_codes.xlsx")
 
+    # Convert inputs to list format
+    if province_codes is not None:
+        province_codes = province_codes if isinstance(province_codes, list) else [province_codes]
+    if ine_codes is not None:
+        ine_codes = ine_codes if isinstance(ine_codes, list) else [ine_codes]
+    if cadaster_codes is not None:
+        cadaster_codes = cadaster_codes if isinstance(cadaster_codes, list) else [cadaster_codes]
+
     # Filter which geographical area to download
-    if ine_codes is not None and cadaster_codes is not None:
-        raise ValueError("Municipality INE codes (ine_codes) or cadaster codes (cadaster_codes) should be provided, not both!")
-    elif ine_codes is None and cadaster_codes is None:
-        if province_codes is None:
-            raise ValueError("One of the arguments must be provided: municipality INE codes (ine_codes) or cadaster codes "
-                             "(cadaster_codes), or province codes (province_codes)")
-        else:
-            municipalities = utils.list_municipalities(
-                province_codes=province_codes, echo=False)
-            cadaster_codes = [item['name'].split("-")[0] for item in municipalities]
-            ine_codes = utils.cadaster_to_ine_codes(utils.cadaster_dir_(wd), cadaster_codes)
-    elif ine_codes is None:
-        ine_codes = utils.cadaster_to_ine_codes(utils.cadaster_dir_(wd), cadaster_codes)
-        province_codes = list(set([code[:2] for code in ine_codes]))
-    elif cadaster_codes is None:
-        province_codes = list(set([code[:2] for code in ine_codes]))
-        cadaster_codes = utils.ine_to_cadaster_codes(utils.cadaster_dir_(wd), ine_codes)
+    all_cadaster_codes = []
+    
+    if province_codes is None and ine_codes is None and cadaster_codes is None:
+        raise ValueError("At least one of the arguments must be provided: province codes (province_codes), "
+                         "municipality INE codes (ine_codes), or cadaster codes (cadaster_codes)")
+    
+    # Add cadaster codes from province_codes
+    if province_codes is not None:
+        municipalities = utils.list_municipalities(province_codes=province_codes, echo=False)
+        province_cadaster_codes = [item['name'].split("-")[0] for item in municipalities]
+        all_cadaster_codes.extend(province_cadaster_codes)
+    
+    # Add cadaster codes from ine_codes
+    if ine_codes is not None:
+        ine_cadaster_codes = utils.ine_to_cadaster_codes(utils.cadaster_dir_(wd), ine_codes)
+        all_cadaster_codes.extend(ine_cadaster_codes)
+    
+    # Add directly provided cadaster codes
+    if cadaster_codes is not None:
+        all_cadaster_codes.extend(cadaster_codes)
+    
+    # Remove duplicates and set final cadaster_codes
+    cadaster_codes = list(set(all_cadaster_codes))
+    
+    # Generate derived codes
+    ine_codes = utils.cadaster_to_ine_codes(utils.cadaster_dir_(wd), cadaster_codes)
+    province_codes = list(set([code[:2] for code in ine_codes]))
 
     # Download the cadaster datasets of that area
     downloaders.cadaster_downloader(cadaster_dir=utils.cadaster_dir_(wd), cadaster_codes=cadaster_codes)
@@ -89,29 +118,49 @@ def download(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
 def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
           neighborhood_layer=True, postal_code_layer=True, census_layer=True, elevations_layer=True,
           open_data_layers=True, building_parts_inference=False, building_parts_plots=False,
-          use_CAT_files=False, CAT_files_rel_dir="CAT_files"):
+          plot_zones_ratio=0.01, use_CAT_files=False, CAT_files_rel_dir="CAT_files"):
+
+    # Convert inputs to list format
+    if province_codes is not None:
+        province_codes = province_codes if isinstance(province_codes, list) else [province_codes]
+    if ine_codes is not None:
+        ine_codes = ine_codes if isinstance(ine_codes, list) else [ine_codes]
+    if cadaster_codes is not None:
+        cadaster_codes = cadaster_codes if isinstance(cadaster_codes, list) else [cadaster_codes]
 
     # Filter which geographical area to download
-    if ine_codes is not None and cadaster_codes is not None:
+    all_cadaster_codes = []
+    
+    if province_codes is None and ine_codes is None and cadaster_codes is None:
+        raise ValueError("At least one of the arguments must be provided: province codes (province_codes), "
+                         "municipality INE codes (ine_codes), or cadaster codes (cadaster_codes)")
+    
+    # Add cadaster codes from province_codes
+    if province_codes is not None:
+        municipalities = utils.list_municipalities(province_codes=province_codes, echo=False)
+        province_cadaster_codes = [item['name'].split("-")[0] for item in municipalities]
+        all_cadaster_codes.extend(province_cadaster_codes)
+    
+    # Add cadaster codes from ine_codes
+    if ine_codes is not None:
+        ine_cadaster_codes = utils.ine_to_cadaster_codes(utils.cadaster_dir_(wd), ine_codes)
+        all_cadaster_codes.extend(ine_cadaster_codes)
+    
+    # Add directly provided cadaster codes
+    if cadaster_codes is not None:
+        all_cadaster_codes.extend(cadaster_codes)
+    
+    # Remove duplicates and set final cadaster_codes
+    cadaster_codes = list(set(all_cadaster_codes))
+    
+    # Validate building analysis constraints
+    if (building_parts_inference or building_parts_plots) and len(cadaster_codes) > 1:
         raise ValueError(
-            "Municipality INE codes (ine_codes) or cadaster codes (cadaster_codes) should be provided, not both!")
-    elif ine_codes is None and cadaster_codes is None:
-        if province_codes is None:
-            raise ValueError(
-                "One of the arguments must be provided: municipality INE codes (ine_codes) or cadaster codes "
-                "(cadaster_codes), or province codes (province_codes)")
-        else:
-            municipalities = utils.list_municipalities(
-                province_codes=province_codes, echo=False)
-            cadaster_codes = [item['name'].split("-")[0] for item in municipalities]
-    elif cadaster_codes is None:
-        cadaster_codes = utils.ine_to_cadaster_codes(utils.cadaster_dir_(wd), ine_codes)
-
-    # cadaster_dir = utils.cadaster_dir_(wd)
-    # results_dir = utils.results_dir_(wd)
-    # open_street_dir = utils.open_street_dir_(wd)
-    # open_data_layers_dir = utils.open_data_dir_(wd)
-    # CAT_files_dir = f"{wd}/{CAT_files_rel_dir}"
+            f"Building parts inference and plots are computationally intensive and can only be enabled "
+            f"for single municipality processing. Found {len(cadaster_codes)} municipalities: {cadaster_codes}. "
+            f"Please process municipalities individually when using building_parts_inference=True or "
+            f"building_parts_plots=True."
+        )
 
     gdf = mergers.join_cadaster_data(
         cadaster_dir=utils.cadaster_dir_(wd),
@@ -121,9 +170,11 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
         building_parts_inference=building_parts_inference,
         use_CAT_files=use_CAT_files,
         building_parts_plots=building_parts_plots,
+        plot_zones_ratio=plot_zones_ratio,
         open_data_layers=open_data_layers,
         open_data_layers_dir=utils.open_data_dir_(wd),
-        CAT_files_dir=f"{wd}/{CAT_files_rel_dir}")
+        CAT_files_dir=f"{wd}/{CAT_files_rel_dir}"
+    )
 
     if census_layer:
         gdf = mergers.join_by_census_tracts(

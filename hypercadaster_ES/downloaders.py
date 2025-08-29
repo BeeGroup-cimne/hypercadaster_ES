@@ -1,12 +1,10 @@
 import sys
 import zipfile
 import geopandas as gpd
-import json
 import os
 import requests
 import pandas as pd
 import fiona
-from fastkml import kml
 from hypercadaster_ES import utils
 import polars as pl
 from charset_normalizer import from_path
@@ -17,53 +15,20 @@ from joblib import Parallel, delayed
 from joblib.externals.loky import get_reusable_executor
 
 def download_file(dir, url, file):
-    if not os.path.exists(f"{dir}/{file}"):
-        response = requests.get(url)
-        if response.status_code == 200:
-            with open(f"{dir}/{file}", 'wb') as archivo:
-                archivo.write(response.content)
-
-
-def kml_to_geojson(kml_file):
-    features = []
-    k = kml.KML()
-    k.from_string(kml_file)
-    for doc in k.features():
-        for feature in doc.features():
-            for placemark in feature.features():
-                properties = {}
-                if hasattr(placemark, 'extended_data') and placemark.extended_data:
-                    for data in placemark.extended_data.elements:
-                        if isinstance(data, kml.SchemaData):
-                            for simple_data in data.data:
-                                properties[simple_data['name']] = simple_data['value']
-                coordinates = []
-                if hasattr(placemark, 'geometry') and placemark.geometry:
-                    if placemark.geometry._type in ['MultiPolygon']:
-
-                        for polygon in placemark.geometry.geoms:
-                            outer_boundary = polygon.exterior.coords
-                            coordinates.append([[list(point)[:2] for point in outer_boundary]])
-
-                    elif placemark.geometry._type in ['Polygon']:
-                        outer_boundary = placemark.geometry.exterior.coords
-                        coordinates.append([list(point)[:2] for point in outer_boundary])
-
-                feature_json = {
-                    "type": "Feature",
-                    "properties": properties,
-                    "geometry": {
-                        "type": placemark.geometry.geom_type if coordinates else None,
-                        "coordinates": coordinates
-                    }
-                }
-                features.append(feature_json)
-
-    feature_collection = {
-        "type": "FeatureCollection",
-        "features": features
-    }
-    return json.dumps(feature_collection)
+    """Download a file from URL to directory if it doesn't exist."""
+    file_path = os.path.join(dir, file)
+    if not os.path.exists(file_path):
+        try:
+            response = requests.get(url, timeout=30)
+            if response.status_code == 200:
+                with open(file_path, 'wb') as archivo:
+                    archivo.write(response.content)
+            else:
+                sys.stderr.write(f"Error downloading {file}: Status {response.status_code}\n")
+        except requests.exceptions.RequestException as e:
+            sys.stderr.write(f"Error downloading {file}: {e}\n")
+        except Exception as e:
+            sys.stderr.write(f"Unexpected error downloading {file}: {e}\n")
 
 
 def download_postal_codes(postal_codes_dir, province_codes=None):
@@ -75,39 +40,89 @@ def download_postal_codes(postal_codes_dir, province_codes=None):
         if not os.path.exists(f"{postal_codes_dir}/raw/k{province_code}.geojson"):
             response = requests.get(f"https://www.codigospostales.com/kml/k{province_code}.kml")
             if response.status_code == 200:
-                geojson_data = kml_to_geojson(response.content)
+                geojson_data = utils.kml_to_geojson(response.content)
                 with open(f"{postal_codes_dir}/raw/k{province_code}.geojson", 'w') as f:
                     f.write(geojson_data)
             else:
-                print(f"Error downloading postal code {province_code} file\n", response.status_code)
+                sys.stderr.write(f"Error downloading postal code {province_code} file: Status {response.status_code}\n")
 
-    # Filtrar la lista para obtener solo los archivos que terminan en ".geojson"
+    # Filter and concatenate downloaded geojson files
     patterns = [f'k{pr}.geojson' for pr in province_codes]
-    geojson_filenames = [gpd.read_file(f"{postal_codes_dir}/raw/{file}") for file in
-                        [filename for filename in os.listdir(f"{postal_codes_dir}/raw") if
-                         any(filename.endswith(pattern) for pattern in patterns)]]
-    concatenated_gdf = gpd.GeoDataFrame(pd.concat(geojson_filenames, ignore_index=True), crs=geojson_filenames[0].crs)
-    concatenated_gdf.geometry = concatenated_gdf.geometry.make_valid()
-    concatenated_gdf.to_file(f"{postal_codes_dir}/postal_codes.geojson", driver="GeoJSON")
+    raw_files = [filename for filename in os.listdir(f"{postal_codes_dir}/raw") 
+                 if any(filename.endswith(pattern) for pattern in patterns)]
+    
+    if not raw_files:
+        sys.stderr.write("Error: No postal code files were successfully downloaded\n")
+        return
+    
+    try:
+        geojson_filenames = []
+        for file in raw_files:
+            try:
+                gdf = gpd.read_file(f"{postal_codes_dir}/raw/{file}")
+                if not gdf.empty:
+                    geojson_filenames.append(gdf)
+            except Exception as e:
+                sys.stderr.write(f"Error reading {file}: {e}\n")
+                
+        if not geojson_filenames:
+            sys.stderr.write("Error: No valid postal code files found\n")
+            return
+            
+        concatenated_gdf = gpd.GeoDataFrame(pd.concat(geojson_filenames, ignore_index=True), 
+                                           crs=geojson_filenames[0].crs)
+        concatenated_gdf.geometry = concatenated_gdf.geometry.make_valid()
+        concatenated_gdf.to_file(f"{postal_codes_dir}/postal_codes.geojson", driver="GeoJSON")
+    except Exception as e:
+        sys.stderr.write(f"Error processing postal codes: {e}\n")
 
 
 def download_census_tracts(census_tracts_dir, year):
     sys.stderr.write(f"\nDownloading census tract geometries for year: {year}\n")
-    if not os.path.exists(f"{census_tracts_dir}/validated_census_{year}.gpkg"):
-        if not f"España_Seccionado{year}_ETRS89H30" in os.listdir(census_tracts_dir):
+    output_file = f"{census_tracts_dir}/validated_census_{year}.gpkg"
+    
+    if not os.path.exists(output_file):
+        extracted_dir = f"España_Seccionado{year}_ETRS89H30"
+        
+        if not os.path.exists(os.path.join(census_tracts_dir, extracted_dir)):
             os.makedirs(f"{census_tracts_dir}/zip", exist_ok=True)
+            zip_file = f"{census_tracts_dir}/zip/census_{year}.zip"
+            
             response = requests.get(f"https://www.ine.es/prodyser/cartografia/seccionado_{year}.zip")
             if response.status_code == 200:
-                with open(f"{census_tracts_dir}/zip/year.zip", 'wb') as archivo:
+                with open(zip_file, 'wb') as archivo:
                     archivo.write(response.content)
+                
+                try:
+                    with zipfile.ZipFile(zip_file, "r") as zip_ref:
+                        zip_ref.extractall(census_tracts_dir)
+                except zipfile.BadZipFile:
+                    sys.stderr.write(f"Error: Downloaded file is not a valid zip file\n")
+                    return
+            else:
+                sys.stderr.write(f"Error downloading census data: Status {response.status_code}\n")
+                return
 
-            with zipfile.ZipFile(f"{census_tracts_dir}/zip/year.zip", "r") as zip_ref:
-                zip_ref.extractall(census_tracts_dir)
-
-        shp = gpd.read_file([os.path.join(census_tracts_dir, f"España_Seccionado{year}_ETRS89H30", archivo) for archivo in
-                             os.listdir(f"{census_tracts_dir}/España_Seccionado{year}_ETRS89H30") if archivo.endswith(".shp")][0])
-        shp.geometry = shp.geometry.make_valid()
-        shp.to_file(f"{census_tracts_dir}/validated_census_{year}.gpkg", driver="GPKG")
+        # Find and read the shapefile
+        extracted_path = os.path.join(census_tracts_dir, extracted_dir)
+        if not os.path.exists(extracted_path):
+            sys.stderr.write(f"Error: Extracted directory {extracted_dir} not found\n")
+            return
+            
+        shp_files = [f for f in os.listdir(extracted_path) if f.endswith(".shp")]
+        if not shp_files:
+            sys.stderr.write(f"Error: No shapefile found in {extracted_dir}\n")
+            return
+            
+        shp_path = os.path.join(extracted_path, shp_files[0])
+        
+        try:
+            shp = gpd.read_file(shp_path)
+            shp.geometry = shp.geometry.make_valid()
+            shp.to_file(output_file, driver="GPKG")
+        except Exception as e:
+            sys.stderr.write(f"Error processing census shapefile: {e}\n")
+            return
 
 
 def cadaster_downloader(cadaster_dir, cadaster_codes=None):
@@ -166,15 +181,23 @@ def download_DEM_raster(raster_dir, bbox, year=2023):
 
 
 def download(url, name, save_path):
-    get_response = requests.get(url, stream=True)
-    if get_response:
-        file_name = os.path.join(save_path, name)
-        with open(file_name, 'wb') as f:
-            for chunk in get_response.iter_content(chunk_size=1024):
-                if chunk:
-                    f.write(chunk)
-    else:
-        print(get_response)
+    """Download a file with streaming for large files."""
+    try:
+        get_response = requests.get(url, stream=True, timeout=60)
+        if get_response.status_code == 200:
+            file_name = os.path.join(save_path, name)
+            os.makedirs(save_path, exist_ok=True)
+            
+            with open(file_name, 'wb') as f:
+                for chunk in get_response.iter_content(chunk_size=1024):
+                    if chunk:
+                        f.write(chunk)
+        else:
+            sys.stderr.write(f"Error downloading {url}: Status {get_response.status_code}\n")
+    except requests.exceptions.RequestException as e:
+        sys.stderr.write(f"Error downloading {url}: {e}\n")
+    except Exception as e:
+        sys.stderr.write(f"Unexpected error downloading {url}: {e}\n")
 
 
 def load_and_transform_barcelona_ground_premises(open_data_layers_dir):
@@ -581,6 +604,20 @@ building_space_detailed_use_types = {
 }
 
 building_space_typologies = { #https://www.boe.es/buscar/act.php?id=BOE-A-1993-19265
+    "PDEP": {
+        "Use": "Unknown/Undefined",
+        "UseLevel": 1,
+        "UseClass": "Undefined Space",
+        "UseClassModality": "No Classification",
+        "ConstructionValue": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    },
+    "0000": {
+        "Use": "Unknown/Undefined",
+        "UseLevel": 1,
+        "UseClass": "Undefined Space",
+        "UseClassModality": "No Classification",
+        "ConstructionValue": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    },
     "0111": {
         "Use": "Residential",
         "UseLevel": 1,

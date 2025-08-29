@@ -1,20 +1,32 @@
+"""Data merging and joining operations for hypercadaster_ES.
+
+This module provides functions for joining Spanish cadastral data with
+various external geographic and administrative datasets.
+
+Main functions:
+    - join_cadaster_data(): Main orchestrator for joining all cadastral data
+    - get_cadaster_address(): Extract and process address information
+    - join_cadaster_building(): Join building geometry and attributes
+    - join_cadaster_zone(): Join cadastral zoning information
+    - join_DEM_raster(): Add elevation data from Digital Elevation Model
+    - join_by_census_tracts(): Add census tract information
+    - join_by_neighbourhoods(): Add neighborhood information (Barcelona)
+    - join_by_postal_codes(): Add postal code information
+"""
+
+import sys
+import numpy as np
+import pandas as pd
+import polars as pl
+import geopandas as gpd
+import rasterio
+import regex as re
+from shapely import wkt
+from shapely.geometry import Point
+
 from hypercadaster_ES import utils
 from hypercadaster_ES import building_inference
 from hypercadaster_ES import downloaders
-import geopandas as gpd
-import pandas as pd
-import polars as pl
-import rasterio
-from shapely import wkt
-from shapely.geometry import Point
-import sys
-import numpy as np
-import regex as re
-
-def make_valid(gdf):
-    gdf.geometry = gdf.geometry.make_valid()
-    return gdf
-
 
 def get_cadaster_address(cadaster_dir, cadaster_codes, directions_from_CAT_files=True, CAT_files_dir="CAT_files",
                          directions_from_open_data=True, open_data_layers_dir="open_data"):
@@ -209,8 +221,9 @@ def get_cadaster_address(cadaster_dir, cadaster_codes, directions_from_CAT_files
 
 
 def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_street_dir, building_parts_plots=False,
-                           building_parts_inference=False, building_parts_inference_using_CAT_files=False,
-                           open_data_layers=False, open_data_layers_dir=None, CAT_files_dir=None):
+                           plot_zones_ratio=0.01, building_parts_inference=False,
+                           building_parts_inference_using_CAT_files=False, open_data_layers=False,
+                           open_data_layers_dir=None, CAT_files_dir=None):
 
     sys.stderr.write(f"\nJoining the buildings description for {len(cadaster_codes)} municipalities\n")
 
@@ -311,7 +324,7 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_
             building_part_gdf_ = building_inference.process_building_parts(
                 code=code, building_part_gdf_=building_part_gdf_, buildings_CAT=buildings_CAT,
                 parcels_gdf=parcels_gdf, results_dir=results_dir, cadaster_dir=cadaster_dir,
-                open_street_dir=open_street_dir, plots=building_parts_plots)
+                open_street_dir=open_street_dir, plots=building_parts_plots, plot_zones_ratio=plot_zones_ratio)
 
             if "building_part_gdf" in locals():
                 building_part_gdf = pd.concat([building_part_gdf, building_part_gdf_[1]], ignore_index=True)
@@ -523,15 +536,18 @@ def join_adm_div_naming(gdf, cadaster_dir, cadaster_codes):
 
 
 def join_cadaster_data(cadaster_dir, cadaster_codes, results_dir, open_street_dir, building_parts_plots=False,
-                       building_parts_inference=False, use_CAT_files=False,
+                       building_parts_inference=False, plot_zones_ratio=0.01, use_CAT_files=False,
                        open_data_layers=False, open_data_layers_dir=None, CAT_files_dir = None):
 
     # Address
-    gdf = get_cadaster_address(cadaster_dir=cadaster_dir, cadaster_codes=cadaster_codes,
-                               directions_from_CAT_files=use_CAT_files,
-                               CAT_files_dir=CAT_files_dir,
-                               directions_from_open_data=open_data_layers,
-                               open_data_layers_dir=open_data_layers_dir)
+    gdf = get_cadaster_address(
+        cadaster_dir=cadaster_dir,
+        cadaster_codes=cadaster_codes,
+        directions_from_CAT_files=use_CAT_files,
+        CAT_files_dir=CAT_files_dir,
+        directions_from_open_data=open_data_layers,
+        open_data_layers_dir=open_data_layers_dir
+    )
 
     # Zones
     gdf = join_cadaster_zone(gdf=gdf, cadaster_dir=cadaster_dir, cadaster_codes=cadaster_codes)
@@ -541,6 +557,7 @@ def join_cadaster_data(cadaster_dir, cadaster_codes, results_dir, open_street_di
     gdf = join_cadaster_building(gdf=gdf, cadaster_dir=cadaster_dir, cadaster_codes=cadaster_codes,
                                  results_dir=results_dir, open_street_dir=open_street_dir,
                                  building_parts_plots=building_parts_plots,
+                                 plot_zones_ratio=plot_zones_ratio,
                                  building_parts_inference=building_parts_inference,
                                  building_parts_inference_using_CAT_files=use_CAT_files,
                                  open_data_layers=open_data_layers, open_data_layers_dir=open_data_layers_dir,

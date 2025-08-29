@@ -1,11 +1,22 @@
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
+"""Interoperability functions for external systems integration.
 
-# TODO:
-# Añadir street width real using parcels geometries
-# Añadir rehabilitación integral
-# Mirar casos vacios en los resultados de orientación: 9505427DF2890F
+This module provides functions for converting hypercadaster_ES data 
+into formats compatible with external simulation and analysis tools.
+
+Main functions:
+    - input_files_for_IREC_simulations(): Convert data for IREC building energy simulations
+    - plot_weather_stations(): Visualize weather station clustering
+    - converter_(): Provide data structure mappings for external tools
+
+TODO:
+- Add real street width calculations using parcel geometries
+- Add comprehensive rehabilitation analysis
+- Investigate empty orientation cases: 9505427DF2890F
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 def input_files_for_IREC_simulations(gdf):
 
     gdf_filt = gdf.drop_duplicates(subset="building_reference")
