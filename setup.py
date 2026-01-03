@@ -49,6 +49,9 @@ INSTALL_REQUIRES = [
     "pyarrow>=14.0",
     "openpyxl>=3.1",
     "et-xmlfile>=1.1",
+    "arrow>=1.4.0",
+    "fastkml>=1.4.0",
+    "lxml>=6.0.2",
 
     # --- Web / HTTP ---
     "requests>=2.31,<3.0",

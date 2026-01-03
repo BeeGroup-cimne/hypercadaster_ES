@@ -531,7 +531,7 @@ def join_cadaster_parcel(gdf, cadaster_dir, cadaster_codes, how="left"):
 
 def join_adm_div_naming(gdf, cadaster_dir, cadaster_codes):
 
-    return pd.merge(gdf, utils.get_administrative_divisions_naming(cadaster_dir, cadaster_codes=cadaster_codes),
+    return pd.merge(gdf, utils.get_administrative_divisions_naming(cadaster_codes=cadaster_codes),
                     left_on="cadaster_code", right_on="cadaster_code", how="left")
 
 

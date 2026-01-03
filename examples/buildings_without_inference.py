@@ -20,10 +20,10 @@ import hypercadaster_ES as hc
 
 # Configuration
 # Working directory where all data will be stored
-wd = "/home/gmor/Nextcloud2/Beegroup/data/hypercadaster_ES"
+wd = "/Users/gmor-air/test_bitgenoma/data"#"/home/gmor/Nextcloud2/Beegroup/data/hypercadaster_ES"
 
 # Municipality to analyze (08900: Barcelona, Barcelona province)
-cadaster_codes = ["08900"]
+cadaster_codes = ["08195"]
 
 # Download all required data
 print("Downloading cadastral and auxiliary data...")

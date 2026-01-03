@@ -26,9 +26,6 @@ def download(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
         except FileNotFoundError:
             pass
     utils.create_dirs(data_dir=wd)
-    downloaders.download_file(dir=utils.cadaster_dir_(wd),
-                              url="https://www.catastro.minhap.es/regularizacion/Regularizacion_municipios_finalizados.xlsx",
-                              file="ine_inspire_codes.xlsx")
 
     # Convert inputs to list format
     if province_codes is not None:
@@ -53,7 +50,7 @@ def download(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
     
     # Add cadaster codes from ine_codes
     if ine_codes is not None:
-        ine_cadaster_codes = utils.ine_to_cadaster_codes(utils.cadaster_dir_(wd), ine_codes)
+        ine_cadaster_codes = utils.ine_to_cadaster_codes(ine_codes)
         all_cadaster_codes.extend(ine_cadaster_codes)
     
     # Add directly provided cadaster codes
@@ -64,7 +61,7 @@ def download(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
     cadaster_codes = list(set(all_cadaster_codes))
     
     # Generate derived codes
-    ine_codes = utils.cadaster_to_ine_codes(utils.cadaster_dir_(wd), cadaster_codes)
+    ine_codes = utils.cadaster_to_ine_codes(cadaster_codes)
     province_codes = list(set([code[:2] for code in ine_codes]))
 
     # Download the cadaster datasets of that area
@@ -143,7 +140,7 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
     
     # Add cadaster codes from ine_codes
     if ine_codes is not None:
-        ine_cadaster_codes = utils.ine_to_cadaster_codes(utils.cadaster_dir_(wd), ine_codes)
+        ine_cadaster_codes = utils.ine_to_cadaster_codes(ine_codes)
         all_cadaster_codes.extend(ine_cadaster_codes)
     
     # Add directly provided cadaster codes

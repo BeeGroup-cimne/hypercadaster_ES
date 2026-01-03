@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from zipfile import ZipFile, BadZipFile
 import tarfile
 import json
+from importlib.resources import files
 
 # Data processing
 import numpy as np
@@ -53,6 +54,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import PathPatch
 from matplotlib.path import Path
 import matplotlib.patches as patches
+
 
 # ==========================================
 # PARALLEL PROCESSING UTILITIES
@@ -184,18 +186,18 @@ def list_municipalities(province_codes=None,
     return list_municipalities
 
 
-def ine_to_cadaster_codes(cadaster_dir, ine_codes):
+def ine_to_cadaster_codes(ine_codes):
     if ine_codes is not None:
-        map_code_dict = pd.read_excel(f"{cadaster_dir}/ine_inspire_codes.xlsx", dtype=object, engine='openpyxl').set_index(
+        map_code_dict = pd.read_excel(files("hypercadaster_ES").joinpath("cached_files/ine_inspire_codes.xlsx"), dtype=object, engine='openpyxl').set_index(
             'CÓDIGO INE').to_dict()['CÓDIGO CATASTRO']
         cadaster_codes = [map_code_dict[key] for key in ine_codes]
     else:
         cadaster_codes = None
     return cadaster_codes
 
-def cadaster_to_ine_codes(cadaster_dir, cadaster_codes):
+def cadaster_to_ine_codes(cadaster_codes):
     if cadaster_codes is not None:
-        map_code_dict = pd.read_excel(f"{cadaster_dir}/ine_inspire_codes.xlsx", dtype=object, engine='openpyxl').set_index(
+        map_code_dict = pd.read_excel(files("hypercadaster_ES").joinpath("cached_files/ine_inspire_codes.xlsx"), dtype=object, engine='openpyxl').set_index(
             'CÓDIGO CATASTRO').to_dict()['CÓDIGO INE']
         ine_codes = [map_code_dict[key] for key in cadaster_codes]
     else:
@@ -212,8 +214,8 @@ def municipality_name(ine_code):
 
     return list(df.loc[df["Municipality code"]==ine_code ,"Municipality name"])[0]
 
-def get_administrative_divisions_naming(cadaster_dir, cadaster_codes):
-    municipalities = pd.read_excel(f"{cadaster_dir}/ine_inspire_codes.xlsx", dtype=object, engine='openpyxl')
+def get_administrative_divisions_naming(cadaster_codes):
+    municipalities = pd.read_excel(files("hypercadaster_ES").joinpath("cached_files/ine_inspire_codes.xlsx"), dtype=object, engine='openpyxl')
     municipalities.drop(['INMUEBLES TOTALES', 'INMUEBLES URBANOS', 'INMUEBLES RÚSTICOS',
                          'Regularizados', 'Regularizados\nurbanos', 'Regularizados\nrústicos',
                          'Nuevas Construcciones', 'Ampliaciones y Rehabilitaciones',

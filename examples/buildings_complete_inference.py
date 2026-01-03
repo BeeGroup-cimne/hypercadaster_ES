@@ -88,6 +88,17 @@ output_filename = f"{wd}/{'~'.join(cadaster_codes)}_complete_inference.pkl"
 print(f"Saving combined results to: {output_filename}")
 combined_gdf.to_pickle(output_filename, compression="gzip")
 
+## To read these results:
+#import pandas as pd
+#import pprint
+#df = pd.read_pickle("/Users/gmor-air/Downloads/08900.pkl", compression="gzip")
+## Characteristics for one building: main entrance location (EPSG:25831), general geometry (EPSG:25831),
+## elevation from sea level (m), number of floors (u) (multiply it by 3m and you will obtain and approximate building
+## height)
+#pprint.pp(dict(df[["building_reference", "location", "building_geometry", "elevation", "br__floors_above_ground"]].
+#               iloc[100]), width=100, depth=2, compact=True)
+
+
 # Summary statistics
 print("\n" + "="*60)
 print("ANALYSIS COMPLETED")
