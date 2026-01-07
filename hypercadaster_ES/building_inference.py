@@ -1337,22 +1337,38 @@ def parse_horizontal_division_buildings_CAT_files(cadaster_code, CAT_files_dir):
     building_space_age_value_dict = \
         {str(entry["Age"][0]): {k: v for k, v in entry.items() if k != "Age"} for entry in downloaders.building_space_age_value}
 
+    # Helper function to safely convert category to integer index
+    def safe_category_to_index(category):
+        try:
+            return int(category) - 1
+        except (ValueError, TypeError):
+            return 0  # Default to first index for non-numeric categories
+
     # Economical value coefficients of the constructions
     building_spaces_detailed = building_spaces_detailed.with_columns(
         pl.struct(["building_space_typology_id", "building_space_typology_category"]).map_elements(
             lambda row:
-                downloaders.building_space_typologies[
-                    row["building_space_typology_id"]]["ConstructionValue"][
-                    int(row["building_space_typology_category"]) - 1], # Adjust index to match zero-based indexing
+                downloaders.building_space_typologies.get(
+                    row["building_space_typology_id"], 
+                    downloaders.building_space_typologies.get("0000", {"ConstructionValue": [1.0]})
+                )["ConstructionValue"][
+                    safe_category_to_index(row["building_space_typology_category"])], # Safe index conversion
             return_dtype=pl.Float64  # Specify the return dtype explicitly
         ).alias("construction_relative_economic_value"),
         pl.struct(["building_space_age_key", "building_space_typology_use_level",
                    "building_space_typology_category"]).map_elements(
             lambda row:
-            building_space_age_value_dict[
-                row["building_space_age_key"]][
-                row["building_space_typology_use_level"]][
-                int(row["building_space_typology_category"]) - 1],  # Adjust index to match zero-based indexing
+            building_space_age_value_dict.get(
+                row["building_space_age_key"], {}
+            ).get(
+                row["building_space_typology_use_level"], [1.0]
+            )[safe_category_to_index(row["building_space_typology_category"])] if len(
+                building_space_age_value_dict.get(
+                    row["building_space_age_key"], {}
+                ).get(
+                    row["building_space_typology_use_level"], [1.0]
+                )
+            ) > safe_category_to_index(row["building_space_typology_category"]) else 1.0,  # Safe index conversion
             return_dtype=pl.Float64  # Specify the return dtype explicitly
         ).alias("age_correction_relative_economic_value")
     )
