@@ -470,11 +470,17 @@ def join_cadaster_zone(gdf, cadaster_dir, cadaster_codes):
         if len(nan_rows) > 0 and len(zone_gdf_urban) > 0:
             # Extract coordinates from points and zone centroids
             try:
-                # Get coordinates of unassigned locations
-                nan_coords = np.array([[geom.x, geom.y] for geom in nan_rows["location"] if geom is not None])
-                zone_coords = np.array([[geom.centroid.x, geom.centroid.y] for geom in zone_gdf_urban["geometry"]])
+                # Get coordinates of unassigned locations - filter out None values properly
+                location_data = [(i, geom) for i, geom in zip(nan_rows.index, nan_rows["location"]) if geom is not None]
                 
-                if len(nan_coords) > 0 and len(zone_coords) > 0:
+                if len(location_data) > 0 and len(zone_gdf_urban) > 0:
+                    # Extract coordinates and indices separately
+                    valid_indices = [item[0] for item in location_data]
+                    valid_geoms = [item[1] for item in location_data]
+                    
+                    nan_coords = np.array([[geom.x, geom.y] for geom in valid_geoms])
+                    zone_coords = np.array([[geom.centroid.x, geom.centroid.y] for geom in zone_gdf_urban["geometry"]])
+                    
                     # Use sklearn NearestNeighbors for efficient distance calculation
                     nbrs = NearestNeighbors(n_neighbors=1, algorithm='ball_tree').fit(zone_coords)
                     distances, indices = nbrs.kneighbors(nan_coords)
@@ -482,12 +488,12 @@ def join_cadaster_zone(gdf, cadaster_dir, cadaster_codes):
                     # Assign closest zone references
                     closest_zone_refs = zone_gdf_urban.iloc[indices.flatten()]["zone_reference"].values
                     
-                    # Update the zone references
-                    valid_location_mask = nan_rows["location"].notna()
-                    nan_indices = nan_rows[valid_location_mask].index
-                    joined_urban.loc[nan_indices, "zone_reference"] = closest_zone_refs[:len(nan_indices)]
-                    
-                    sys.stderr.write(f"Assigned {len(nan_indices)} records to nearest zones\n")
+                    # Update the zone references - ensure lengths match
+                    if len(valid_indices) == len(closest_zone_refs):
+                        joined_urban.loc[valid_indices, "zone_reference"] = closest_zone_refs
+                        sys.stderr.write(f"Assigned {len(valid_indices)} records to nearest zones\n")
+                    else:
+                        sys.stderr.write(f"Warning: Length mismatch: {len(valid_indices)} indices vs {len(closest_zone_refs)} references\n")
             except Exception as e:
                 sys.stderr.write(f"Warning: Vectorized zone assignment failed, falling back to theoretical references: {e}\n")
                 
@@ -531,21 +537,28 @@ def join_cadaster_zone(gdf, cadaster_dir, cadaster_codes):
         rural_nan_rows = joined_rural[rural_nan_mask].copy()
         
         try:
-            # Vectorized nearest neighbor assignment for rural zones
-            rural_nan_coords = np.array([[geom.x, geom.y] for geom in rural_nan_rows["location"] if geom is not None])
-            rural_zone_coords = np.array([[geom.centroid.x, geom.centroid.y] for geom in zone_gdf_rural["geometry"]])
+            # Vectorized nearest neighbor assignment for rural zones  
+            rural_location_data = [(i, geom) for i, geom in zip(rural_nan_rows.index, rural_nan_rows["location"]) if geom is not None]
             
-            if len(rural_nan_coords) > 0 and len(rural_zone_coords) > 0:
+            if len(rural_location_data) > 0 and len(zone_gdf_rural) > 0:
+                # Extract coordinates and indices separately
+                rural_valid_indices = [item[0] for item in rural_location_data]
+                rural_valid_geoms = [item[1] for item in rural_location_data]
+                
+                rural_nan_coords = np.array([[geom.x, geom.y] for geom in rural_valid_geoms])
+                rural_zone_coords = np.array([[geom.centroid.x, geom.centroid.y] for geom in zone_gdf_rural["geometry"]])
+                
                 rural_nbrs = NearestNeighbors(n_neighbors=1, algorithm='ball_tree').fit(rural_zone_coords)
                 rural_distances, rural_indices = rural_nbrs.kneighbors(rural_nan_coords)
                 
                 rural_closest_refs = zone_gdf_rural.iloc[rural_indices.flatten()]["zone_reference"].values
                 
-                rural_valid_mask = rural_nan_rows["location"].notna()
-                rural_indices = rural_nan_rows[rural_valid_mask].index
-                joined_rural.loc[rural_indices, "zone_reference"] = rural_closest_refs[:len(rural_indices)]
-                
-                sys.stderr.write(f"Assigned {len(rural_indices)} rural records to nearest zones\n")
+                # Update the zone references - ensure lengths match
+                if len(rural_valid_indices) == len(rural_closest_refs):
+                    joined_rural.loc[rural_valid_indices, "zone_reference"] = rural_closest_refs
+                    sys.stderr.write(f"Assigned {len(rural_valid_indices)} rural records to nearest zones\n")
+                else:
+                    sys.stderr.write(f"Warning: Rural length mismatch: {len(rural_valid_indices)} indices vs {len(rural_closest_refs)} references\n")
         except Exception as e:
             sys.stderr.write(f"Warning: Rural zone assignment failed: {e}\n")
 
