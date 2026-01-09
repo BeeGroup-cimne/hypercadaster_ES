@@ -354,10 +354,16 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_
             # Create the use type column mapping (filter out None values)
             valid_use_types = [use_type for use_type in use_types if use_type is not None and not pd.isna(use_type)]
             use_type_mapping = {use_type: to_snake_case_prefix(use_type) for use_type in valid_use_types}
-            # Add mapping for None/NaN values
-            use_type_mapping[None] = "building_area_unknown"
 
-            # First, summarize total area per building and use type
+            # First, replace None/NaN use types with a placeholder before pivoting
+            buildings_CAT = buildings_CAT.with_columns(
+                pl.col("building_space_inferred_use_type").fill_null("Unknown").alias("building_space_inferred_use_type")
+            )
+
+            # Add mapping for the placeholder
+            use_type_mapping["Unknown"] = "building_area_unknown"
+
+            # Summarize total area per building and use type
             area_per_use = (
                 buildings_CAT
                 .group_by(["building_reference", "building_space_inferred_use_type"])
@@ -374,7 +380,7 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_
                     index="building_reference",
                     on="building_space_inferred_use_type"
                 )
-                .rename(use_type_mapping)  # rename columns
+                .rename(use_type_mapping)  # rename columns (now all keys are valid strings)
                 .fill_null(0.0)  # optional: replace nulls with 0 for missing use types
             )
 
