@@ -347,10 +347,15 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_
 
             # Function to convert use type to snake_case with prefix
             def to_snake_case_prefix(use_type: str) -> str:
-                return "building_area_" + re.sub(r'[^a-zA-Z0-9]+', '_', use_type.strip().lower()).strip('_')
+                if use_type is None or pd.isna(use_type):
+                    return "building_area_unknown"
+                return "building_area_" + re.sub(r'[^a-zA-Z0-9]+', '_', str(use_type).strip().lower()).strip('_')
 
-            # Create the use type column mapping
-            use_type_mapping = {use_type: to_snake_case_prefix(use_type) for use_type in use_types}
+            # Create the use type column mapping (filter out None values)
+            valid_use_types = [use_type for use_type in use_types if use_type is not None and not pd.isna(use_type)]
+            use_type_mapping = {use_type: to_snake_case_prefix(use_type) for use_type in valid_use_types}
+            # Add mapping for None/NaN values
+            use_type_mapping[None] = "building_area_unknown"
 
             # First, summarize total area per building and use type
             area_per_use = (
