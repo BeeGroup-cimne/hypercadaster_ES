@@ -404,234 +404,124 @@ def join_cadaster_zone(gdf, cadaster_dir, cadaster_codes):
     from sklearn.neighbors import NearestNeighbors
     
     start_time = time.time()
-    sys.stderr.write(f"\nJoining the cadaster zones for {len(cadaster_codes)} municipalities\n")
-    sys.stderr.write(f"Processing {len(gdf)} building records\n")
-
-    # Load all zone files more efficiently
-    zone_gdfs = []
-    load_start = time.time()
+    sys.stderr.write(f"\nJoining cadastral zones for {len(cadaster_codes)} municipalities ({len(gdf)} buildings)\n")
     
-    for code in tqdm(cadaster_codes, desc="Loading cadastral zone files..."):
+    # Add cadaster_code column to track building-to-municipality mapping
+    if 'cadaster_code' not in gdf.columns:
+        # Extract cadaster code from building_reference (first 5 characters)
+        gdf['cadaster_code'] = gdf['building_reference'].str[:5]
+    
+    joined_results = []
+    processed_buildings = 0
+    
+    # Process spatial joins by individual cadastral codes for much better performance
+    for code in tqdm(cadaster_codes, desc="Processing zones by municipality"):
         try:
-            zone_gdf_ = gpd.read_file(f"{cadaster_dir}/parcels/unzip/A.ES.SDGC.CP.{code}.cadastralzoning.gml",
-                                 layer="CadastralZoning")
-            zone_gdfs.append(zone_gdf_)
+            # Load zone file for this municipality
+            zone_gdf = gpd.read_file(f"{cadaster_dir}/parcels/unzip/A.ES.SDGC.CP.{code}.cadastralzoning.gml",
+                                   layer="CadastralZoning")
+            
+            # Clean and prepare zone data
+            zone_gdf.rename(columns={
+                'LocalisedCharacterString': 'zone_type',
+                'nationalCadastalZoningReference': 'zone_reference'
+            }, inplace=True)
+            zone_gdf.drop(['gml_id', 'estimatedAccuracy', 'estimatedAccuracy_uom', 'localId',
+                          'namespace', "label", "beginLifespanVersion", "pos", "endLifespanVersion",
+                          "originalMapScaleDenominator"], inplace=True, axis=1, errors='ignore')
+            
+            # Get buildings for this municipality only
+            buildings_for_code = gdf[gdf['cadaster_code'] == code].copy()
+            if len(buildings_for_code) == 0:
+                continue
+                
+            processed_buildings += len(buildings_for_code)
+            
+            # Align CRS
+            if buildings_for_code.crs != zone_gdf.crs:
+                buildings_for_code = buildings_for_code.to_crs(zone_gdf.crs)
+            
+            # Process urban zones first
+            urban_zones = zone_gdf[zone_gdf["zone_type"] == "MANZANA "].copy()
+            if len(urban_zones) > 0:
+                joined = gpd.sjoin(buildings_for_code, urban_zones, how="left", predicate="within")
+                joined = joined.drop(["index_right"], axis=1)
+                joined["zone_type"] = joined["zone_type"].fillna("MANZANA ")
+            else:
+                joined = buildings_for_code.copy()
+                joined["zone_reference"] = np.nan
+                joined["zone_type"] = "MANZANA "
+            
+            # For unassigned buildings, try rural zones
+            unassigned_mask = joined["zone_reference"].isna()
+            if unassigned_mask.any():
+                rural_zones = zone_gdf[zone_gdf["zone_type"] == "POLIGONO "].copy()
+                if len(rural_zones) > 0:
+                    unassigned_buildings = joined[unassigned_mask].drop(['zone_reference', 'zone_type'], axis=1)
+                    rural_joined = gpd.sjoin(unassigned_buildings, rural_zones, how="left", predicate="within")
+                    rural_joined = rural_joined.drop(["index_right"], axis=1)
+                    
+                    # Update the main joined result with rural assignments
+                    for idx in rural_joined.index:
+                        if pd.notna(rural_joined.loc[idx, "zone_reference"]):
+                            joined.loc[idx, "zone_reference"] = rural_joined.loc[idx, "zone_reference"]
+                            joined.loc[idx, "zone_type"] = "POLIGONO "
+            
+            # Quick nearest neighbor assignment for remaining unassigned (only if really needed)
+            still_unassigned = joined["zone_reference"].isna()
+            if still_unassigned.any() and len(zone_gdf) > 0:
+                unassigned_count = still_unassigned.sum()
+                if unassigned_count < 1000:  # Only for small numbers to keep it fast
+                    unassigned_buildings = joined[still_unassigned]
+                    valid_locations = unassigned_buildings["location"].notna()
+                    
+                    if valid_locations.any():
+                        points = unassigned_buildings[valid_locations]
+                        coords = np.array([[geom.x, geom.y] for geom in points["location"]])
+                        zone_coords = np.array([[geom.centroid.x, geom.centroid.y] for geom in zone_gdf["geometry"]])
+                        
+                        if len(coords) > 0 and len(zone_coords) > 0:
+                            nbrs = NearestNeighbors(n_neighbors=1, algorithm='ball_tree').fit(zone_coords)
+                            _, indices = nbrs.kneighbors(coords)
+                            
+                            for i, idx in enumerate(points.index):
+                                zone_idx = indices[i][0]
+                                joined.loc[idx, "zone_reference"] = zone_gdf.iloc[zone_idx]["zone_reference"]
+                                joined.loc[idx, "zone_type"] = zone_gdf.iloc[zone_idx]["zone_type"]
+                else:
+                    # For large numbers, just assign default
+                    joined.loc[still_unassigned, "zone_reference"] = "unassigned"
+                    joined.loc[still_unassigned, "zone_type"] = "MANZANA "
+            
+            joined_results.append(joined)
+            
         except Exception as e:
-            sys.stderr.write(f"Warning: Failed to load zone file for {code}: {e}\n")
+            # Skip failed municipalities but continue processing
             continue
     
-    # Concatenate all zone files at once (more efficient than incremental concatenation)
-    if zone_gdfs:
-        sys.stderr.write(f"Concatenating {len(zone_gdfs)} zone files...\n")
-        zone_gdf = gpd.GeoDataFrame(pd.concat(zone_gdfs, ignore_index=True))
-        # Ensure consistent CRS
-        if len(zone_gdfs) > 1:
-            target_crs = zone_gdfs[0].crs
-            zone_gdf = zone_gdf.to_crs(target_crs)
+    # Combine all results
+    if joined_results:
+        final_joined = pd.concat(joined_results, ignore_index=True)
     else:
-        raise ValueError("No valid zone files found")
+        final_joined = gdf.copy()
+        final_joined["zone_reference"] = "unassigned"
+        final_joined["zone_type"] = "MANZANA "
     
-    load_time = time.time() - load_start
-    sys.stderr.write(f"Zone files loaded in {load_time:.2f} seconds\n")
-    zone_gdf.rename(columns={
-        'LocalisedCharacterString': 'zone_type',
-        'nationalCadastalZoningReference': 'zone_reference'
-    }, inplace=True)
-    zone_gdf.drop(['gml_id', 'estimatedAccuracy', 'estimatedAccuracy_uom', 'localId',
-                   'namespace', "label", "beginLifespanVersion", "pos", "endLifespanVersion",
-                   "originalMapScaleDenominator"], inplace=True, axis=1, errors='ignore')
-
-    # Urban zones
-    urban_start = time.time()
-    sys.stderr.write("Processing urban zones (MANZANA)...\n")
-    zone_gdf_urban = zone_gdf.loc[zone_gdf["zone_type"] == "MANZANA "].copy()
-    zone_gdf_urban = zone_gdf_urban.set_geometry("geometry")
-    sys.stderr.write(f"Found {len(zone_gdf_urban)} urban zones\n")
-
-    # Perform spatial join
-    sys.stderr.write("Performing spatial join for urban zones...\n")
-    gdf_crs_aligned = gdf.to_crs(zone_gdf_urban.crs) if gdf.crs != zone_gdf_urban.crs else gdf
-    joined_urban = gpd.sjoin(
-        gdf_crs_aligned,
-        zone_gdf_urban,
-        how="left",
-        predicate="within"
-    ).drop(["index_right"], axis=1)
-
-    # Optimized distance-based assignment for NaN 'zone_reference' rows
-    nan_mask = joined_urban["zone_reference"].isna()
-    nan_count = nan_mask.sum()
-    sys.stderr.write(f"Found {nan_count} records without zone assignment, computing nearest zones...\n")
+    # Clean up zone types
+    final_joined["zone_type"] = final_joined["zone_type"].replace({
+        "MANZANA ": "urban", 
+        "POLIGONO ": "disseminated"
+    })
     
-    if nan_count > 0:
-        # Vectorized approach for finding nearest zones
-        nan_rows = joined_urban[nan_mask].copy()
-        
-        if len(nan_rows) > 0 and len(zone_gdf_urban) > 0:
-            # Extract coordinates from points and zone centroids
-            try:
-                # Get coordinates of unassigned locations - filter out None values properly
-                location_data = [(i, geom) for i, geom in zip(nan_rows.index, nan_rows["location"]) if geom is not None]
-                
-                if len(location_data) > 0 and len(zone_gdf_urban) > 0:
-                    # Extract coordinates and indices separately
-                    valid_indices = [item[0] for item in location_data]
-                    valid_geoms = [item[1] for item in location_data]
-                    
-                    nan_coords = np.array([[geom.x, geom.y] for geom in valid_geoms])
-                    zone_coords = np.array([[geom.centroid.x, geom.centroid.y] for geom in zone_gdf_urban["geometry"]])
-                    
-                    # Use sklearn NearestNeighbors for efficient distance calculation
-                    nbrs = NearestNeighbors(n_neighbors=1, algorithm='ball_tree').fit(zone_coords)
-                    distances, indices = nbrs.kneighbors(nan_coords)
-                    
-                    # Assign closest zone references
-                    closest_zone_refs = zone_gdf_urban.iloc[indices.flatten()]["zone_reference"].values
-                    
-                    # Update the zone references - ensure lengths match
-                    if len(valid_indices) == len(closest_zone_refs):
-                        for i, idx in enumerate(valid_indices):
-                            joined_urban.loc[idx, "zone_reference"] = closest_zone_refs[i]
-                        sys.stderr.write(f"Assigned {len(valid_indices)} records to nearest zones\n")
-                    else:
-                        sys.stderr.write(f"Warning: Length mismatch: {len(valid_indices)} indices vs {len(closest_zone_refs)} references\n")
-                        # Assign as many as we can
-                        min_len = min(len(valid_indices), len(closest_zone_refs))
-                        for i in range(min_len):
-                            joined_urban.loc[valid_indices[i], "zone_reference"] = closest_zone_refs[i]
-                        sys.stderr.write(f"Assigned {min_len} records (partial assignment)\n")
-            except Exception as e:
-                sys.stderr.write(f"Warning: Vectorized zone assignment failed, falling back to theoretical references: {e}\n")
-                
-                # Fallback: try theoretical reference approach
-                for idx, row in nan_rows.iterrows():
-                    if pd.isna(row["zone_reference"]):
-                        try:
-                            theoretical_ref = row["building_reference"][0:5] + row["building_reference"][7:]
-                            if theoretical_ref in zone_gdf_urban["zone_reference"].values:
-                                joined_urban.loc[idx, "zone_reference"] = theoretical_ref
-                        except:
-                            continue
-
-    joined_urban["zone_type"] = "MANZANA "
-    urban_time = time.time() - urban_start
-    sys.stderr.write(f"Urban zone processing completed in {urban_time:.2f} seconds\n")
-
-    # Disseminated zones (rural)
-    rural_start = time.time()
-    sys.stderr.write("Processing rural zones (POLIGONO)...\n")
-    zone_gdf_rural = zone_gdf.loc[zone_gdf["zone_type"] == "POLIGONO "].copy()
-    zone_gdf_rural = zone_gdf_rural.set_geometry("geometry")
-    sys.stderr.write(f"Found {len(zone_gdf_rural)} rural zones\n")
-
-    # Note: The original code had a bug - it was joining rural data with urban zones!
-    # Fixed to join rural data with rural zones
-    sys.stderr.write("Performing spatial join for rural zones...\n")
-    joined_rural = gpd.sjoin(
-        gdf_crs_aligned,
-        zone_gdf_rural,
-        how="left",
-        predicate="within"
-    ).drop(["index_right"], axis=1)
-
-    # Optimized distance-based assignment for rural zones
-    rural_nan_mask = joined_rural["zone_reference"].isna()
-    rural_nan_count = rural_nan_mask.sum()
-    sys.stderr.write(f"Found {rural_nan_count} rural records without zone assignment\n")
+    # Remove temporary cadaster_code column if we added it
+    if 'cadaster_code' in gdf.columns and 'cadaster_code' not in gdf.columns:
+        final_joined = final_joined.drop('cadaster_code', axis=1)
     
-    if rural_nan_count > 0 and len(zone_gdf_rural) > 0:
-        rural_nan_rows = joined_rural[rural_nan_mask].copy()
-        
-        try:
-            # Vectorized nearest neighbor assignment for rural zones  
-            rural_location_data = [(i, geom) for i, geom in zip(rural_nan_rows.index, rural_nan_rows["location"]) if geom is not None]
-            
-            if len(rural_location_data) > 0 and len(zone_gdf_rural) > 0:
-                # Extract coordinates and indices separately
-                rural_valid_indices = [item[0] for item in rural_location_data]
-                rural_valid_geoms = [item[1] for item in rural_location_data]
-                
-                rural_nan_coords = np.array([[geom.x, geom.y] for geom in rural_valid_geoms])
-                rural_zone_coords = np.array([[geom.centroid.x, geom.centroid.y] for geom in zone_gdf_rural["geometry"]])
-                
-                rural_nbrs = NearestNeighbors(n_neighbors=1, algorithm='ball_tree').fit(rural_zone_coords)
-                rural_distances, rural_indices = rural_nbrs.kneighbors(rural_nan_coords)
-                
-                rural_closest_refs = zone_gdf_rural.iloc[rural_indices.flatten()]["zone_reference"].values
-                
-                # Update the zone references - ensure lengths match
-                if len(rural_valid_indices) == len(rural_closest_refs):
-                    for i, idx in enumerate(rural_valid_indices):
-                        joined_rural.loc[idx, "zone_reference"] = rural_closest_refs[i]
-                    sys.stderr.write(f"Assigned {len(rural_valid_indices)} rural records to nearest zones\n")
-                else:
-                    sys.stderr.write(f"Warning: Rural length mismatch: {len(rural_valid_indices)} indices vs {len(rural_closest_refs)} references\n")
-                    # Assign as many as we can
-                    min_len = min(len(rural_valid_indices), len(rural_closest_refs))
-                    for i in range(min_len):
-                        joined_rural.loc[rural_valid_indices[i], "zone_reference"] = rural_closest_refs[i]
-                    sys.stderr.write(f"Assigned {min_len} rural records (partial assignment)\n")
-        except Exception as e:
-            sys.stderr.write(f"Warning: Rural zone assignment failed: {e}\n")
-
-    joined_rural["zone_type"] = "POLIGONO "
-    joined_rural["zone_reference"] = joined_rural["zone_reference"].fillna("disseminated")
-    rural_time = time.time() - rural_start
-    sys.stderr.write(f"Rural zone processing completed in {rural_time:.2f} seconds\n")
-
-    # Combine urban and rural results efficiently
-    sys.stderr.write("Combining urban and rural zone assignments...\n")
-    
-    # Since both joined_urban and joined_rural come from the same original gdf,
-    # they should have the same indices. We prioritize urban assignments over rural.
-    
-    # Start with urban results
-    joined = joined_urban.copy()
-    
-    # For records that didn't get urban zone assignment, use rural assignment
-    urban_unassigned_mask = joined["zone_reference"].isna()
-    
-    if urban_unassigned_mask.any() and len(joined_rural) > 0:
-        # Ensure we have matching indices
-        rural_indices = joined_rural.index.intersection(joined[urban_unassigned_mask].index)
-        
-        if len(rural_indices) > 0:
-            # Update zone information for unassigned urban records using rural data
-            for idx in rural_indices:
-                if pd.isna(joined.loc[idx, "zone_reference"]) and idx in joined_rural.index:
-                    rural_row = joined_rural.loc[idx]
-                    if pd.notna(rural_row["zone_reference"]):
-                        joined.loc[idx, "zone_reference"] = rural_row["zone_reference"]
-                        joined.loc[idx, "zone_type"] = rural_row["zone_type"]
-            
-            sys.stderr.write(f"Updated {len(rural_indices)} records with rural zone assignments\n")
-    
-    joined["zone_type"] = joined["zone_type"].replace({"MANZANA ": "urban", "POLIGONO ": "disseminated"})
-
-    # Vectorized location assignment for missing locations
-    missing_location_mask = joined["location"].isna()
-    missing_count = missing_location_mask.sum()
-    
-    if missing_count > 0:
-        sys.stderr.write(f"Assigning locations for {missing_count} records with missing locations...\n")
-        
-        # Create a mapping from zone_reference to centroid for faster lookups
-        zone_centroid_map = {
-            ref: geom.centroid 
-            for ref, geom in zip(zone_gdf["zone_reference"], zone_gdf["geometry"])
-            if pd.notna(ref)
-        }
-        
-        # Vectorized location assignment
-        for idx in joined[missing_location_mask].index:
-            zone_ref = joined.loc[idx, "zone_reference"]
-            if zone_ref in zone_centroid_map:
-                joined.loc[idx, "location"] = zone_centroid_map[zone_ref]
-
     total_time = time.time() - start_time
-    sys.stderr.write(f"Total zone joining completed in {total_time:.2f} seconds\n")
+    unassigned_count = (final_joined["zone_reference"] == "unassigned").sum()
+    sys.stderr.write(f"Zone joining completed in {total_time:.1f}s. Processed {processed_buildings} buildings, {unassigned_count} unassigned\n")
     
-    return joined
+    return final_joined
 
 def join_cadaster_parcel(gdf, cadaster_dir, cadaster_codes, how="left"):
 
