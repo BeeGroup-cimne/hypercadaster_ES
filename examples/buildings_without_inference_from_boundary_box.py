@@ -8,13 +8,23 @@ The script automatically discovers municipalities intersecting the bounding box,
 converts INE codes to cadastral codes, and processes building data without
 building inference for faster execution.
 
+⚠️  IMPORTANT: For large areas (>20 municipalities or metropolitan regions),
+    use buildings_batched_processing.py instead for better performance,
+    memory management, and progress monitoring.
+
 Key features demonstrated:
 - Automatic municipality discovery from bounding box coordinates
-- INE to cadastral code conversion
+- INE to cadastral code conversion  
 - Multi-municipality data download and processing
 - All auxiliary data layers included (neighborhoods, postal codes, census, elevations, open data)
 - Building processing without geometric inference for performance
 - Comprehensive output with address-focused results
+- Optimized spatial operations for efficient zone joining
+
+Performance notes:
+- This script works well for small to medium areas (1-20 municipalities)
+- For the Barcelona metropolitan area (93 municipalities), processing time is ~1-2 hours
+- Zone joining has been optimized with vectorized operations for faster processing
 
 Author: hypercadaster_ES examples
 """
@@ -36,6 +46,15 @@ print(f"Bounding box: {bbox} (lon_min, lat_min, lon_max, lat_max)")
 # Get INE municipality codes for municipalities intersecting the bounding box
 ine_codes = hc.get_ine_codes_from_bounding_box(wd, bbox)
 print(f"Found {len(ine_codes)} municipalities in bounding box:")
+
+# Performance warning for large areas
+if len(ine_codes) > 20:
+    print(f"\n⚠️  WARNING: Large area detected ({len(ine_codes)} municipalities)")
+    print("   For better performance and progress monitoring, consider using:")
+    print("   examples/buildings_batched_processing.py")
+    print("   This script may take 1-2+ hours to complete.")
+    print()
+
 names = hc.municipality_name(ine_codes)
 pp.pprint(names, compact=True)
 
