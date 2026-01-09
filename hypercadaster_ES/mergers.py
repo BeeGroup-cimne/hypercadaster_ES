@@ -490,10 +490,16 @@ def join_cadaster_zone(gdf, cadaster_dir, cadaster_codes):
                     
                     # Update the zone references - ensure lengths match
                     if len(valid_indices) == len(closest_zone_refs):
-                        joined_urban.loc[valid_indices, "zone_reference"] = closest_zone_refs
+                        for i, idx in enumerate(valid_indices):
+                            joined_urban.loc[idx, "zone_reference"] = closest_zone_refs[i]
                         sys.stderr.write(f"Assigned {len(valid_indices)} records to nearest zones\n")
                     else:
                         sys.stderr.write(f"Warning: Length mismatch: {len(valid_indices)} indices vs {len(closest_zone_refs)} references\n")
+                        # Assign as many as we can
+                        min_len = min(len(valid_indices), len(closest_zone_refs))
+                        for i in range(min_len):
+                            joined_urban.loc[valid_indices[i], "zone_reference"] = closest_zone_refs[i]
+                        sys.stderr.write(f"Assigned {min_len} records (partial assignment)\n")
             except Exception as e:
                 sys.stderr.write(f"Warning: Vectorized zone assignment failed, falling back to theoretical references: {e}\n")
                 
@@ -555,10 +561,16 @@ def join_cadaster_zone(gdf, cadaster_dir, cadaster_codes):
                 
                 # Update the zone references - ensure lengths match
                 if len(rural_valid_indices) == len(rural_closest_refs):
-                    joined_rural.loc[rural_valid_indices, "zone_reference"] = rural_closest_refs
+                    for i, idx in enumerate(rural_valid_indices):
+                        joined_rural.loc[idx, "zone_reference"] = rural_closest_refs[i]
                     sys.stderr.write(f"Assigned {len(rural_valid_indices)} rural records to nearest zones\n")
                 else:
                     sys.stderr.write(f"Warning: Rural length mismatch: {len(rural_valid_indices)} indices vs {len(rural_closest_refs)} references\n")
+                    # Assign as many as we can
+                    min_len = min(len(rural_valid_indices), len(rural_closest_refs))
+                    for i in range(min_len):
+                        joined_rural.loc[rural_valid_indices[i], "zone_reference"] = rural_closest_refs[i]
+                    sys.stderr.write(f"Assigned {min_len} rural records (partial assignment)\n")
         except Exception as e:
             sys.stderr.write(f"Warning: Rural zone assignment failed: {e}\n")
 
@@ -569,12 +581,30 @@ def join_cadaster_zone(gdf, cadaster_dir, cadaster_codes):
 
     # Combine urban and rural results efficiently
     sys.stderr.write("Combining urban and rural zone assignments...\n")
-    # Use urban results where available, otherwise use rural results
-    urban_assigned_mask = ~joined_urban["zone_reference"].isna()
-    joined = pd.concat([
-        joined_urban.loc[urban_assigned_mask, :],
-        joined_rural.loc[~urban_assigned_mask, :]
-    ]).reset_index(drop=True)
+    
+    # Since both joined_urban and joined_rural come from the same original gdf,
+    # they should have the same indices. We prioritize urban assignments over rural.
+    
+    # Start with urban results
+    joined = joined_urban.copy()
+    
+    # For records that didn't get urban zone assignment, use rural assignment
+    urban_unassigned_mask = joined["zone_reference"].isna()
+    
+    if urban_unassigned_mask.any() and len(joined_rural) > 0:
+        # Ensure we have matching indices
+        rural_indices = joined_rural.index.intersection(joined[urban_unassigned_mask].index)
+        
+        if len(rural_indices) > 0:
+            # Update zone information for unassigned urban records using rural data
+            for idx in rural_indices:
+                if pd.isna(joined.loc[idx, "zone_reference"]) and idx in joined_rural.index:
+                    rural_row = joined_rural.loc[idx]
+                    if pd.notna(rural_row["zone_reference"]):
+                        joined.loc[idx, "zone_reference"] = rural_row["zone_reference"]
+                        joined.loc[idx, "zone_type"] = rural_row["zone_type"]
+            
+            sys.stderr.write(f"Updated {len(rural_indices)} records with rural zone assignments\n")
     
     joined["zone_type"] = joined["zone_type"].replace({"MANZANA ": "urban", "POLIGONO ": "disseminated"})
 
