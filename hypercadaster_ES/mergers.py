@@ -7,7 +7,6 @@ Main functions:
     - join_cadaster_data(): Main orchestrator for joining all cadastral data
     - get_cadaster_address(): Extract and process address information
     - join_cadaster_building(): Join building geometry and attributes
-    - join_cadaster_zone(): Join cadastral zoning information
     - join_DEM_raster(): Add elevation data from Digital Elevation Model
     - join_by_census_tracts(): Add census tract information
     - join_by_neighbourhoods(): Add neighborhood information (Barcelona)
@@ -221,6 +220,120 @@ def get_cadaster_address(cadaster_dir, cadaster_codes, directions_from_CAT_files
     return gdf
 
 
+def assign_building_zones(gdf, cadaster_dir, cadaster_codes):
+    """
+    Assign cadastral zones to buildings using building centroids for better accuracy.
+    
+    This replaces the old approach that used address points with a more accurate method
+    based on building geometry centroids and simple spatial joins.
+    
+    Args:
+        gdf (GeoDataFrame): Building data with building_geometry
+        cadaster_dir (str): Directory containing cadastral data
+        cadaster_codes (list): List of cadastral codes to process
+        
+    Returns:
+        GeoDataFrame: Data with zone_reference and zone_type columns added
+    """
+    import time
+    import os
+    
+    start_time = time.time()
+
+    # Add cadaster_code column if not present
+    if 'cadaster_code' not in gdf.columns:
+        gdf['cadaster_code'] = gdf['building_reference'].str[:5]
+    
+    # Initialize zone columns
+    gdf['zone_reference'] = "unassigned"
+    gdf['zone_type'] = "urban"
+    
+    processed_buildings = 0
+
+    codes = tqdm(cadaster_codes, desc="Processing zones by municipality") \
+        if isinstance(cadaster_codes, list) else [cadaster_codes]
+
+    for code in codes:
+        try:
+            # Load zone file for this municipality
+            zone_file = f"{cadaster_dir}/parcels/unzip/A.ES.SDGC.CP.{code}.cadastralzoning.gml"
+            if not os.path.exists(zone_file):
+                continue
+                
+            zone_gdf = gpd.read_file(zone_file, layer="CadastralZoning")
+            
+            # Clean and prepare zone data
+            zone_gdf.rename(columns={
+                'LocalisedCharacterString': 'zone_type',
+                'nationalCadastalZoningReference': 'zone_reference'
+            }, inplace=True)
+            
+            # Avoid FutureWarning by checking for empty DataFrame before subsetting
+            if len(zone_gdf) > 0:
+                zone_gdf = zone_gdf[["zone_reference", "zone_type", "geometry"]].copy()
+            else:
+                continue  # Skip empty zone files
+            
+            # Get buildings for this municipality only
+            building_mask = gdf['cadaster_code'] == code
+            buildings_for_code = gdf[building_mask].copy()
+            if len(buildings_for_code) == 0:
+                continue
+                
+            processed_buildings += len(buildings_for_code)
+            
+            # Create building centroids for zone assignment
+            buildings_for_code['centroid'] = buildings_for_code['building_geometry'].centroid
+            buildings_centroids = buildings_for_code.set_geometry('centroid')
+            
+            # Align CRS
+            if buildings_centroids.crs != zone_gdf.crs:
+                buildings_centroids = buildings_centroids.to_crs(zone_gdf.crs)
+            
+            # Simple spatial join using building centroids - much more accurate than address points!
+            joined = gpd.sjoin(buildings_centroids, zone_gdf, how="left", predicate="within")
+            
+            # Check what columns we got from the join
+            right_zone_ref_col = None
+            right_zone_type_col = None
+            for col in joined.columns:
+                if col.endswith('zone_reference'):
+                    right_zone_ref_col = col
+                elif col.endswith('zone_type'):
+                    right_zone_type_col = col
+            
+            # Update the main dataframe with zone assignments
+            if len(joined) > 0 and right_zone_ref_col and right_zone_type_col:
+                # Get successful assignments
+                assigned_mask = joined[right_zone_ref_col].notna()
+                assigned_buildings = joined[assigned_mask]
+                
+                for idx in assigned_buildings.index:
+                    zone_ref = assigned_buildings.loc[idx, right_zone_ref_col]
+                    zone_type = assigned_buildings.loc[idx, right_zone_type_col]
+                    
+                    gdf.loc[idx, "zone_reference"] = zone_ref
+                    # Clean up zone types
+                    if zone_type == "MANZANA ":
+                        gdf.loc[idx, "zone_type"] = "urban"
+                    elif zone_type == "POLIGONO ":
+                        gdf.loc[idx, "zone_type"] = "disseminated"
+                    else:
+                        gdf.loc[idx, "zone_type"] = "urban"  # default
+            
+        except Exception as e:
+            sys.stderr.write(f"Error processing zones for {code}: {e}\n")
+            continue
+
+    # Remove temporary columns (only if we added it)
+    # Note: we always keep cadaster_code as it might be used elsewhere
+    
+    total_time = time.time() - start_time
+    unassigned_count = (gdf["zone_reference"] == "unassigned").sum() if len(gdf) > 0 else 0
+
+    return gdf
+
+
 def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_street_dir, building_parts_plots=False,
                            plot_zones_ratio=0.01, building_parts_inference=False,
                            building_parts_inference_using_CAT_files=False, open_data_layers=False,
@@ -259,12 +372,9 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_
             inplace=True, axis=1)
         building_gdf_ = building_gdf_.set_geometry("building_geometry")
 
-        if "building_gdf" in locals():
-            if building_gdf_.crs != building_gdf.crs:
-                building_gdf_ = building_gdf_.to_crs(building_gdf.crs)
-            building_gdf = gpd.GeoDataFrame(pd.concat([building_gdf, building_gdf_], ignore_index=True))
-        else:
-            building_gdf = building_gdf_
+        # Zone assignment
+        if 'building_geometry' in building_gdf_.columns:
+            building_gdf_ = assign_building_zones(building_gdf_, cadaster_dir, code)
 
         # Parse CAT file, if available
         if building_parts_inference_using_CAT_files:
@@ -326,22 +436,22 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_
                 parcels_gdf=parcels_gdf, results_dir=results_dir, cadaster_dir=cadaster_dir,
                 open_street_dir=open_street_dir, plots=building_parts_plots, plot_zones_ratio=plot_zones_ratio)
 
+            # Join Building geodataframe with
+            building_gdf_ = (building_gdf_[['gml_id', 'building_status', 'building_reference', 'building_use',
+                                          'building_geometry','year_of_construction', 'zone_reference', 'zone_type']].
+                            merge(building_part_gdf_, left_on="building_reference",
+                                  right_on="building_reference", how="left"))
+
             if "building_part_gdf" in locals():
                 building_part_gdf = pd.concat([building_part_gdf, building_part_gdf_[1]], ignore_index=True)
             else:
                 building_part_gdf = building_part_gdf_[1]
 
-            # Join Building geodataframe with
-            building_gdf = (building_gdf[['gml_id', 'building_status', 'building_reference', 'building_use',
-                                          'building_geometry','year_of_construction']].
-                            merge(building_part_gdf, left_on="building_reference",
-                                  right_on="building_reference", how="left"))
-
         elif buildings_CAT is not None:
             #['n_building_units', 'n_dwellings', 'n_floors_above_ground', 'building_area']
 
-            building_gdf = building_gdf[['gml_id', 'building_status', 'building_reference', 'building_use',
-                                         'building_geometry', 'year_of_construction']]
+            building_gdf_ = building_gdf_[['gml_id', 'building_status', 'building_reference', 'building_use',
+                                         'building_geometry', 'year_of_construction', 'zone_reference', 'zone_type']]
 
             use_types = buildings_CAT["building_space_inferred_use_type"].unique().to_list()
 
@@ -373,14 +483,22 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_
             )
 
             # Pivot so each use type becomes a column
-            area_pivot = (
+            area_pivot_raw = (
                 area_per_use
                 .pivot(
                     values="area_by_use",
                     index="building_reference",
                     on="building_space_inferred_use_type"
                 )
-                .rename(use_type_mapping)  # rename columns (now all keys are valid strings)
+            )
+            
+            # Filter mapping to only include columns that actually exist after pivot
+            existing_columns = set(area_pivot_raw.columns)
+            filtered_mapping = {k: v for k, v in use_type_mapping.items() if k in existing_columns}
+            
+            area_pivot = (
+                area_pivot_raw
+                .rename(filtered_mapping)  # rename only existing columns
                 .fill_null(0.0)  # optional: replace nulls with 0 for missing use types
             )
 
@@ -400,139 +518,30 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_
 
             # Join both tables
             final_df = summary.join(area_pivot, on="building_reference", how="left").to_pandas()
-            building_gdf = pd.merge(building_gdf, final_df, on="building_reference", how="left")
+            building_gdf_ = pd.merge(building_gdf_, final_df, on="building_reference", how="left")
 
         else:
-            building_gdf = building_gdf[['gml_id', 'building_status', 'building_reference', 'building_use',
+            building_gdf_ = building_gdf_[['gml_id', 'building_status', 'building_reference', 'building_use',
                                          'building_geometry', 'year_of_construction', 'n_building_units', 'n_dwellings',
-                                         'n_floors_above_ground', 'building_area']]
+                                         'n_floors_above_ground', 'building_area', 'zone_reference', 'zone_type']]
 
-    return pd.merge(gdf, building_gdf, left_on="building_reference", right_on="building_reference", how="left")
-
-
-def join_cadaster_zone(gdf, cadaster_dir, cadaster_codes):
-    import time
-    from sklearn.neighbors import NearestNeighbors
-    
-    start_time = time.time()
-    sys.stderr.write(f"\nJoining cadastral zones for {len(cadaster_codes)} municipalities ({len(gdf)} buildings)\n")
-    
-    # Add cadaster_code column to track building-to-municipality mapping
-    if 'cadaster_code' not in gdf.columns:
-        # Extract cadaster code from building_reference (first 5 characters)
-        gdf['cadaster_code'] = gdf['building_reference'].str[:5]
-    
-    joined_results = []
-    processed_buildings = 0
-    
-    # Process spatial joins by individual cadastral codes for much better performance
-    for code in tqdm(cadaster_codes, desc="Processing zones by municipality"):
-        try:
-            # Load zone file for this municipality
-            zone_gdf = gpd.read_file(f"{cadaster_dir}/parcels/unzip/A.ES.SDGC.CP.{code}.cadastralzoning.gml",
-                                   layer="CadastralZoning")
-            
-            # Clean and prepare zone data
-            zone_gdf.rename(columns={
-                'LocalisedCharacterString': 'zone_type',
-                'nationalCadastalZoningReference': 'zone_reference'
-            }, inplace=True)
-            zone_gdf.drop(['gml_id', 'estimatedAccuracy', 'estimatedAccuracy_uom', 'localId',
-                          'namespace', "label", "beginLifespanVersion", "pos", "endLifespanVersion",
-                          "originalMapScaleDenominator"], inplace=True, axis=1, errors='ignore')
-            
-            # Get buildings for this municipality only
-            buildings_for_code = gdf[gdf['cadaster_code'] == code].copy()
-            if len(buildings_for_code) == 0:
-                continue
-                
-            processed_buildings += len(buildings_for_code)
-            
-            # Align CRS
-            if buildings_for_code.crs != zone_gdf.crs:
-                buildings_for_code = buildings_for_code.to_crs(zone_gdf.crs)
-            
-            # Process urban zones first
-            urban_zones = zone_gdf[zone_gdf["zone_type"] == "MANZANA "].copy()
-            if len(urban_zones) > 0:
-                joined = gpd.sjoin(buildings_for_code, urban_zones, how="left", predicate="within")
-                joined = joined.drop(["index_right"], axis=1)
-                joined["zone_type"] = joined["zone_type"].fillna("MANZANA ")
-            else:
-                joined = buildings_for_code.copy()
-                joined["zone_reference"] = np.nan
-                joined["zone_type"] = "MANZANA "
-            
-            # For unassigned buildings, try rural zones
-            unassigned_mask = joined["zone_reference"].isna()
-            if unassigned_mask.any():
-                rural_zones = zone_gdf[zone_gdf["zone_type"] == "POLIGONO "].copy()
-                if len(rural_zones) > 0:
-                    unassigned_buildings = joined[unassigned_mask].drop(['zone_reference', 'zone_type'], axis=1)
-                    rural_joined = gpd.sjoin(unassigned_buildings, rural_zones, how="left", predicate="within")
-                    rural_joined = rural_joined.drop(["index_right"], axis=1)
-                    
-                    # Update the main joined result with rural assignments
-                    for idx in rural_joined.index:
-                        if pd.notna(rural_joined.loc[idx, "zone_reference"]):
-                            joined.loc[idx, "zone_reference"] = rural_joined.loc[idx, "zone_reference"]
-                            joined.loc[idx, "zone_type"] = "POLIGONO "
-            
-            # Quick nearest neighbor assignment for remaining unassigned (only if really needed)
-            still_unassigned = joined["zone_reference"].isna()
-            if still_unassigned.any() and len(zone_gdf) > 0:
-                unassigned_count = still_unassigned.sum()
-                if unassigned_count < 1000:  # Only for small numbers to keep it fast
-                    unassigned_buildings = joined[still_unassigned]
-                    valid_locations = unassigned_buildings["location"].notna()
-                    
-                    if valid_locations.any():
-                        points = unassigned_buildings[valid_locations]
-                        coords = np.array([[geom.x, geom.y] for geom in points["location"]])
-                        zone_coords = np.array([[geom.centroid.x, geom.centroid.y] for geom in zone_gdf["geometry"]])
-                        
-                        if len(coords) > 0 and len(zone_coords) > 0:
-                            nbrs = NearestNeighbors(n_neighbors=1, algorithm='ball_tree').fit(zone_coords)
-                            _, indices = nbrs.kneighbors(coords)
-                            
-                            for i, idx in enumerate(points.index):
-                                zone_idx = indices[i][0]
-                                joined.loc[idx, "zone_reference"] = zone_gdf.iloc[zone_idx]["zone_reference"]
-                                joined.loc[idx, "zone_type"] = zone_gdf.iloc[zone_idx]["zone_type"]
+        # Include it in the general building_gdf_
+        if "building_gdf" in locals():
+            if building_gdf_.crs != building_gdf.crs:
+                building_gdf_ = building_gdf_.to_crs(building_gdf.crs)
+            # Avoid FutureWarning by checking for empty DataFrames before concatenation
+            if not building_gdf_.empty:
+                if building_gdf.empty:
+                    building_gdf = building_gdf_
                 else:
-                    # For large numbers, just assign default
-                    joined.loc[still_unassigned, "zone_reference"] = "unassigned"
-                    joined.loc[still_unassigned, "zone_type"] = "MANZANA "
-            
-            joined_results.append(joined)
-            
-        except Exception as e:
-            # Skip failed municipalities but continue processing
-            continue
+                    building_gdf = gpd.GeoDataFrame(pd.concat([building_gdf, building_gdf_], ignore_index=True))
+        else:
+            building_gdf = building_gdf_
+
+    merged_gdf = pd.merge(gdf, building_gdf, left_on="building_reference", right_on="building_reference", how="left")
     
-    # Combine all results
-    if joined_results:
-        final_joined = pd.concat(joined_results, ignore_index=True)
-    else:
-        final_joined = gdf.copy()
-        final_joined["zone_reference"] = "unassigned"
-        final_joined["zone_type"] = "MANZANA "
-    
-    # Clean up zone types
-    final_joined["zone_type"] = final_joined["zone_type"].replace({
-        "MANZANA ": "urban", 
-        "POLIGONO ": "disseminated"
-    })
-    
-    # Remove temporary cadaster_code column if we added it
-    if 'cadaster_code' in gdf.columns and 'cadaster_code' not in gdf.columns:
-        final_joined = final_joined.drop('cadaster_code', axis=1)
-    
-    total_time = time.time() - start_time
-    unassigned_count = (final_joined["zone_reference"] == "unassigned").sum()
-    sys.stderr.write(f"Zone joining completed in {total_time:.1f}s. Processed {processed_buildings} buildings, {unassigned_count} unassigned\n")
-    
-    return final_joined
+    return merged_gdf
+
 
 def join_cadaster_parcel(gdf, cadaster_dir, cadaster_codes, how="left"):
 
@@ -580,8 +589,6 @@ def join_cadaster_data(cadaster_dir, cadaster_codes, results_dir, open_street_di
         open_data_layers_dir=open_data_layers_dir
     )
 
-    # Zones
-    gdf = join_cadaster_zone(gdf=gdf, cadaster_dir=cadaster_dir, cadaster_codes=cadaster_codes)
     # Buildings
     # building_parts_inference_using_CAT_files = use_CAT_files
     # code = "08900"

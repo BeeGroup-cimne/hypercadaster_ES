@@ -38,13 +38,12 @@ def download_postal_codes(postal_codes_dir, province_codes=None):
     fiona.drvsupport.supported_drivers['KML'] = 'rw'
     for province_code in province_codes:
         if not os.path.exists(f"{postal_codes_dir}/raw/k{province_code}.geojson"):
-            response = requests.get(f"https://www.codigospostales.com/kml/k{province_code}.kml")
-            if response.status_code == 200:
-                geojson_data = utils.kml_to_geojson(response.content)
+            try:
+                geojson_data = utils.kml_to_geojson(f"https://www.codigospostales.com/kml/k{province_code}.kml")
                 with open(f"{postal_codes_dir}/raw/k{province_code}.geojson", 'w') as f:
-                    f.write(geojson_data)
-            else:
-                sys.stderr.write(f"Error downloading postal code {province_code} file: Status {response.status_code}\n")
+                   f.write(geojson_data)
+            except:
+                sys.stderr.write(f"Error downloading postal code {province_code} file\n")
 
     # Filter and concatenate downloaded geojson files
     patterns = [f'k{pr}.geojson' for pr in province_codes]

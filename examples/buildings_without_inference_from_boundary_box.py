@@ -102,9 +102,13 @@ gdf = hc.merge(
     CAT_files_rel_dir=CAT_files_rel_dir
 )
 
+# Filter only the buildings and the first address
+gdf = gdf[~gdf.building_status.isna()]
+gdf = gdf.drop_duplicates(subset="building_reference")
+
 # Save results with descriptive naming
 bbox_str = f"{bbox[0]}_{bbox[1]}_{bbox[2]}_{bbox[3]}".replace(".", "p")
-output_filename = f"{wd}/bbox_{bbox_str}_municipalities_{'~'.join(cadaster_codes)}.pkl"
+output_filename = f"{wd}/bbox_{bbox_str}.pkl"
 print(f"Saving results to: {output_filename}")
 gdf.to_pickle(output_filename, compression="gzip")
 

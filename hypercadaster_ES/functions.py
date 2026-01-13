@@ -188,8 +188,7 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
     if elevations_layer:
         gdf = mergers.join_DEM_raster(
             gdf = gdf,
-            raster_dir = utils.DEM_raster_dir_(wd)
-        )
+            raster_dir = utils.DEM_raster_dir_(wd))
     if "index" in gdf.columns:
         gdf.drop("index", axis=1, inplace=True)
 

@@ -19,9 +19,10 @@ Examples:
 """
 
 from .functions import download, merge
+from .utils import get_ine_codes_from_bounding_box, ine_to_cadaster_codes, municipality_name
 
 __version__ = "1.0.0"
 __author__ = "Jose Manuel Broto Vispe"
 __email__ = "jmbrotovispe@gmail.com"
 
-__all__ = ["download", "merge"]
+__all__ = ["download", "merge", "get_ine_codes_from_bounding_box", "ine_to_cadaster_codes", "municipality_name"]

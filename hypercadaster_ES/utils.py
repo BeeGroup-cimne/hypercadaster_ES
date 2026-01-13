@@ -204,15 +204,69 @@ def cadaster_to_ine_codes(cadaster_codes):
         ine_codes = None
     return ine_codes
 
-def municipality_name(ine_code):
+def municipality_name(ine_codes):
 
+    ine_codes = [ine_codes] if not isinstance(ine_codes, list) else ine_codes
     df = pd.read_excel("https://www.ine.es/daco/daco42/codmun/diccionario24.xlsx", header=1)
     df['Municipality code'] = df['CPRO'].astype(int).apply(lambda x: f"{x:02d}") +\
                               df['CMUN'].astype(int).apply(lambda x: f"{x:03d}")
     df.rename(columns = {'NOMBRE':'Municipality name'}, inplace=True)
     df.drop(columns = ["CODAUTO","CPRO","CMUN","DC"],inplace=True)
 
-    return list(df.loc[df["Municipality code"]==ine_code ,"Municipality name"])[0]
+    return list(df.loc[df["Municipality code"].isin(ine_codes) ,"Municipality name"])
+
+def get_ine_codes_from_bounding_box(wd, bbox, year=2022):
+    """
+    Get INE municipality codes for municipalities that intersect with a bounding box.
+    
+    Parameters:
+    -----------
+    wd : str
+        Working directory path containing the census_tracts data
+    bbox : list or tuple
+        Bounding box in longitude/latitude format [min_lon, min_lat, max_lon, max_lat]
+    year : int, optional
+        Census year (default: 2022)
+    
+    Returns:
+    --------
+    list
+        List of INE municipality codes (strings) for municipalities intersecting the bbox
+    
+    Example:
+    --------
+    # Barcelona area bounding box
+    bbox = [2.05, 41.32, 2.25, 41.47]
+    ine_codes = get_ine_codes_from_bounding_box("/path/to/data", bbox)
+    """
+    from hypercadaster_ES.mergers import get_census_gdf
+    from shapely.geometry import box
+    from shapely.ops import unary_union
+    
+    # Load census data with municipalities
+    census_dir = census_tracts_dir_(wd)
+    census_gdf = get_census_gdf(census_dir, year=year, crs="EPSG:4326")
+    
+    # Aggregate by municipality to get unique municipality geometries
+    municipalities_gdf = census_gdf.groupby('ine_municipality_code').agg({
+        'municipality_name': 'first',
+        'province_name': 'first', 
+        'autonomous_community_name': 'first',
+        'geometry': lambda x: unary_union(x.tolist())
+    }).reset_index()
+    
+    # Convert back to GeoDataFrame
+    municipalities_gdf = gpd.GeoDataFrame(municipalities_gdf, geometry='geometry', crs="EPSG:4326")
+    
+    # Create bounding box polygon
+    bbox_polygon = box(bbox[0], bbox[1], bbox[2], bbox[3])
+    bbox_gdf = gpd.GeoDataFrame([1], geometry=[bbox_polygon], crs="EPSG:4326")
+    
+    # Find municipalities that intersect with the bounding box
+    intersecting_municipalities = gpd.sjoin(municipalities_gdf, bbox_gdf, predicate='intersects')
+    
+    # Return list of INE codes
+    return intersecting_municipalities['ine_municipality_code'].tolist()
 
 def get_administrative_divisions_naming(cadaster_codes):
     municipalities = pd.read_excel(files("hypercadaster_ES").joinpath("cached_files/ine_inspire_codes.xlsx"), dtype=object, engine='openpyxl')
@@ -231,45 +285,63 @@ def get_administrative_divisions_naming(cadaster_codes):
 
     return municipalities
 
-def kml_to_geojson(kml_file):
-    features = []
+def kml_to_geojson(kml_url):
+    r = requests.get(kml_url)
+    r.raise_for_status()
+
+    kml_bytes = r.content
+
     k = kml.KML()
-    k.from_string(kml_file)
-    for doc in k.features():
-        for feature in doc.features():
-            for placemark in feature.features():
+    k = k.from_string(kml_bytes)
+
+    features = []
+
+    for doc in k.features:
+        for feature in doc.features:
+            for placemark in feature.features:
+
                 properties = {}
-                if hasattr(placemark, 'extended_data') and placemark.extended_data:
-                    for data in placemark.extended_data.elements:
-                        if isinstance(data, kml.SchemaData):
-                            for simple_data in data.data:
-                                properties[simple_data['name']] = simple_data['value']
+
+                if placemark.extended_data:
+                    for element in placemark.extended_data.elements:
+                        if hasattr(element, "data"):
+                            for sd in element.data:
+                                name = getattr(sd, "name", None) or sd.get("name")
+                                value = getattr(sd, "value", None) or sd.get("value")
+                                if name is not None:
+                                    properties[name] = value
+
                 coordinates = []
+
                 if hasattr(placemark, 'geometry') and placemark.geometry:
-                    if placemark.geometry._type in ['MultiPolygon']:
 
-                        for polygon in placemark.geometry.geoms:
-                            outer_boundary = polygon.exterior.coords
-                            coordinates.append([[list(point)[:2] for point in outer_boundary]])
+                    geom = placemark.geometry
 
-                    elif placemark.geometry._type in ['Polygon']:
-                        outer_boundary = placemark.geometry.exterior.coords
-                        coordinates.append([list(point)[:2] for point in outer_boundary])
+                    if geom.geom_type == "MultiPolygon":
+                        for polygon in geom.geoms:
+                            outer = polygon.exterior.coords
+                            coordinates.append([[list(pt)[:2] for pt in outer]])
+
+                    elif geom.geom_type == "Polygon":
+                        outer = geom.exterior.coords
+                        coordinates.append([list(pt)[:2] for pt in outer])
 
                 feature_json = {
                     "type": "Feature",
                     "properties": properties,
                     "geometry": {
                         "type": placemark.geometry.geom_type if coordinates else None,
-                        "coordinates": coordinates
+                        "coordinates": coordinates if coordinates else None
                     }
                 }
+
                 features.append(feature_json)
 
     feature_collection = {
         "type": "FeatureCollection",
         "features": features
     }
+
     return json.dumps(feature_collection)
 
 # ==========================================
