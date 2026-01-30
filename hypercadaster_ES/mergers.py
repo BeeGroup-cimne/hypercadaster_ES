@@ -403,9 +403,10 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_
                  'heightBelowGround_uom'],
                 inplace=True, axis=1)
 
-            gdf_unique = gdf.drop_duplicates(subset='building_reference')
-            building_part_gdf_ = building_part_gdf_.join(gdf_unique.set_index('building_reference'),
-                                                       on="building_reference", how="left")
+            if gdf is not None:
+                gdf_unique = gdf.drop_duplicates(subset='building_reference')
+                building_part_gdf_ = building_part_gdf_.join(gdf_unique.set_index('building_reference'),
+                                                           on="building_reference", how="left")
             building_part_gdf_.loc[building_part_gdf_["zone_type"].isna(), "zone_type"] = "unknown"
             building_part_gdf_.loc[building_part_gdf_["zone_reference"].isna(), "zone_reference"] = "unknown"
             # building_part_gdf_.drop(columns=["building_part_geometry"]).set_geometry("location").to_file("test.gpkg")
@@ -538,8 +539,11 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_
         else:
             building_gdf = building_gdf_
 
-    merged_gdf = pd.merge(gdf, building_gdf, left_on="building_reference", right_on="building_reference", how="left")
-    
+    if gdf is not None:
+        merged_gdf = pd.merge(gdf, building_gdf, left_on="building_reference", right_on="building_reference", how="left")
+    else:
+        merged_gdf = building_gdf
+
     return merged_gdf
 
 
@@ -563,11 +567,14 @@ def join_cadaster_parcel(gdf, cadaster_dir, cadaster_codes, how="left"):
     parcel_gdf = parcel_gdf.rename({"geometry": "parcel_geometry", "localId": "building_reference"}, axis=1)
     parcel_gdf = parcel_gdf[["building_reference", "parcel_geometry"]]
     parcel_gdf = parcel_gdf.drop_duplicates(subset="building_reference", keep="first")
-    gdf_joined = gdf.merge(parcel_gdf, on="building_reference", how=how)
+    if gdf is not None:
+        gdf_joined = gdf.merge(parcel_gdf, on="building_reference", how=how)
+    else:
+        gdf_joined = parcel_gdf
     parcel_gdf = parcel_gdf.set_geometry("parcel_geometry")
     parcel_gdf["parcel_centroid"] = parcel_gdf.centroid
 
-    return (gdf_joined,parcel_gdf)
+    return (gdf_joined,parcel_gdf) if gdf is not None else gdf_joined
 
 def join_adm_div_naming(gdf, cadaster_dir, cadaster_codes):
 
