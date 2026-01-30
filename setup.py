@@ -3,8 +3,8 @@ from setuptools import find_packages, setup
 
 HERE = pathlib.Path(__file__).parent
 
-VERSION = "1.0.0"
-PACKAGE_NAME = "hypercadaster_ES"
+VERSION = "1.0.1"
+PACKAGE_NAME = "hypercadaster_es"
 AUTHOR = "Jose Manuel Broto Vispe"
 AUTHOR_EMAIL = "jmbrotovispe@gmail.com"
 URL = "https://github.com/BeeGroup-cimne"
