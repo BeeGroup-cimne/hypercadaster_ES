@@ -3,7 +3,7 @@ from setuptools import find_packages, setup
 
 HERE = pathlib.Path(__file__).parent
 
-VERSION = "1.0.1"
+VERSION = "1.0.5"
 PACKAGE_NAME = "hypercadaster_es"
 AUTHOR = "Jose Manuel Broto Vispe"
 AUTHOR_EMAIL = "jmbrotovispe@gmail.com"
@@ -102,6 +102,9 @@ setup(
     license=LICENSE,
     packages=find_packages(),
     include_package_data=True,
+    package_data={
+        'hypercadaster_es': ['cached_files/*.xlsx'],
+    },
     license_files=("LICENSE",),
     install_requires=INSTALL_REQUIRES,
     python_requires=">=3.10",

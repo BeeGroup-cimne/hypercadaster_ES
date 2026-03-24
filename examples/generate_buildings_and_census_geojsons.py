@@ -91,8 +91,7 @@ gdf_ct = gpd.read_file(census_shapefile)
 # Filter census tracts for the specified municipalities
 # Convert cadastral codes to INE codes for filtering
 ine_codes = hc.functions.utils.cadaster_to_ine_codes(
-    cadaster_dir=hc.functions.utils.cadaster_dir_(wd),
-    cadaster_codes=cadaster_codes
+    cadaster_codes
 )
 
 gdf_ct = gdf_ct[gdf_ct.CLAU2.isin(ine_codes)]

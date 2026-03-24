@@ -48,8 +48,6 @@ import requests
 from bs4 import BeautifulSoup
 
 # Visualization
-import matplotlib
-matplotlib.use('Agg')  # Use a non-interactive backend
 import matplotlib.pyplot as plt
 from matplotlib.patches import PathPatch
 from matplotlib.path import Path

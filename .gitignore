@@ -3,7 +3,8 @@ data
 cache
 __pycache__
 dist
-hypercadaster_ES.egg-info
+build 
+.egg-info
 all_directions_barcelona.py
 .idea
 .DS_Store

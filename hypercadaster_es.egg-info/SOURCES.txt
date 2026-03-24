@@ -1,4 +1,5 @@
 LICENSE
+MANIFEST.in
 README.md
 setup.py
 hypercadaster_ES/__init__.py
@@ -8,6 +9,7 @@ hypercadaster_ES/functions.py
 hypercadaster_ES/interoperability.py
 hypercadaster_ES/mergers.py
 hypercadaster_ES/utils.py
+hypercadaster_ES/cached_files/ine_inspire_codes.xlsx
 hypercadaster_es.egg-info/PKG-INFO
 hypercadaster_es.egg-info/SOURCES.txt
 hypercadaster_es.egg-info/dependency_links.txt

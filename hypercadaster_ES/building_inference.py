@@ -45,7 +45,6 @@ from shapely.geometry import (Polygon, LineString, LinearRing, MultiPolygon, Mul
 
 # Visualization
 import matplotlib
-matplotlib.use('Agg')  # Use a non-interactive backend
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
@@ -181,7 +180,7 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
         else:
             zones_to_plot = set()
 
-        ine_code = utils.cadaster_to_ine_codes(cadaster_dir, [code])[0]
+        ine_code = utils.cadaster_to_ine_codes([code])[0]
         streets_gdf = utils.get_municipality_open_street_maps(
             open_street_dir=open_street_dir,
             query_location=f"{utils.municipality_name(ine_code)}, Spain",
