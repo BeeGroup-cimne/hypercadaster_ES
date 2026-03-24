@@ -407,6 +407,14 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_
                 gdf_unique = gdf.drop_duplicates(subset='building_reference')
                 building_part_gdf_ = building_part_gdf_.join(gdf_unique.set_index('building_reference'),
                                                            on="building_reference", how="left")
+            
+            # Ensure zone columns exist
+            if "zone_type" not in building_part_gdf_.columns:
+                building_part_gdf_["zone_type"] = "unknown"
+            if "zone_reference" not in building_part_gdf_.columns:
+                building_part_gdf_["zone_reference"] = "unknown"
+                
+            # Fill missing values
             building_part_gdf_.loc[building_part_gdf_["zone_type"].isna(), "zone_type"] = "unknown"
             building_part_gdf_.loc[building_part_gdf_["zone_reference"].isna(), "zone_reference"] = "unknown"
             # building_part_gdf_.drop(columns=["building_part_geometry"]).set_geometry("location").to_file("test.gpkg")
@@ -440,7 +448,7 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_
             # Join Building geodataframe with
             building_gdf_ = (building_gdf_[['gml_id', 'building_status', 'building_reference', 'building_use',
                                           'building_geometry','year_of_construction', 'zone_reference', 'zone_type']].
-                            merge(building_part_gdf_, left_on="building_reference",
+                            merge(building_part_gdf_[1], left_on="building_reference",
                                   right_on="building_reference", how="left"))
 
             if "building_part_gdf" in locals():
