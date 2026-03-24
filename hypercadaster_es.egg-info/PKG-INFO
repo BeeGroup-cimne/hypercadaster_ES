@@ -1,4 +1,4 @@
-Metadata-Version: 2.1
+Metadata-Version: 2.4
 Name: hypercadaster_es
 Version: 1.0.1
 Summary: Python library to obtain the Spanish cadaster data joined with external attributes.
@@ -79,6 +79,19 @@ Requires-Dist: black>=24.0; extra == "dev"
 Requires-Dist: ruff>=0.4; extra == "dev"
 Requires-Dist: pytest>=7.0; extra == "dev"
 Requires-Dist: pytest-cov>=4.0; extra == "dev"
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: keywords
+Dynamic: license
+Dynamic: license-file
+Dynamic: provides-extra
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
 
 # hypercadaster_ES
 

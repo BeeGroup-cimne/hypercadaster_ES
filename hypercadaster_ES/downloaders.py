@@ -13,6 +13,9 @@ import numpy as np
 from tqdm import tqdm
 from joblib import Parallel, delayed
 from joblib.externals.loky import get_reusable_executor
+import rasterio
+from rasterio.merge import merge
+import math
 
 def download_file(dir, url, file):
     """Download a file from URL to directory if it doesn't exist."""
@@ -154,30 +157,138 @@ def cadaster_downloader(cadaster_dir, cadaster_codes=None):
         if nf:
             utils.unzip_directory(f"{cadaster_dir}/{k}/zip/", f"{cadaster_dir}/{k}/unzip/")
 
+def read_dataspace_credentials(client_name="hypercadaster_ES", filepath=os.path.expanduser("~/.dataspaces")):
+    """
+    Reads clientId and clientSecret from ~/.dataspaces for a given client name.
+    """
+    creds = {}
+    current_client = None
+    with open(filepath, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("client:"):
+                current_client = line.split(":", 1)[1].strip()
+            elif line.startswith("clientId:") and current_client == client_name:
+                creds["client_id"] = line.split(":", 1)[1].strip()
+            elif line.startswith("clientSecret:") and current_client == client_name:
+                creds["client_secret"] = line.split(":", 1)[1].strip()
+    if "client_id" not in creds or "client_secret" not in creds:
+        raise RuntimeError(f"Credentials for client '{client_name}' not found in {filepath}")
+    return creds
 
-def download_DEM_raster(raster_dir, bbox, year=2023):
-    sys.stderr.write(f"\nDownloading Digital Elevation Models for year: {year}\n")
-    os.makedirs(f"{raster_dir}/raw", exist_ok=True)
-    os.makedirs(f"{raster_dir}/uncompressed", exist_ok=True)
-    bbox = [int(i) for i in bbox]
-    nf = False
-    for latitude in range(bbox[1],bbox[3]+1):
-        for longitude in range(bbox[0],bbox[2]+1):
-            if not os.path.exists(f"{raster_dir}/raw/DEM_{latitude}_{longitude}_{year}.tar"):
-                nf = True
-                sys.stderr.write(f"\t--> Latitude {latitude}, longitude {longitude}\n")
-                download_file(dir = f"{raster_dir}/raw",
-                              url = f"https://prism-dem-open.copernicus.eu/pd-desk-open-access/prismDownload/"
-                                    f"COP-DEM_GLO-30-DGED__{year}_1/"
-                                    f"Copernicus_DSM_10_N{latitude:02}_00_E{longitude:03}_00.tar",
-                              file = f"DEM_{latitude}_{longitude}_{year}.tar")
-    if nf:
-        utils.untar_directory(tar_directory = f"{raster_dir}/raw/",
-                        untar_directory = f"{raster_dir}/uncompressed/",
-                        files_to_extract= "*/DEM/*.tif")
-        utils.concatenate_tiffs(input_dir=f"{raster_dir}/uncompressed/",
-                                output_file=f"{raster_dir}/DEM.tif")
+def get_dataspace_token(client_id, client_secret):
+    """
+    Requests an OAuth2 access token using client credentials.
+    """
+    token_url = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
+    payload = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret
+    }
+    response = requests.post(token_url, data=payload)
+    if response.status_code != 200:
+        raise RuntimeError(f"Failed to get access token ({response.status_code}): {response.text}")
+    return response.json()["access_token"]
 
+
+def download_DEM_raster(raster_dir, bbox, instance="COPERNICUS_30", max_pixels=2500):
+    """
+    Download Copernicus DEM using a global tile grid.
+    Tiles are cached and always merged into DEM.tif.
+    """
+    os.makedirs(raster_dir, exist_ok=True)
+    tiles_dir = os.path.join(raster_dir, "tiles")
+    os.makedirs(tiles_dir, exist_ok=True)
+
+    sys.stderr.write(f"\nRequesting DEM for area: {bbox} with instance {instance}\n")
+
+    creds = read_dataspace_credentials("hypercadaster_ES")
+    access_token = get_dataspace_token(creds["client_id"], creds["client_secret"])
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    # --- Global grid resolution ---
+    grid_res = max_pixels * 0.0003
+
+    # --- Compute tiles aligned to global grid ---
+    minx_idx = math.floor(bbox[0] / grid_res)
+    maxx_idx = math.ceil(bbox[2] / grid_res)
+    miny_idx = math.floor(bbox[1] / grid_res)
+    maxy_idx = math.ceil(bbox[3] / grid_res)
+
+    tiles = []
+    for i in range(minx_idx, maxx_idx):
+        for j in range(miny_idx, maxy_idx):
+            t_minx = i * grid_res
+            t_maxx = (i + 1) * grid_res
+            t_miny = j * grid_res
+            t_maxy = (j + 1) * grid_res
+            tiles.append([t_minx, t_miny, t_maxx, t_maxy])
+
+    tile_files = []
+
+    evalscript = """
+    //VERSION=3
+    function setup() {
+      return {
+        input: ["DEM"],
+        output: { bands: 1, sampleType: "FLOAT32" }
+      };
+    }
+
+    function evaluatePixel(sample) {
+      return [sample.DEM];  // positive above sea level, negative below
+    }
+    """
+
+    url = "https://sh.dataspace.copernicus.eu/api/v1/process"
+
+    for idx, t_bbox in enumerate(tiles):
+        tile_name = f"{t_bbox[1]:.6f}_{t_bbox[0]:.6f}_{t_bbox[3]:.6f}_{t_bbox[2]:.6f}.tif"
+        tile_path = os.path.join(tiles_dir, tile_name)
+
+        if os.path.exists(tile_path):
+            sys.stderr.write(f"Tile {idx+1}/{len(tiles)} already cached: {tile_name}\n")
+        else:
+            sys.stderr.write(f"Downloading tile {idx+1}/{len(tiles)}: {tile_name}\n")
+            request_payload = {
+                "input": {
+                    "bounds": {"properties": {"crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"},
+                               "bbox": t_bbox},
+                    "data": [{"type": "dem",
+                              "dataFilter": {"demInstance": instance},
+                              "processing": {"upsampling": "BILINEAR", "downsampling": "BILINEAR"}}]
+                },
+                "output": {"resx": 0.0003, "resy": 0.0003,
+                           "responses": [{"identifier": "default", "format": {"type": "image/tiff"}}]},
+                "evalscript": evalscript
+            }
+
+            response = requests.post(url, json=request_payload, headers=headers, stream=True)
+            if response.status_code != 200:
+                raise RuntimeError(f"DEM request failed ({response.status_code}): {response.text}")
+
+            with open(tile_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+        tile_files.append(tile_path)
+
+    # --- Merge tiles ---
+    src_files_to_mosaic = [rasterio.open(f) for f in tile_files]
+    mosaic, out_trans = merge(src_files_to_mosaic)
+
+    out_meta = src_files_to_mosaic[0].meta.copy()
+    out_meta.update({"height": mosaic.shape[1],
+                     "width": mosaic.shape[2],
+                     "transform": out_trans})
+
+    merged_path = os.path.join(raster_dir, "DEM.tif")
+    with rasterio.open(merged_path, "w", **out_meta) as dest:
+        dest.write(mosaic)
+
+    sys.stderr.write(f"DEM merged and saved to {merged_path}\n")
+    return merged_path
 
 def download(url, name, save_path):
     """Download a file with streaming for large files."""

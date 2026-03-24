@@ -24,8 +24,9 @@ import pandas as pd
 # Working directory where all data will be stored
 wd = "/home/gmor/Nextcloud2/Beegroup/data/hypercadaster_ES"
 
-# Municipality codes to analyze (25023: Alpicat, 25285: Torrefarrera - both in Lleida province)
-cadaster_codes = ["25023", "25285"]
+# Municipality codes to analyze
+# (08900: Barcelona, 25023: Alpicat, 25285: Torrefarrera - last two, both in Lleida province)
+cadaster_codes = ["08900"]
 
 # Download all required data for all municipalities at once
 print("Downloading cadastral and auxiliary data for all municipalities...")
@@ -55,7 +56,7 @@ for i, municipality in enumerate(cadaster_codes, 1):
         elevations_layer=True,          # Include digital elevation model
         open_data_layers=True,          # Include Barcelona open data layers (if applicable)
         building_parts_inference=True,  # ✅ Now allowed: single municipality
-        building_parts_plots=True,      # ✅ Enable plots for single municipality
+        building_parts_plots=False,     # ✅ Enable plots for single municipality
         plot_zones_ratio=0.02,          # Plot 2% of zones for visualization
         use_CAT_files=True,             # Use detailed CAT format files for space analysis
         CAT_files_rel_dir="CAT_files"   # Directory containing CAT files
