@@ -1,6 +1,7 @@
 data
 .claude
 cache
+hypercadaster_ES/__pycache__
 __pycache__
 dist
 build 
@@ -8,3 +9,4 @@ build
 all_directions_barcelona.py
 .idea
 .DS_Store
+*.pyc

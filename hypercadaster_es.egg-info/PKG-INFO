@@ -134,7 +134,25 @@ A comprehensive Python library for downloading, processing, and analyzing Spanis
 
 ## 🚀 Quick Start
 
-### Installation
+
+#### Copernicus Data Space
+1. If you don't have a user in Copernicus Data Space Ecosystem, register in:
+https://identity.dataspace.copernicus.eu/auth/realms/CDSE/login-actions/registration?client_id=account-console&tab_id=I9M6-7Mx3Cw&client_data=eyJydSI6Imh0dHBzOi8vaWRlbnRpdHkuZGF0YXNwYWNlLmNvcGVybmljdXMuZXUvYXV0aC9yZWFsbXMvQ0RTRS9hY2NvdW50LyMvcGVyc29uYWwtaW5mbyIsInJ0IjoiY29kZSIsInJtIjoicXVlcnkiLCJzdCI6ImNlMzljODM2LTRmYTgtNGRhNy05ZTZlLTZkNDkwZGEyMjE3YSJ9
+2. Once you are logged in the portal: Go to Dashboard / SentinelHub, and inside the https://shapps.dataspace.copernicus.eu/dashboard/#/ 
+3. Edit your User settings and add a new OAuth client with client name as: hypercadaster_ES.
+4. We recommend to click on the Never expire button.
+5. Once you create it, you'll be able to see the client ID and the secret. Store them in your system in ~/.dataspaces
+```bash
+nano ~/.dataspaces
+```
+6. The format of the file is the following (The hashes are examples, not real ones):
+```bash
+client:hypercadaster_ES
+clientId:sh-djhf1a5a-9193-4262-b786-b912744ca675
+clientSecret:P85fgGylvSV5y87HU8Z76HiJgZraoegQ
+```
+
+### Library installation
 ```bash
 pip install hypercadaster-ES
 ```

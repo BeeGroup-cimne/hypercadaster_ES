@@ -49,7 +49,7 @@ for i, municipality in enumerate(cadaster_codes, 1):
     # Process single municipality with full inference
     gdf_municipality = hc.merge(
         wd=wd,
-        cadaster_codes=municipality,    # Single municipality
+        cadaster_codes=[municipality],  # Single municipality (as list)
         neighborhood_layer=True,        # Include Barcelona neighborhood data (if applicable)
         postal_code_layer=True,         # Include postal code boundaries
         census_layer=True,              # Include INE census tract data
@@ -59,9 +59,11 @@ for i, municipality in enumerate(cadaster_codes, 1):
         building_parts_plots=False,     # ✅ Enable plots for single municipality
         plot_zones_ratio=0.02,          # Plot 2% of zones for visualization
         use_CAT_files=True,             # Use detailed CAT format files for space analysis
-        CAT_files_rel_dir="CAT_files"   # Directory containing CAT files
+        CAT_files_rel_dir="CAT_files",   # Directory containing CAT files
+        compact_addresses=True
     )
-    
+    hc.utils.plot_building_reference(gdf_municipality,10,output_path="/home/gmor/test.png")
+
     # Add municipality identifier for tracking
     gdf_municipality['processing_municipality'] = municipality
     

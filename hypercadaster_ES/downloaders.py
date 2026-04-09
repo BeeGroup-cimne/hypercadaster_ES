@@ -247,10 +247,7 @@ def download_DEM_raster(raster_dir, bbox, instance="COPERNICUS_30", max_pixels=2
         tile_name = f"{t_bbox[1]:.6f}_{t_bbox[0]:.6f}_{t_bbox[3]:.6f}_{t_bbox[2]:.6f}.tif"
         tile_path = os.path.join(tiles_dir, tile_name)
 
-        if os.path.exists(tile_path):
-            sys.stderr.write(f"Tile {idx+1}/{len(tiles)} already cached: {tile_name}\n")
-        else:
-            sys.stderr.write(f"Downloading tile {idx+1}/{len(tiles)}: {tile_name}\n")
+        if not os.path.exists(tile_path):
             request_payload = {
                 "input": {
                     "bounds": {"properties": {"crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"},

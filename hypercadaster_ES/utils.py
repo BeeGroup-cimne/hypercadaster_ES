@@ -16,6 +16,7 @@ from importlib.resources import files
 # Data processing
 import numpy as np
 import pandas as pd
+import polars as pl
 
 # Geospatial libraries
 import geopandas as gpd
@@ -52,7 +53,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import PathPatch
 from matplotlib.path import Path
 import matplotlib.patches as patches
-
+import contextily as ctx
 
 # ==========================================
 # PARALLEL PROCESSING UTILITIES
@@ -1664,6 +1665,237 @@ def classify_cadaster_floor_names(floor):
         return classify_below_ground_floor_names(floor)
 
 # ==========================================
+# ADDRESS COMPACTION UTILITIES
+# ==========================================
+
+def _create_full_street_names(gdf):
+    """
+    Helper function to create full street name combinations.
+    
+    Creates the following columns if the required components exist:
+    - street_full_label: "{street_type} {street_name}, {street_number_clean_label}"
+    - street_full_clean: "{street_type} {street_name}, {street_number_clean}"
+    """
+    gdf_result = gdf.copy()
+    
+    # Define the combinations to create
+    street_formats = {
+        'street_full_labels': ['street_type', 'street_name', 'street_number_label'],
+        'street_full_clean': ['street_type', 'street_name', 'street_number_clean']
+    }
+    
+    created_cols = []
+    
+    for col_name, required_cols in street_formats.items():
+        # Check if all required columns exist
+        if all(col in gdf_result.columns for col in required_cols):
+            try:
+                # Create the full street name
+                gdf_result[col_name] = (
+                    gdf_result[required_cols[0]].fillna('').astype(str) + ' ' +
+                    gdf_result[required_cols[1]].fillna('').astype(str) + ', ' + 
+                    gdf_result[required_cols[2]].fillna('').astype(str)
+                )
+                # Clean up extra spaces and commas
+                gdf_result[col_name] = gdf_result[col_name].str.replace(r'\s+', ' ', regex=True)
+                gdf_result[col_name] = gdf_result[col_name].str.replace(r',\s*$', '', regex=True)
+                gdf_result[col_name] = gdf_result[col_name].str.strip()
+                
+                created_cols.append(col_name)
+            except Exception:
+                pass  # Silently skip failed column creation
+    
+    return gdf_result
+
+def normalize_street_number(series):
+    """
+    Returns:
+    - label: original string cleaned
+    - clean: ordered numeric representation (e.g. "1-3")
+    """
+
+    def extract_numbers(s):
+        if pd.isna(s):
+            return None, None
+
+        s = str(s).upper().strip()
+
+        # extract all numbers
+        nums = re.findall(r'\d+', s)
+        if not nums:
+            return s, None
+
+        nums = sorted(set(int(n) for n in nums))
+
+        if len(nums) == 1:
+            clean = str(nums[0])
+        else:
+            clean = f"{nums[0]}-{nums[-1]}"
+
+        return s, clean
+
+    labels = []
+    cleans = []
+
+    for val in series:
+        label, clean = extract_numbers(val)
+        labels.append(label)
+        cleans.append(clean)
+
+    return pd.Series(labels), pd.Series(cleans)
+
+def is_valid_value(val):
+    if val is None:
+        return False
+
+    if isinstance(val, float) and pd.isna(val):
+        return False
+
+    if isinstance(val, (list, np.ndarray)):
+        return len(val) > 0
+
+    return True
+
+def compact_addresses(
+    gdf,
+    building_reference_col='building_reference',
+    address_cols=[
+        'street_type', 'street_name', 'street_number_clean', 'street_number_label'
+    ],
+    geolocation_cols=['address_location'],
+    admin_cols=[
+        'district_code', 'district_name', 'postal_code',
+        'neighborhood_code', 'neighborhood_name', 'section_code'
+    ],
+    create_full_street_names=True,
+    use_unique_for_admin=True):
+
+    sys.stderr.write(f"\nCompacting the addresses (Polars optimized)\n")
+
+    if gdf.empty:
+        return gdf
+
+    gdf_work = gdf.copy()
+
+    # --------------------------------------------------
+    # 1️⃣ Street names
+    # --------------------------------------------------
+    if create_full_street_names:
+        gdf_work = _create_full_street_names(gdf_work)
+
+    # --------------------------------------------------
+    # 2️⃣ Geometry split
+    # --------------------------------------------------
+    geometry_cols = [c for c in gdf_work.columns if str(gdf_work[c].dtype) == "geometry"]
+    df_no_geom = pd.DataFrame(gdf_work.drop(columns=geometry_cols))
+    street_full_cols = [c for c in df_no_geom.columns if c.startswith("street_full")]
+
+    # --------------------------------------------------
+    # 3️⃣ Polars columns
+    # --------------------------------------------------
+    cols_to_compact = list(set(address_cols + admin_cols + street_full_cols))
+    cols_to_compact = [c for c in cols_to_compact if c in df_no_geom.columns]
+    pl_df = pl.from_pandas(df_no_geom[cols_to_compact + [building_reference_col]])
+
+    # --------------------------------------------------
+    # 4️⃣ Aggregations
+    # --------------------------------------------------
+    agg_exprs = []
+
+    for col in pl_df.columns:
+
+        if col == building_reference_col:
+            continue
+
+        elif col in address_cols:
+            agg_exprs.append(pl.col(col).drop_nulls().implode().alias(col))
+
+        elif col in admin_cols:
+            if use_unique_for_admin:
+                agg_exprs.append(
+                    pl.col(col)
+                    .drop_nulls()
+                    .unique(maintain_order=True)
+                    .sort()
+                    .alias(col)
+                )
+            else:
+                agg_exprs.append(pl.col(col).drop_nulls().implode().alias(col))
+        elif col.startswith("street_full"):
+            agg_exprs.append(
+                pl.col(col)
+                .drop_nulls()
+                .unique(maintain_order=True)
+                .alias(col)
+            )
+
+    # --------------------------------------------------
+    # 5️⃣ Polars groupby
+    # --------------------------------------------------
+    pl_grouped = pl_df.group_by(building_reference_col).agg(agg_exprs)
+    df_compacted = pl_grouped.to_pandas()
+
+    # Fix numpy arrays → lists
+    for col in df_compacted.columns:
+        df_compacted[col] = df_compacted[col].apply(
+            lambda x: x.tolist() if isinstance(x, np.ndarray) else x
+        )
+
+    # --------------------------------------------------
+    # 6️⃣ Geolocation (list)
+    # --------------------------------------------------
+    if geolocation_cols:
+        geo_df = (
+            gdf_work[[building_reference_col] + geolocation_cols]
+            .groupby(building_reference_col, as_index=False)
+            .agg({col: lambda x: list(x.dropna()) for col in geolocation_cols})
+        )
+
+        df_compacted = df_compacted.drop(columns=geolocation_cols, errors="ignore")
+
+        df_compacted = df_compacted.merge(geo_df, on=building_reference_col, how="left")
+
+    # --------------------------------------------------
+    # 7️⃣ Non-compacted columns (KEEP THEM)
+    # --------------------------------------------------
+    non_compact_cols = [
+        col for col in gdf_work.columns
+        if col not in address_cols
+           and col not in admin_cols
+           and col not in street_full_cols
+           and col not in geolocation_cols
+           and col != building_reference_col
+    ]
+
+    if non_compact_cols:
+        gdf_work = gdf_work.copy()
+        non_compact_df = (
+            gdf_work
+            .sort_values(building_reference_col)
+            [[building_reference_col] + non_compact_cols]
+            .drop_duplicates(subset=[building_reference_col], keep="first")
+        )
+
+        df_compacted = df_compacted.merge(non_compact_df, on=building_reference_col, how="left")
+
+    # --------------------------------------------------
+    # 9️⃣ Drop redundant street cols
+    # --------------------------------------------------
+    if create_full_street_names:
+        df_compacted = df_compacted.drop(columns=[c for c in address_cols if c in df_compacted.columns])
+
+    # --------------------------------------------------
+    # 🔟 GeoDataFrame
+    # --------------------------------------------------
+    df_compacted = gpd.GeoDataFrame(
+        df_compacted,
+        geometry="building_geometry",
+        crs=gdf_work.crs
+    )
+
+    return df_compacted
+
+# ==========================================
 # DATA ANALYSIS & PROCESSING
 # ==========================================
 
@@ -1884,3 +2116,154 @@ def plot_linestrings_and_polygons(linestrings, polygons=None, pdf_file=None):
         print(f"Plot saved to {pdf_file}")
     else:
         plt.show()
+
+def plot_building_reference(
+    gdf,
+    idx=0,
+    address_col="address_location",
+    building_centroid_col="building_centroid",
+    parcel_centroid_col="parcel_centroid",
+    parcel_geom_col="parcel_geometry",
+    building_geom_col="building_geometry",
+    buffer_m=100,
+    output_path=None,
+    dpi=200
+):
+    """
+    Plot parcel, building footprint, centroids and addresses over OSM
+    and save to file.
+
+    Parameters
+    ----------
+    gdf : GeoDataFrame
+    idx : int
+    output_path : str or None
+        If None → auto-generate filename
+    dpi : int
+        Image resolution
+    """
+
+    row = gdf.iloc[idx]
+
+    # --------------------------------------------------
+    # 1️⃣ Collect geometries
+    # --------------------------------------------------
+    geoms = []
+
+    if parcel_geom_col in row and row[parcel_geom_col] is not None:
+        geoms.append(("parcel", row[parcel_geom_col]))
+
+    if building_geom_col in row and row[building_geom_col] is not None:
+        geoms.append(("building", row[building_geom_col]))
+
+    if building_centroid_col in row and row[building_centroid_col] is not None:
+        geoms.append(("building_centroid", row[building_centroid_col]))
+
+    if parcel_centroid_col in row and row[parcel_centroid_col] is not None:
+        geoms.append(("parcel_centroid", row[parcel_centroid_col]))
+
+    if address_col in row and row[address_col] is not None:
+        addr = row[address_col]
+
+        if isinstance(addr, list):
+            for p in addr:
+                if isinstance(p, Point):
+                    geoms.append(("address", p))
+        elif isinstance(addr, Point):
+            geoms.append(("address", addr))
+
+    # --------------------------------------------------
+    # 2️⃣ Build GeoDataFrame
+    # --------------------------------------------------
+    plot_gdf = gpd.GeoDataFrame(
+        [{"type": t, "geometry": g} for t, g in geoms],
+        geometry="geometry",
+        crs=gdf.crs
+    )
+
+    # --------------------------------------------------
+    # 3️⃣ Reproject to Web Mercator
+    # --------------------------------------------------
+    plot_gdf = plot_gdf.to_crs(epsg=3857)
+
+    # --------------------------------------------------
+    # 4️⃣ Plot
+    # --------------------------------------------------
+    fig, ax = plt.subplots(figsize=(10, 10))
+
+    plot_gdf[plot_gdf["type"] == "parcel"].plot(ax=ax, alpha=0.3)
+    plot_gdf[plot_gdf["type"] == "building"].plot(ax=ax, alpha=0.6)
+
+    plot_gdf[plot_gdf["type"] == "building_centroid"].plot(ax=ax, markersize=80)
+    plot_gdf[plot_gdf["type"] == "parcel_centroid"].plot(ax=ax, markersize=80)
+    plot_gdf[plot_gdf["type"] == "address"].plot(ax=ax, markersize=40)
+
+    # --------------------------------------------------
+    # 5️⃣ Extent
+    # --------------------------------------------------
+    bounds = plot_gdf.total_bounds
+    x_min, y_min, x_max, y_max = bounds
+
+    ax.set_xlim(x_min - buffer_m, x_max + buffer_m)
+    ax.set_ylim(y_min - buffer_m, y_max + buffer_m)
+
+    # --------------------------------------------------
+    # 6️⃣ Basemap
+    # --------------------------------------------------
+    ctx.add_basemap(
+        ax,
+        source=ctx.providers.OpenStreetMap.Mapnik,
+        zoom=19
+    )
+
+    ax.set_axis_off()
+
+    title = f"Building: {row["building_reference"]}" if "building_reference" in row else "Building"
+    plt.title(title)
+
+    # --------------------------------------------------
+    # 7️⃣ Output path
+    # --------------------------------------------------
+    if output_path is None:
+        building_ref = row.get("building_reference", f"idx_{idx}")
+        output_path = f"building_{building_ref}.png"
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True) if os.path.dirname(output_path) else None
+
+    # --------------------------------------------------
+    # 8️⃣ Robust extent (FIXED)
+    # --------------------------------------------------
+
+    # Priority: parcel → building → centroid
+    main_geom = None
+
+    if parcel_geom_col in row and row[parcel_geom_col] is not None:
+        main_geom = row[parcel_geom_col]
+    elif building_geom_col in row and row[building_geom_col] is not None:
+        main_geom = row[building_geom_col]
+    elif building_centroid_col in row and row[building_centroid_col] is not None:
+        main_geom = row[building_centroid_col]
+
+    # Fallback
+    if main_geom is None:
+        main_geom = plot_gdf.unary_union
+
+    # Convert to GeoSeries to project
+    main_geom = gpd.GeoSeries([main_geom], crs=gdf.crs).to_crs(epsg=3857).iloc[0]
+
+    # Buffer in meters (correct in EPSG:3857)
+    buffered = main_geom.buffer(buffer_m)
+
+    x_min, y_min, x_max, y_max = buffered.bounds
+
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
+
+    # --------------------------------------------------
+    # 9⃣ Save
+    # --------------------------------------------------
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=dpi)
+    plt.close(fig)
+
+    return output_path

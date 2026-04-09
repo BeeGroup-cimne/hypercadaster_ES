@@ -28,6 +28,273 @@ from hypercadaster_ES import utils
 from hypercadaster_ES import building_inference
 from hypercadaster_ES import downloaders
 
+
+def _extract_street_type_and_name(street_full_name):
+    """
+    Extract street type and name from full street name.
+    
+    Args:
+        street_full_name (str): Full street name (e.g., 'Carrer de Sant Pau')
+        
+    Returns:
+        tuple: (street_type, street_name) or (None, None) if parsing fails
+    """
+    if pd.isna(street_full_name) or not street_full_name:
+        return None, None
+    
+    try:
+        # Use proper Unicode character classes for Spanish/Catalan
+        capital_matches = list(re.finditer(r'\b[A-ZÁÉÍÓÚÑÜ][^\s]*', street_full_name))
+        number_match = re.search(r'\b\d+', street_full_name)
+        
+        cutoff_indices = []
+        if len(capital_matches) >= 2:
+            cutoff_indices.append(capital_matches[1].start())
+        if number_match:
+            cutoff_indices.append(number_match.start())
+            
+        if cutoff_indices:
+            street_type = street_full_name[:min(cutoff_indices)].strip()
+            street_name = street_full_name[len(street_type):].strip()
+            return street_type.upper(), street_name.upper()
+        
+        return None, None
+    except Exception:
+        return None, None
+
+def _process_barcelona_open_data(
+    open_data_layers_dir,
+    parcels_gdf,
+    target_crs
+):
+
+    # ------------------------------------------------------------
+    # LOAD
+    # ------------------------------------------------------------
+    bcn_file_path = f"{open_data_layers_dir}/barcelona_carrerer.gpkg"
+
+    try:
+        bcn = gpd.read_file(bcn_file_path)
+    except Exception as e:
+        sys.stderr.write(f"Warning: Could not load Barcelona data: {e}\n")
+        return gpd.GeoDataFrame()
+
+    if bcn.empty:
+        return gpd.GeoDataFrame()
+
+    # ------------------------------------------------------------
+    # CLEAN + STANDARDIZE
+    # ------------------------------------------------------------
+    if bcn.geometry.iloc[0].geom_type == "MultiPoint":
+        bcn["geometry"] = bcn.geometry.apply(
+            lambda g: g.geoms[0] if hasattr(g, "geoms") and len(g.geoms) else g
+        )
+
+    if bcn.crs != target_crs:
+        bcn = bcn.to_crs(target_crs)
+
+    # stable id
+    bcn = bcn.reset_index(drop=True)
+    bcn["bcn_id"] = bcn.index
+
+    # street parsing
+    street_split = bcn["NOM_CARRER"].str.upper().str.split(" ", n=1, expand=True)
+    bcn["street_type"] = street_split[0]
+    bcn["street_name"] = street_split[1]
+
+    bcn["street_number_label"], bcn["street_number_clean"] = utils.normalize_street_number(
+        bcn["NUMPOST"]
+    )
+
+    # ------------------------------------------------------------
+    # PARCEL PREP
+    # ------------------------------------------------------------
+    parcels = parcels_gdf[["building_reference", "parcel_geometry"]].rename(
+        columns={"building_reference": "parcel_ref"}
+    ).copy()
+
+    parcels = parcels.set_geometry("parcel_geometry")
+
+    if parcels.crs != target_crs:
+        parcels = parcels.to_crs(target_crs)
+
+    # classify parcels
+    parcels["area"] = parcels.area
+
+    # area already computed
+    parcels["is_building"] = (parcels["area"] > 50) & (parcels["area"] < 10000)
+
+    def count_holes(geom):
+        if geom.geom_type == "Polygon":
+            return len(geom.interiors)
+        elif geom.geom_type == "MultiPolygon":
+            return sum(len(p.interiors) for p in geom.geoms)
+        return 0
+
+    parcels["holes"] = parcels["parcel_geometry"].apply(count_holes)
+
+    parcels["is_container"] = (parcels["area"] > 10000) & (parcels["holes"] > 5)
+
+    building_parcels = parcels[parcels["is_building"]]
+    other_parcels = parcels[~parcels["is_building"] & ~parcels["is_container"]]
+    container_parcels = parcels[parcels["is_container"]]
+
+    # ------------------------------------------------------------
+    # HELPER: ASSIGN FUNCTION
+    # ------------------------------------------------------------
+    def assign_by_join(points, candidate_parcels, predicate, priority, buffer=None, max_distance=None):
+        if points.empty or candidate_parcels.empty:
+            return pd.DataFrame(columns=["bcn_id", "parcel_ref", "priority", "area", "distance"])
+
+        parcels_ = candidate_parcels.copy()
+
+        if buffer is not None:
+            parcels_["parcel_geometry"] = parcels_.buffer(buffer)
+
+        join = gpd.sjoin(
+            points,
+            parcels_.set_geometry("parcel_geometry"),
+            how="inner",
+            predicate=predicate
+        )
+
+        if join.empty:
+            return pd.DataFrame(columns=["bcn_id", "parcel_ref", "priority", "area", "distance"])
+
+        join["priority"] = priority
+        join["distance"] = 0.0
+
+        return join[["bcn_id", "parcel_ref", "priority", "area", "distance"]]
+
+    def assign_nearest(points, candidate_parcels, priority, max_distance=20):
+        if points.empty or candidate_parcels.empty:
+            return pd.DataFrame(columns=["bcn_id", "parcel_ref", "priority", "area", "distance"])
+
+        join = gpd.sjoin_nearest(
+            points,
+            candidate_parcels.set_geometry("parcel_geometry"),
+            how="inner",
+            distance_col="distance",
+            max_distance=max_distance
+        )
+
+        if join.empty:
+            return pd.DataFrame(columns=["bcn_id", "parcel_ref", "priority", "area", "distance"])
+
+        join["priority"] = priority
+
+        return join[["bcn_id", "parcel_ref", "priority", "area", "distance"]]
+
+    # ------------------------------------------------------------
+    # BUILD CANDIDATES
+    # ------------------------------------------------------------
+    candidates = []
+
+    # 1. building parcels (strict)
+    candidates.append(assign_by_join(bcn, building_parcels, "intersects", priority=1))
+
+    # 2. other parcels
+    candidates.append(assign_by_join(bcn, other_parcels, "intersects", priority=2))
+
+    # 3. buffered buildings
+    candidates.append(assign_by_join(bcn, building_parcels, "intersects", priority=3, buffer=1.5))
+
+    # 4. containers
+    candidates.append(assign_by_join(bcn, container_parcels, "intersects", priority=4))
+
+    # 5. nearest fallback
+    candidates.append(assign_nearest(bcn, building_parcels if not building_parcels.empty else parcels, priority=5))
+
+    candidates = pd.concat(candidates, ignore_index=True)
+
+    if candidates.empty:
+        return gpd.GeoDataFrame()
+
+    # ------------------------------------------------------------
+    # BEST MATCH SELECTION (CRITICAL)
+    # ------------------------------------------------------------
+    candidates = candidates.sort_values(
+        ["bcn_id", "priority", "area", "distance"],
+        ascending=[True, True, True, True]
+    )
+
+    best = candidates.drop_duplicates(subset=["bcn_id"])
+
+    # ------------------------------------------------------------
+    # MERGE BACK SAFELY
+    # ------------------------------------------------------------
+    bcn = bcn.merge(best[["bcn_id", "parcel_ref"]], on="bcn_id", how="left")
+
+    # ------------------------------------------------------------
+    # FINAL FORMAT
+    # ------------------------------------------------------------
+    bcn["building_reference"] = bcn["parcel_ref"]
+    bcn["location"] = bcn.geometry
+    bcn["specification"] = "OpenDataBCN"
+    bcn["cadaster_code"] = "08900"
+
+    valid = (
+        bcn["building_reference"].notna()
+        & bcn["street_name"].notna()
+        & bcn["street_type"].notna()
+    )
+
+    return gpd.GeoDataFrame(
+        bcn.loc[valid, [
+            "location",
+            "specification",
+            "cadaster_code",
+            "street_type",
+            "street_name",
+            "street_number_label",
+            "street_number_clean",
+            "building_reference"
+        ]],
+        geometry="location",
+        crs=target_crs
+    )
+
+
+def process_open_data_addresses(open_data_layers_dir, cadaster_codes, parcels_gdf, target_crs):
+    """
+    Process addresses from municipal open data sources using improved parcel-based assignment.
+    
+    This function currently supports Barcelona but is designed to be extensible
+    for other municipalities with open data address databases.
+    
+    Uses different strategies based on parcel geometry:
+    - Parcels with holes: Exact containment only (prevents wrong assignment to outer parcel)
+    - Simple parcels: 1.5m buffered approach for better address matching
+    
+    Args:
+        open_data_layers_dir (str): Directory containing open data files
+        cadaster_codes (list): List of cadastral codes to process
+        parcels_gdf (GeoDataFrame): Parcel geometries for spatial joining  
+        target_crs: Target coordinate reference system
+        
+    Returns:
+        GeoDataFrame: Combined addresses from all available open data sources
+    """
+    combined_addresses = []
+    
+    # Barcelona (cadaster code 08900)
+    if "08900" in cadaster_codes:
+        bcn_addresses = _process_barcelona_open_data(open_data_layers_dir, parcels_gdf, target_crs)
+        if not bcn_addresses.empty:
+            combined_addresses.append(bcn_addresses)
+    
+    # Future municipalities can be added here:
+    # if "XXXXX" in cadaster_codes:
+    #     other_addresses = _process_other_municipality_data(...)
+    #     if not other_addresses.empty:
+    #         combined_addresses.append(other_addresses)
+    
+    if combined_addresses:
+        result = pd.concat(combined_addresses, ignore_index=True)
+        return gpd.GeoDataFrame(result, geometry='location', crs=target_crs)
+    else:
+        return gpd.GeoDataFrame()
+
 def get_cadaster_address(cadaster_dir, cadaster_codes, directions_from_CAT_files=True, CAT_files_dir="CAT_files",
                          directions_from_open_data=True, open_data_layers_dir="open_data"):
     sys.stderr.write(f"\nReading the cadaster addresses for {len(cadaster_codes)} municipalities\n")
@@ -71,7 +338,9 @@ def get_cadaster_address(cadaster_dir, cadaster_codes, directions_from_CAT_files
     gdf.rename(columns={'geometry': 'location', 'text': 'street_name', 'designator': 'street_number'}, inplace=True)
     gdf["street_type"] = gdf["street_name"].apply(lambda x: x.split(" ")[0])
     gdf["street_name"] = gdf["street_name"].apply(lambda x: ' '.join(x.split(" ")[1:]))
-    gdf['street_number_clean'] = gdf['street_number'].str.extract(r'(\d+(?=.*))').fillna(0).astype(int)
+    gdf["street_number_label"], gdf["street_number_clean"] = utils.normalize_street_number(
+        gdf["street_number"]
+    )
     # gdf = gdf[gdf['specification'] == "Entrance"]
     gdf["building_reference"] = gdf['localId'].apply(lambda x: x.split('.')[-1])
 
@@ -79,6 +348,7 @@ def get_cadaster_address(cadaster_dir, cadaster_codes, directions_from_CAT_files
         ["gml_id", "namespace", "localId", "beginLifespanVersion", "validFrom", "level", "type", "method", "default"],
         inplace=True, axis=1)
     gdf = gdf.set_geometry("location")
+    gdf = gdf.drop(columns=["street_number"], errors="ignore")
     _, parcels_gdf = join_cadaster_parcel(gdf, cadaster_dir, cadaster_codes, how="left")
 
     if directions_from_CAT_files:
@@ -93,7 +363,9 @@ def get_cadaster_address(cadaster_dir, cadaster_codes, directions_from_CAT_files
                 buildings_CAT[["building_reference", "street_type", "street_name", "street_number2"]].rename(
                     {"street_number2": "street_number"}).filter(pl.col("street_number") != "")], how="vertical")
             ).to_pandas()
-            addresses_CAT_['street_number_clean'] = addresses_CAT_['street_number'].str.extract(r'(\d+(?=.*))').fillna(0).astype(int)
+            addresses_CAT_["street_number_label"], addresses_CAT_["street_number_clean"] = utils.normalize_street_number(
+                addresses_CAT_["street_number"]
+            )
             addresses_CAT = pd.concat([addresses_CAT, addresses_CAT_], ignore_index=True)
             addresses_CAT['cadaster_code'] = code
 
@@ -130,92 +402,15 @@ def get_cadaster_address(cadaster_dir, cadaster_codes, directions_from_CAT_files
         gdf = pd.concat([gdf, addresses_CAT], ignore_index=True)
         gdf = gdf.drop_duplicates(subset=["street_name", "street_number", "street_type", "cadaster_code"], keep="first", ignore_index=True)
 
-    if directions_from_open_data and "08900" in cadaster_codes:
-        bcn_open_data_streets = gpd.read_file(f"{open_data_layers_dir}/barcelona_carrerer.gpkg")
-        def extract_up_to_second_capital_or_number(text):
-            # Find all positions of capitalized words
-            capital_matches = list(re.finditer(r'\b\p{Lu}[^\s]*', text))
-            # Find all positions of numbers
-            number_match = re.search(r'\b\d+', text)
-            # Determine cut-off point: min of second capital or first number
-            cutoff_indices = []
-            if len(capital_matches) >= 2:
-                cutoff_indices.append(capital_matches[1].start())
-            if number_match:
-                cutoff_indices.append(number_match.start())
-            if cutoff_indices:
-                return text[:min(cutoff_indices)]
-            return None
-        bcn_open_data_streets['street_type'] = bcn_open_data_streets['NOM_CARRER'].apply(
-            extract_up_to_second_capital_or_number)
-        bcn_open_data_streets['street_name'] = bcn_open_data_streets.apply(
-            lambda row: row['NOM_CARRER'][len(row['street_type']):].strip() if pd.notnull(row['street_type']) else None,
-            axis=1
+    if directions_from_open_data:
+        open_data_addresses = process_open_data_addresses(
+            open_data_layers_dir, cadaster_codes, parcels_gdf, gdf.crs
         )
-        bcn_open_data_streets['street_type'] = bcn_open_data_streets['street_type'].str.upper()
-        bcn_open_data_streets['street_name'] = bcn_open_data_streets['street_name'].str.upper()
-
-        # Step 1: Ensure CRS matches
-        if bcn_open_data_streets.crs != parcels_gdf.crs:
-            bcn_open_data_streets = bcn_open_data_streets.to_crs(parcels_gdf.crs)
-
-        # Step 2: Spatial join - points inside parcels
-        bcn_open_data_streets = gpd.sjoin(
-            bcn_open_data_streets, parcels_gdf[['building_reference', 'parcel_geometry']],
-            how="left", predicate="within"
-        )
-
-        # Step 3: Find unmatched (not inside any parcel)
-        unmatched = bcn_open_data_streets[bcn_open_data_streets['building_reference'].isna()].copy()
-
-        if not unmatched.empty:
-            # Create a spatial index for parcels
-            parcels_gdf = parcels_gdf.set_geometry('parcel_geometry')
-            parcel_sindex = parcels_gdf.sindex
-
-            # Function to find closest parcel geometry
-            def find_closest_parcel(point):
-                # Ensure input is a Shapely Point
-                nearest_idx = list(parcel_sindex.nearest(point, 1))
-                closest_geom = parcels_gdf.iloc[nearest_idx[0]]
-                return closest_geom['building_reference']
-
-            # Apply to unmatched geometries
-            unmatched['building_reference'] = unmatched['geometry'].apply(find_closest_parcel)
-
-            # Step 4: Merge results back
-            bcn_open_data_streets.update(unmatched)
-
-        bcn_open_data_streets["location"] = bcn_open_data_streets.geometry.centroid
-        bcn_open_data_streets["specification"] = "OpenDataBCN"
-        bcn_open_data_streets["cadaster_code"] = "08900"
-        bcn_open_data_streets["street_number"] = pd.to_numeric(bcn_open_data_streets["NUMPOST"],
-                                                                     errors='coerce').astype(str)
-        bcn_open_data_streets["street_number_clean"] = pd.to_numeric(bcn_open_data_streets["NUMPOST"],
-                                                                     errors='coerce').astype('Int64')
-
-        aggregated = (
-            bcn_open_data_streets.groupby('geometry')['street_number_clean']
-            .agg(['min', 'max'])
-            .reset_index()
-        )
-
-        aggregated['street_number_clean_label'] = aggregated.apply(
-            lambda row: str(int(row['min'])) if row['min'] == row['max']
-            else f"{int(row['min'])}-{int(row['max'])}",
-            axis=1
-        )
-
-        bcn_open_data_streets = bcn_open_data_streets.merge(aggregated[['geometry', 'street_number_clean_label']],
-                                                            on='geometry', how='left')
-        bcn_open_data_streets["street_number_odbcn_label"] = bcn_open_data_streets["ETIQUETA"]
-
-        bcn_open_data_streets = bcn_open_data_streets[
-            ['location', 'specification', 'cadaster_code', 'street_type', 'street_name', 'street_number_clean_label',
-             'street_number_odbcn_label', 'street_number', 'street_number_clean', 'building_reference']]
-
-        gdf = gdf[gdf["cadaster_code"]!="08900"]
-        gdf = pd.concat([gdf, bcn_open_data_streets])
+        if not open_data_addresses.empty:
+            # Deprecate the addresses from Cadaster when they are already available from a Municipal dataset
+            # (normally more accurate).
+            gdf = gdf[~gdf["cadaster_code"].isin(open_data_addresses["cadaster_code"].unique())]
+            gdf = pd.concat([gdf, open_data_addresses], ignore_index=True)
 
     return gdf
 
@@ -445,22 +640,109 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_
                 parcels_gdf=parcels_gdf, results_dir=results_dir, cadaster_dir=cadaster_dir,
                 open_street_dir=open_street_dir, plots=building_parts_plots, plot_zones_ratio=plot_zones_ratio)
 
-            # Join Building geodataframe with
-            building_gdf_ = (building_gdf_[['gml_id', 'building_status', 'building_reference', 'building_use',
-                                          'building_geometry','year_of_construction', 'zone_reference', 'zone_type']].
-                            merge(building_part_gdf_[1], left_on="building_reference",
-                                  right_on="building_reference", how="left"))
+            # Unpack the results: (sbr_results, br_results)
+            sbr_results, br_results = building_part_gdf_
 
-            if "building_part_gdf" in locals():
-                building_part_gdf = pd.concat([building_part_gdf, building_part_gdf_[1]], ignore_index=True)
+            # Check if results are valid
+            if br_results is not None and len(br_results) > 0:
+                # Join Building geodataframe with br_results
+                building_gdf_ = (building_gdf_[['gml_id', 'building_status', 'building_reference', 'building_use',
+                                              'building_geometry','year_of_construction', 'zone_reference', 'zone_type']].
+                                merge(br_results, left_on="building_reference",
+                                      right_on="building_reference", how="left"))
+
+                # Also merge SBR results directly (they already have sbr__ column prefixes)
+                if sbr_results is not None and len(sbr_results) > 0:
+
+                    sbr_cols = [col for col in sbr_results.columns if col.startswith("sbr__")]
+
+                    # ------------------------------------------------------------
+                    # 1️⃣ Count SBR per building
+                    # ------------------------------------------------------------
+                    sbr_counts = (
+                        sbr_results.groupby("building_reference")["single_building_reference"]
+                        .nunique()
+                        .rename("n_sbr")
+                        .reset_index()
+                    )
+
+                    sbr_results = sbr_results.merge(sbr_counts, on="building_reference", how="left")
+
+                    # ------------------------------------------------------------
+                    # 2️⃣ MULTI SBR → dict
+                    # ------------------------------------------------------------
+                    multi_sbr = sbr_results[sbr_results["n_sbr"] > 1].copy()
+
+                    if not multi_sbr.empty:
+
+                        def aggregate_sbr(group):
+                            result = {}
+
+                            for col in sbr_cols:
+                                result_col = {}
+
+                                for _, row in group.iterrows():
+                                    val = row[col]
+
+                                    if utils.is_valid_value(val):
+                                        sbr_id = row["single_building_reference"]
+                                        result_col[sbr_id] = val
+
+                                result[col] = result_col if result_col else None
+
+                            return pd.Series(result)
+
+                        sbr_multi = (
+                            multi_sbr
+                            .groupby("building_reference")
+                            .apply(aggregate_sbr, include_groups=False)
+                            .reset_index()
+                        )
+
+                    else:
+                        sbr_multi = pd.DataFrame(columns=["building_reference"] + sbr_cols)
+
+                    # ------------------------------------------------------------
+                    # 3️⃣ SINGLE SBR → force None
+                    # ------------------------------------------------------------
+                    single_refs = sbr_results.loc[sbr_results["n_sbr"] == 1, "building_reference"].unique()
+
+                    if len(single_refs) > 0:
+                        sbr_single = pd.DataFrame({
+                            "building_reference": single_refs
+                        })
+
+                        for col in sbr_cols:
+                            sbr_single[col] = None
+                    else:
+                        sbr_single = pd.DataFrame(columns=["building_reference"] + sbr_cols)
+
+                    # ------------------------------------------------------------
+                    # 4️⃣ Combine
+                    # ------------------------------------------------------------
+                    sbr_final = pd.concat([sbr_multi, sbr_single], ignore_index=True)
+
+                    # ------------------------------------------------------------
+                    # 5️⃣ Merge into building_gdf_
+                    # ------------------------------------------------------------
+                    building_gdf_ = building_gdf_.merge(
+                        sbr_final,
+                        on="building_reference",
+                        how="left"
+                    )
+
+                if "building_part_gdf" in locals():
+                    building_part_gdf = pd.concat([building_part_gdf, br_results], ignore_index=True)
+                else:
+                    building_part_gdf = br_results
             else:
-                building_part_gdf = building_part_gdf_[1]
+                sys.stderr.write("Warning: Building parts inference returned no results\n")
 
-        elif buildings_CAT is not None:
+        if buildings_CAT is not None:
             #['n_building_units', 'n_dwellings', 'n_floors_above_ground', 'building_area']
-
-            building_gdf_ = building_gdf_[['gml_id', 'building_status', 'building_reference', 'building_use',
-                                         'building_geometry', 'year_of_construction', 'zone_reference', 'zone_type']]
+            if not building_parts_inference:
+                building_gdf_ = building_gdf_[['gml_id', 'building_status', 'building_reference', 'building_use',
+                                             'building_geometry', 'year_of_construction', 'zone_reference', 'zone_type']]
 
             use_types = buildings_CAT["building_space_inferred_use_type"].unique().to_list()
 
@@ -529,10 +811,12 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_
             final_df = summary.join(area_pivot, on="building_reference", how="left").to_pandas()
             building_gdf_ = pd.merge(building_gdf_, final_df, on="building_reference", how="left")
 
-        else:
+        elif not building_parts_inference:
+            # Only strip to basic columns when building_parts_inference is explicitly False
             building_gdf_ = building_gdf_[['gml_id', 'building_status', 'building_reference', 'building_use',
                                          'building_geometry', 'year_of_construction', 'n_building_units', 'n_dwellings',
                                          'n_floors_above_ground', 'building_area', 'zone_reference', 'zone_type']]
+        # When building_parts_inference=True but buildings_CAT=None, keep all columns (including br__ and sbr_data)
 
         # Include it in the general building_gdf_
         if "building_gdf" in locals():

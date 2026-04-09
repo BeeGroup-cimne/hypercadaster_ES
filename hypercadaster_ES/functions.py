@@ -67,7 +67,7 @@ def download(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
     # Download the cadaster datasets of that area
     downloaders.cadaster_downloader(cadaster_dir=utils.cadaster_dir_(wd), cadaster_codes=cadaster_codes)
     # Districts and neighborhoods definition are only available for the city of Barcelona
-    if '08019' in ine_codes and neighborhood_layer:
+    if '08019' in ine_codes or '08900' in cadaster_codes and neighborhood_layer:
         downloaders.download_file(dir=utils.districts_dir_(wd),
                                   url="https://opendata-ajuntament.barcelona.cat/data/dataset/808daafa-d9ce-48c0-"
                                       "925a-fa5afdb1ed41/resource/576bc645-9481-4bc4-b8bf-f5972c20df3f/download",
@@ -76,20 +76,24 @@ def download(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
                                   url="https://opendata-ajuntament.barcelona.cat/data/dataset/808daafa-d9ce-48c0-"
                                       "925a-fa5afdb1ed41/resource/b21fa550-56ea-4f4c-9adc-b8009381896e/download",
                                   file="neighbourhoods.csv")
+
     # Postal codes
     if postal_code_layer or elevation_layer:
         downloaders.download_postal_codes(postal_codes_dir=utils.postal_codes_dir_(wd), province_codes=province_codes)
+
     # Digital Elevation Model layer
     if elevation_layer:
         postal_codes_gdf = gpd.read_file(f"{utils.postal_codes_dir_(wd)}/postal_codes.geojson")
         postal_codes_gdf = gpd.GeoDataFrame(postal_codes_gdf, geometry='geometry', crs='EPSG:4326')
         bbox_postal_code = utils.get_bbox(gdf = postal_codes_gdf)
         downloaders.download_DEM_raster(raster_dir=utils.DEM_raster_dir_(wd), bbox=bbox_postal_code)
+
     # Census tracts and districts
     if census_layer:
         downloaders.download_census_tracts(census_tracts_dir=utils.census_tracts_dir_(wd), year=2022)
+
     # OpenDataBarcelona
-    if '08019' in ine_codes and open_data_layers:
+    if '08019' in ine_codes or '08900' in cadaster_codes and open_data_layers:
         downloaders.download_file(dir=utils.open_data_dir_(wd),
                                   url="https://opendata-ajuntament.barcelona.cat/data/dataset/3dc277bf-ff89-4b49-8f"
                                       "29-48a1122bb813/resource/2e123ea9-1819-46cf-a545-be61151fa97d/download",
@@ -115,7 +119,41 @@ def download(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
 def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
           neighborhood_layer=True, postal_code_layer=True, census_layer=True, elevations_layer=True,
           open_data_layers=True, building_parts_inference=False, building_parts_plots=False,
-          plot_zones_ratio=0.01, use_CAT_files=False, CAT_files_rel_dir="CAT_files"):
+          plot_zones_ratio=0.01, use_CAT_files=False, CAT_files_rel_dir="CAT_files",
+          compact_addresses=False):
+    """
+    Merge cadastral and geographic data into a unified GeoDataFrame.
+    
+    Parameters:
+    -----------
+    compact_addresses : bool, default False
+        If True, compacts address data so that each building_reference appears only once
+        with address and geolocation information stored as lists. This reduces the number
+        of rows in the output when buildings have multiple addresses.
+        
+        Example transformation:
+        Before: 2 rows per building (one per address)
+        After:  1 row per building with address lists
+        
+    create_full_street_names : bool, default True
+        When compact_addresses=True, whether to create full street name combinations.
+        Creates columns like:
+        - street_full_odbcn_labels: "CARRER GRAN VIA, 123a"
+        - street_full_labels: "CARRER GRAN VIA, 123-A"  
+        - street_full_clean: "CARRER GRAN VIA, 123"
+        - street_full: "CARRER GRAN VIA, 123"
+        
+    use_unique_for_admin : bool, default True
+        When compact_addresses=True, whether to use unique values for administrative
+        areas (districts, neighborhoods, postal codes) instead of creating lists.
+        This prevents duplication when all addresses for a building are in the same area.
+        
+    Returns:
+    --------
+    GeoDataFrame
+        Merged cadastral data. If compact_addresses=True, address columns will be 
+        converted to lists (e.g., 'street_name' → 'street_names')
+    """
 
     # Convert inputs to list format
     if province_codes is not None:
@@ -172,6 +210,7 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
         open_data_layers_dir=utils.open_data_dir_(wd),
         CAT_files_dir=f"{wd}/{CAT_files_rel_dir}"
     )
+    crs = gdf.crs
 
     if census_layer:
         gdf = mergers.join_by_census_tracts(
@@ -198,6 +237,20 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
 
     subset = [c for c in gdf.columns if c not in cols_with_dicts + ['geometry']]
     gdf = gdf.drop_duplicates(subset=subset, keep='first')
+    
+    # Apply address compaction if requested
+    if compact_addresses:
+        # Check if there are multiple rows per building_reference (indicating addresses to compact)
+        if 'building_reference' in gdf.columns:
+            building_counts = gdf['building_reference'].value_counts()
+            buildings_with_multiple_addresses = building_counts[building_counts > 1]
+            if len(buildings_with_multiple_addresses) > 0:
+                # Apply compaction
+                gdf = utils.compact_addresses(
+                    gdf,
+                    building_reference_col='building_reference'
+                )
+
 
     return gdf
 
