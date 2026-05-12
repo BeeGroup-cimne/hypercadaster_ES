@@ -53,12 +53,15 @@ Processes and merges all downloaded data into unified GeoDataFrame.
 - `building_parts_plots` (bool): Generate visualization plots
 - `use_CAT_files` (bool): Use detailed CAT format files
 - `CAT_files_rel_dir` (str): CAT files directory path
+- `pois_layer` (bool): Fetch POIs from OpenStreetMap and join proximity indicators (default `False`)
+- `compact_addresses` (bool): Collapse multiple address rows per building into lists (default `False`)
 
 **Features:**
 - Optional advanced building inference and analysis
 - Configurable output complexity and detail level
 - Duplicate removal and data quality assurance
 - Memory-efficient processing options
+- POI proximity analysis with caching for OpenStreetMap data
 
 ## 🔗 mergers.py - Data Integration Engine
 
@@ -125,6 +128,32 @@ Spanish postal code boundary and routing information:
 - Postal delivery areas
 - Address validation
 - Geographic routing context
+
+### POI Integration
+
+#### `join_pois(gdf, open_street_dir, cadaster_dir, cadaster_codes)`
+Joins Points of Interest (POI) indicators from OpenStreetMap to each building. Called automatically when `pois_layer=True` is passed to `merge()`.
+
+**Process:**
+1. For each cadaster code, fetches POIs via `utils.get_pois_open_street_maps()` with a 200 m boundary buffer.
+2. Organises POIs by group and subgroup (e.g. `amenity / food`, `shop / clothing`).
+3. Adds **direct assignment** columns: how many POIs of each category are located on the building itself.
+4. Adds **proximity count** columns: how many POIs of each category fall within 100 m, 250 m, and 500 m of the building centroid (using a metric CRS for accurate buffering).
+5. Results across multiple municipalities are concatenated before joining, so multi-municipality calls produce a single consistent dataset.
+
+**Output columns per POI group/subgroup** (where `{prefix}` = `poi_{group}` or `poi_{group}_{subgroup}`):
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `{prefix}_count` | Integer | POIs directly assigned to the building |
+| `{prefix}_ids` | List | OSM identifiers of those POIs |
+| `{prefix}_100m` | Integer | POI count within 100 m |
+| `{prefix}_250m` | Integer | POI count within 250 m |
+| `{prefix}_500m` | Integer | POI count within 500 m |
+
+**Groups covered:** `amenity`, `emergency`, `healthcare`, `leisure`, `office`, `shop`, `tourism`
+
+**Caching:** raw OSM query results are cached as GeoPackage files under `open_street/POIS_{municipality}/` so subsequent runs skip the network requests.
 
 ### Utility Functions
 

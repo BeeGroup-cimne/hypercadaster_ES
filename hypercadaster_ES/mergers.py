@@ -14,6 +14,8 @@ Main functions:
 """
 
 import sys
+import os
+import glob
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -302,7 +304,7 @@ def get_cadaster_address(cadaster_dir, cadaster_codes, directions_from_CAT_files
     address_gdf = gpd.GeoDataFrame()
     address_street_names_df = gpd.GeoDataFrame()
 
-    for code in tqdm(cadaster_codes, desc="Iterating by cadaster codes..."):
+    for code in tqdm(cadaster_codes, desc="Iterating by cadaster codes...") if len(cadaster_codes)>1 else cadaster_codes:
         # sys.stderr.write("\r" + " " * 60)
         # sys.stderr.flush()
         # sys.stderr.write(f"\r\tCadaster code: {code}")
@@ -529,14 +531,15 @@ def assign_building_zones(gdf, cadaster_dir, cadaster_codes):
     return gdf
 
 
-def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_street_dir, building_parts_plots=False,
+def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
+                           cadaster_codes, results_dir, open_street_dir, building_parts_plots=False,
                            plot_zones_ratio=0.01, building_parts_inference=False,
                            building_parts_inference_using_CAT_files=False, open_data_layers=False,
                            open_data_layers_dir=None, CAT_files_dir=None):
 
     sys.stderr.write(f"\nJoining the buildings description for {len(cadaster_codes)} municipalities\n")
 
-    for code in tqdm(cadaster_codes, desc="Iterating by cadaster codes..."):
+    for code in tqdm(cadaster_codes, desc="Iterating by cadaster codes...") if len(cadaster_codes)>1 else cadaster_codes:
         # sys.stderr.write("\r" + " " * 60)
         # sys.stderr.flush()
         # sys.stderr.write(f"\r\tCadaster code: {code}")
@@ -579,66 +582,184 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_
 
         if building_parts_inference:
 
-            building_part_gdf_ = gpd.read_file(f"{cadaster_dir}/buildings/unzip/A.ES.SDGC.BU.{code}.buildingpart.gml",
-                                          layer="BuildingPart")
+            building_part_gdf_ = gpd.read_file(
+                f"{cadaster_dir}/buildings/unzip/A.ES.SDGC.BU.{code}.buildingpart.gml",
+                layer="BuildingPart"
+            )
 
+            nearby_buildings_buffer = 80
+
+            # ------------------------------------------------------------
+            # 1️⃣ Get neighboring municipalities (ONLY THESE)
+            # ------------------------------------------------------------
+            nearby_cadaster_codes = utils.get_neighboring_cadaster_codes(
+                cadaster_codes,
+                census_tracts_dir,
+                buffer_distance=nearby_buildings_buffer
+            )
+
+            # ------------------------------------------------------------
+            # 2️⃣ Prepare spatial filter area
+            # ------------------------------------------------------------
+            from shapely.geometry import box
+
+            current_bounds = building_part_gdf_.total_bounds
+            current_area = box(*current_bounds).buffer(nearby_buildings_buffer)
+
+            # ------------------------------------------------------------
+            # 3️⃣ Load ONLY neighboring building parts
+            # ------------------------------------------------------------
+            nearby_building_parts = []
+
+            for neighbor_code in nearby_cadaster_codes:
+
+                file_path = f"{cadaster_dir}/buildings/unzip/A.ES.SDGC.BU.{neighbor_code}.buildingpart.gml"
+
+                if not os.path.exists(file_path):
+                    continue
+
+                try:
+                    neighbor_parts = gpd.read_file(file_path, layer="BuildingPart")
+
+                    if neighbor_parts.empty:
+                        continue
+
+                    # Ensure CRS consistency
+                    if neighbor_parts.crs != building_part_gdf_.crs:
+                        neighbor_parts = neighbor_parts.to_crs(building_part_gdf_.crs)
+
+                    # Spatial filter
+                    neighbor_parts_intersect = neighbor_parts[
+                        neighbor_parts.geometry.intersects(current_area)
+                    ]
+
+                    if not neighbor_parts_intersect.empty:
+                        neighbor_parts_intersect = neighbor_parts_intersect.copy()
+                        neighbor_parts_intersect["nearby_buildings"] = True
+                        nearby_building_parts.append(neighbor_parts_intersect)
+
+                except Exception as e:
+                    print(f"[WARN] nearby_buildings error for {neighbor_code}: {e}")
+
+            # ------------------------------------------------------------
+            # 4️⃣ Merge with original building parts
+            # ------------------------------------------------------------
+            building_part_gdf_["nearby_buildings"] = False
+
+            if nearby_building_parts:
+                building_part_gdf_ = pd.concat(
+                    [building_part_gdf_] + nearby_building_parts,
+                    ignore_index=True
+                )
+
+            # ------------------------------------------------------------
+            # 5️⃣ Continue original pipeline
+            # ------------------------------------------------------------
             sys.stderr.write("\r" + " " * 60)
+
             building_part_gdf_.rename(columns={
                 'geometry': 'building_part_geometry',
                 'numberOfFloorsAboveGround': 'n_floors_above_ground',
                 'numberOfFloorsBelowGround': 'n_floors_below_ground',
                 'localId': 'building_reference'
             }, inplace=True)
-            building_part_gdf_['building_reference'] = building_part_gdf_['building_reference'].str.split("_").str[0]
+
+            building_part_gdf_['building_reference'] = (
+                building_part_gdf_['building_reference'].str.split("_").str[0]
+            )
+
             building_part_gdf_.drop(
                 ['gml_id', 'beginLifespanVersion', 'conditionOfConstruction',
                  'namespace', 'horizontalGeometryEstimatedAccuracy',
                  'horizontalGeometryEstimatedAccuracy_uom',
-                 'horizontalGeometryReference', 'referenceGeometry', 'heightBelowGround',
-                 'heightBelowGround_uom'],
-                inplace=True, axis=1)
+                 'horizontalGeometryReference', 'referenceGeometry',
+                 'heightBelowGround', 'heightBelowGround_uom'],
+                inplace=True, axis=1
+            )
 
             if gdf is not None:
                 gdf_unique = gdf.drop_duplicates(subset='building_reference')
-                building_part_gdf_ = building_part_gdf_.join(gdf_unique.set_index('building_reference'),
-                                                           on="building_reference", how="left")
-            
+                building_part_gdf_ = building_part_gdf_.join(
+                    gdf_unique.set_index('building_reference'),
+                    on="building_reference",
+                    how="left"
+                )
+
             # Ensure zone columns exist
-            if "zone_type" not in building_part_gdf_.columns:
-                building_part_gdf_["zone_type"] = "unknown"
-            if "zone_reference" not in building_part_gdf_.columns:
-                building_part_gdf_["zone_reference"] = "unknown"
-                
-            # Fill missing values
-            building_part_gdf_.loc[building_part_gdf_["zone_type"].isna(), "zone_type"] = "unknown"
-            building_part_gdf_.loc[building_part_gdf_["zone_reference"].isna(), "zone_reference"] = "unknown"
-            # building_part_gdf_.drop(columns=["building_part_geometry"]).set_geometry("location").to_file("test.gpkg")
+            building_part_gdf_["zone_type"] = building_part_gdf_.get("zone_type", "unknown")
+            building_part_gdf_["zone_reference"] = building_part_gdf_.get("zone_reference", "unknown")
 
-            # building_part_gdf_ = building_part_gdf_.merge(building_gdf_[['building_reference','building_status']])
+            building_part_gdf_.loc[
+                building_part_gdf_["zone_type"].isna(), "zone_type"
+            ] = "unknown"
 
-            # In case of Barcelona municipality analysis, use commercial establishments and ground premises datasets
-            if code=="08900" and open_data_layers:
-                # establishments = pd.read_csv(
-                #     filepath_or_buffer=f"{open_data_layers_dir}/barcelona_establishments.csv",
-                #     encoding=from_path(f"{open_data_layers_dir}/barcelona_establishments.csv").best().encoding,
-                #     on_bad_lines='skip',
-                #     sep=",")
-                ground_premises = downloaders.load_and_transform_barcelona_ground_premises(open_data_layers_dir)
-                building_part_gdf_ = building_part_gdf_.join(ground_premises.set_index("building_reference"),
-                                                             on="building_reference", how="left")
-            # building_part_gdf_.loc[
-            #    ((building_part_gdf_.n_floors_above_ground == 0) &
-            #     (building_part_gdf_.n_floors_below_ground == 1)),
-            #    "n_floors_above_ground"] = 1
+            building_part_gdf_.loc[
+                building_part_gdf_["zone_reference"].isna(), "zone_reference"
+            ] = "unknown"
 
-            # Join the parcel
-            building_part_gdf_, parcels_gdf = join_cadaster_parcel(building_part_gdf_, cadaster_dir, [code])
+            # ------------------------------------------------------------
+            # 6️⃣ Barcelona extra data
+            # ------------------------------------------------------------
+            if code == "08900" and open_data_layers:
+                ground_premises = downloaders.load_and_transform_barcelona_ground_premises(
+                    open_data_layers_dir
+                )
+                building_part_gdf_ = building_part_gdf_.join(
+                    ground_premises.set_index("building_reference"),
+                    on="building_reference",
+                    how="left"
+                )
+
+            # ------------------------------------------------------------
+            # 7️⃣ Join parcels
+            # ------------------------------------------------------------
+            building_part_gdf_, parcels_gdf = join_cadaster_parcel(
+                building_part_gdf_, cadaster_dir, [code]
+            )
+
+            # ------------------------------------------------------------
+            # 8️⃣ Elevation
+            # ------------------------------------------------------------
+            try:
+                # Ensure correct active geometry BEFORE anything
+                building_part_gdf_ = building_part_gdf_.set_geometry("building_part_geometry")
+
+                # Create centroids
+                building_part_gdf_["centroid_for_elevation"] = (
+                    building_part_gdf_["building_part_geometry"].centroid
+                )
+
+                # Store geometry column NAME (not object)
+                original_geom_col = building_part_gdf_.geometry.name
+
+                # Switch to centroid geometry
+                building_part_gdf_ = building_part_gdf_.set_geometry("centroid_for_elevation")
+
+                dem_files = glob.glob(f"{DEM_raster_dir}/*.tif")
+
+                if dem_files:
+                    building_part_gdf_ = join_DEM_raster(
+                        building_part_gdf_,
+                        DEM_raster_dir
+                    )
+                else:
+                    building_part_gdf_["elevation"] = 0.0
+
+                # Restore original geometry
+                building_part_gdf_ = building_part_gdf_.set_geometry(original_geom_col)
+
+                # Cleanup
+                building_part_gdf_ = building_part_gdf_.drop(columns=["centroid_for_elevation"])
+
+            except Exception:
+                building_part_gdf_['elevation'] = 0.0
 
             # Process the building parts
             building_part_gdf_ = building_inference.process_building_parts(
                 code=code, building_part_gdf_=building_part_gdf_, buildings_CAT=buildings_CAT,
                 parcels_gdf=parcels_gdf, results_dir=results_dir, cadaster_dir=cadaster_dir,
-                open_street_dir=open_street_dir, plots=building_parts_plots, plot_zones_ratio=plot_zones_ratio)
+                open_street_dir=open_street_dir, plots=building_parts_plots, plot_zones_ratio=plot_zones_ratio,
+                floor_height=3.0, nearby_buildings_buffer=nearby_buildings_buffer)  # Default 3m floor height
 
             # Unpack the results: (sbr_results, br_results)
             sbr_results, br_results = building_part_gdf_
@@ -841,7 +962,7 @@ def join_cadaster_building(gdf, cadaster_dir, cadaster_codes, results_dir, open_
 
 def join_cadaster_parcel(gdf, cadaster_dir, cadaster_codes, how="left"):
 
-    for code in tqdm(cadaster_codes, desc="Iterating by cadaster codes..."):
+    for code in tqdm(cadaster_codes, desc="Iterating by cadaster codes...") if len(cadaster_codes)>1 else cadaster_codes:
         # sys.stderr.write("\r" + " " * 60)
         # sys.stderr.flush()
         # sys.stderr.write(f"\r\tJoining cadastral parcels for buildings in cadaster code: {code}")
@@ -874,9 +995,9 @@ def join_adm_div_naming(gdf, cadaster_dir, cadaster_codes):
                     left_on="cadaster_code", right_on="cadaster_code", how="left")
 
 
-def join_cadaster_data(cadaster_dir, cadaster_codes, results_dir, open_street_dir, building_parts_plots=False,
-                       building_parts_inference=False, plot_zones_ratio=0.01, use_CAT_files=False,
-                       open_data_layers=False, open_data_layers_dir=None, CAT_files_dir = None):
+def join_cadaster_data(cadaster_dir, census_tracts_dir, DEM_raster_dir, cadaster_codes, results_dir, open_street_dir,
+                       building_parts_plots=False, building_parts_inference=False, plot_zones_ratio=0.01,
+                       use_CAT_files=False, open_data_layers=False, open_data_layers_dir=None, CAT_files_dir = None):
 
     # Address
     gdf = get_cadaster_address(
@@ -891,7 +1012,10 @@ def join_cadaster_data(cadaster_dir, cadaster_codes, results_dir, open_street_di
     # Buildings
     # building_parts_inference_using_CAT_files = use_CAT_files
     # code = "08900"
-    gdf = join_cadaster_building(gdf=gdf, cadaster_dir=cadaster_dir, cadaster_codes=cadaster_codes,
+    gdf = join_cadaster_building(gdf=gdf, cadaster_dir=cadaster_dir,
+                                 census_tracts_dir=census_tracts_dir,
+                                 DEM_raster_dir=DEM_raster_dir,
+                                 cadaster_codes=cadaster_codes,
                                  results_dir=results_dir, open_street_dir=open_street_dir,
                                  building_parts_plots=building_parts_plots,
                                  plot_zones_ratio=plot_zones_ratio,
@@ -1014,3 +1138,156 @@ def join_by_postal_codes(gdf, postal_codes_dir, columns=None, geometry_column="p
               how="left", predicate="within").drop(["index_right"], axis=1)
 
     return postal_codes_gdf
+
+
+def join_pois(gdf, open_street_dir, cadaster_dir, cadaster_codes):
+    """Join POI indicators to buildings from OpenStreetMap data.
+
+    For each POI group/subgroup (amenity, emergency, healthcare, leisure,
+    office, shop, tourism) the following columns are added per building:
+
+    - poi_{group}[_{subgroup}]_count  : number of POIs assigned to the building
+    - poi_{group}[_{subgroup}]_ids    : list of POI identifiers on the building
+    - poi_{group}[_{subgroup}]_100m   : count of POIs within 100 m
+    - poi_{group}[_{subgroup}]_250m   : count of POIs within 250 m
+    - poi_{group}[_{subgroup}]_500m   : count of POIs within 500 m
+    """
+    from collections import defaultdict
+
+    GROUPS_OF_INTEREST = {"amenity", "emergency", "healthcare", "leisure", "office", "shop", "tourism"}
+    DISTANCES = [100, 250, 500]
+    METRIC_CRS = "EPSG:25831"
+
+    sys.stderr.write(f"\nJoining POI indicators for {len(cadaster_codes)} municipalities\n")
+
+    # Collect POIs across all cadaster codes, keyed by (group, subgroup)
+    poi_collections = defaultdict(list)
+
+    codes_iter = tqdm(cadaster_codes, desc="Fetching POIs by cadaster code") if len(cadaster_codes) > 1 else cadaster_codes
+    for code in codes_iter:
+        try:
+            pois = utils.get_pois_open_street_maps(
+                cadaster_code=code,
+                cadaster_dir=cadaster_dir,
+                open_street_dir=open_street_dir,
+                buffer_m=200,
+            )
+        except Exception as e:
+            sys.stderr.write(f"Warning: Could not get POIs for {code}: {e}\n")
+            continue
+
+        for group, value in pois.items():
+            if group not in GROUPS_OF_INTEREST:
+                continue
+            if isinstance(value, dict):
+                for subgroup, poi_gdf in value.items():
+                    if poi_gdf is not None and not poi_gdf.empty:
+                        poi_collections[(group, subgroup)].append(poi_gdf)
+            elif isinstance(value, gpd.GeoDataFrame) and not value.empty:
+                poi_collections[(group, None)].append(value)
+
+    if not poi_collections:
+        return gdf
+
+    # Merge GeoDataFrames of same group/subgroup across municipalities
+    all_pois = {}
+    for key, gdfs in poi_collections.items():
+        valid = [g for g in gdfs if g is not None and not g.empty]
+        if not valid:
+            continue
+        if len(valid) == 1:
+            all_pois[key] = valid[0]
+        else:
+            merged = pd.concat(valid, ignore_index=True)
+            all_pois[key] = gpd.GeoDataFrame(merged, geometry="geometry", crs=valid[0].crs)
+
+    def _id_col(poi_gdf):
+        for col in ("id", "osmid", "name"):
+            if col in poi_gdf.columns:
+                return col
+        return None
+
+    # ------------------------------------------------------------------
+    # 1. Direct building_reference assignment
+    # ------------------------------------------------------------------
+    for (group, subgroup), poi_gdf in all_pois.items():
+        col_prefix = f"poi_{group}_{subgroup}" if subgroup else f"poi_{group}"
+
+        if "building_reference" not in poi_gdf.columns:
+            continue
+
+        poi_valid = poi_gdf[poi_gdf["building_reference"].notna()].copy()
+        if poi_valid.empty:
+            continue
+
+        counts = (
+            poi_valid.groupby("building_reference")
+            .size()
+            .reset_index(name=f"{col_prefix}_count")
+        )
+        gdf = gdf.merge(counts, on="building_reference", how="left")
+        gdf[f"{col_prefix}_count"] = gdf[f"{col_prefix}_count"].fillna(0).astype(int)
+
+        id_col = _id_col(poi_valid)
+        if id_col:
+            ids = (
+                poi_valid.groupby("building_reference")[id_col]
+                .apply(list)
+                .reset_index(name=f"{col_prefix}_ids")
+            )
+            gdf = gdf.merge(ids, on="building_reference", how="left")
+
+    # ------------------------------------------------------------------
+    # 2. Distance-based counts (100 m, 250 m, 500 m)
+    # ------------------------------------------------------------------
+    if "building_centroid" in gdf.columns:
+        buildings_pts = (
+            gdf[["building_reference", "building_centroid"]]
+            .drop_duplicates("building_reference")
+            .copy()
+        )
+        buildings_pts = gpd.GeoDataFrame(buildings_pts, geometry="building_centroid", crs=gdf.crs)
+    elif "building_geometry" in gdf.columns:
+        buildings_pts = (
+            gdf[["building_reference", "building_geometry"]]
+            .drop_duplicates("building_reference")
+            .copy()
+        )
+        buildings_pts = gpd.GeoDataFrame(buildings_pts, geometry="building_geometry", crs=gdf.crs)
+        buildings_pts["building_centroid"] = buildings_pts.geometry.centroid
+        buildings_pts = buildings_pts.set_geometry("building_centroid").drop(columns=["building_geometry"])
+    else:
+        sys.stderr.write("Warning: No building geometry found for POI distance calculation\n")
+        return gdf
+
+    buildings_pts = buildings_pts[buildings_pts.geometry.notna()].to_crs(METRIC_CRS)
+    buildings_pts = buildings_pts.rename_geometry("geometry")
+
+    for (group, subgroup), poi_gdf in all_pois.items():
+        col_prefix = f"poi_{group}_{subgroup}" if subgroup else f"poi_{group}"
+
+        poi_metric = poi_gdf.to_crs(METRIC_CRS)
+        poi_metric = poi_metric[poi_metric.geometry.notna()][["geometry"]].copy()
+
+        if poi_metric.empty:
+            continue
+
+        for dist in DISTANCES:
+            col_name = f"{col_prefix}_{dist}m"
+
+            buffered = buildings_pts[["building_reference", "geometry"]].copy()
+            buffered = buffered.set_geometry("geometry")
+            buffered["geometry"] = buffered.geometry.buffer(dist)
+
+            joined = gpd.sjoin(buffered, poi_metric, how="left", predicate="contains")
+
+            counts_dist = (
+                joined[joined["index_right"].notna()]
+                .groupby("building_reference")
+                .size()
+                .reset_index(name=col_name)
+            )
+            gdf = gdf.merge(counts_dist, on="building_reference", how="left")
+            gdf[col_name] = gdf[col_name].fillna(0).astype(int)
+
+    return gdf

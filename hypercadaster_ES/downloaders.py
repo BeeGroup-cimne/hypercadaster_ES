@@ -134,7 +134,6 @@ def cadaster_downloader(cadaster_dir, cadaster_codes=None):
         "address": "https://www.catastro.hacienda.gob.es/INSPIRE/Addresses/ES.SDGC.AD.atom.xml",
         "buildings": "https://www.catastro.hacienda.gob.es/INSPIRE/buildings/ES.SDGC.BU.atom.xml"
     }
-
     for k, v in inspire_dict.items():
         sys.stderr.write(f"\nDownloading INSPIRE-harmonised cadaster data: {k}\n")
         municipalities = utils.list_municipalities(

@@ -70,8 +70,8 @@ warnings.filterwarnings(
 
 def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf, results_dir=None, cadaster_dir=None,
                            open_street_dir=None, plots=False, plot_zones_ratio=0.01, 
-                           orientation_discrete_interval_in_degrees=5,
-                           num_workers=max(1, math.ceil(multiprocessing.cpu_count()/3))):
+                           orientation_discrete_interval_in_degrees=5, floor_height=3.0,
+                           num_workers=-1, nearby_buildings_buffer=80):#max(1, math.ceil(multiprocessing.cpu_count()/3))):
     """
     Main function to process building parts and perform comprehensive building analysis.
     
@@ -125,18 +125,18 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
 
         if (not os.path.exists(f"{results_dir}/cache/{code}_aux1.pkl")):
             gdf_global = utils.detect_close_buildings_parallel(gdf_building_parts=building_part_gdf_,
-                                                         buffer_neighbours=80,
+                                                         buffer_neighbours=nearby_buildings_buffer,
                                                          neighbours_column_name="nearby_buildings",
                                                          neighbours_id_column_name="building_reference",
-                                                         num_workers=-1,
+                                                         num_workers=num_workers,
                                                          column_name_to_split="zone_reference")
             parcels_gdf["zone_reference"] = (
                 parcels_gdf["building_reference"].str[0:5] + parcels_gdf["building_reference"].str[7:14])
             gdf_parcels_global = utils.detect_close_parcels_parallel(gdf_parcels=parcels_gdf,
-                                                             buffer_neighbours=150,
+                                                             buffer_neighbours=nearby_buildings_buffer*2,
                                                              neighbours_column_name="nearby_parcels",
                                                              neighbours_id_column_name="building_reference",
-                                                             num_workers=-1,
+                                                             num_workers=num_workers,
                                                              column_name_to_split="zone_reference")
             gdf_global = gdf_global.merge(
                 gdf_parcels_global[["building_reference","nearby_parcels"]],
@@ -155,7 +155,7 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
                 min_hole_area=0.5,
                 gap_tolerance=0.05,
                 chunk_size=500,
-                num_workers=-1)
+                num_workers=num_workers)
             gdf_footprints_global.to_pickle(f"{results_dir}/cache/{code}_aux2.pkl")
         else:
             gdf_footprints_global = pd.read_pickle(f"{results_dir}/cache/{code}_aux2.pkl")
@@ -180,10 +180,9 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
         else:
             zones_to_plot = set()
 
-        ine_code = utils.cadaster_to_ine_codes([code])[0]
-        streets_gdf = utils.get_municipality_open_street_maps(
+        streets_gdf = utils.get_streets_open_street_maps(
             open_street_dir=open_street_dir,
-            query_location=f"{utils.municipality_name(ine_code)}, Spain",
+            cadaster_code=code,
             crs=gdf_global.crs)
         streets_gdf = streets_gdf[streets_gdf.geometry.apply(lambda geom: isinstance(geom, LineString))]
 
@@ -201,13 +200,24 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
                 buildings_CAT,
                 results_dir,
                 zone_plots,
-                orientation_discrete_interval_in_degrees
+                orientation_discrete_interval_in_degrees,
+                floor_height
             )
 
         # Process each zone sequentially with progress tracking
         results = []
-        for zone_reference in tqdm(zone_references, desc="Inferring geometrical KPIs for each building..."):
-            results.append(process_zone_delayed(zone_reference))
+        progress_bar = tqdm(zone_references, desc="Inferring building KPIs", 
+                           mininterval=1.0, leave=True, ncols=80)
+        
+        def safe_process_zone(zone_ref):
+            try:
+                return process_zone_delayed(zone_ref)
+            except Exception as e:
+                progress_bar.write(f"This cadastral zone failed: '{zone_ref}'. Error: {e}")
+                return None
+        
+        for zone_reference in progress_bar:
+            results.append(safe_process_zone(zone_reference))
             
         # Note: Parallel processing commented out for performance reasons
         # Alternative parallel implementation available if needed
@@ -218,8 +228,15 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
         # del grouped
 
         # Concatenate all results into a single DataFrame
-        sbr_results = pd.concat([i[0] for i in results if i is not None])[results[0][0].columns]
-        br_results = pd.concat([i[1] for i in results if i is not None])[results[0][1].columns]
+        valid_results = [i for i in results if i is not None]
+        if valid_results:
+            sbr_results = pd.concat([i[0] for i in valid_results])[valid_results[0][0].columns]
+            br_results = pd.concat([i[1] for i in valid_results])[valid_results[0][1].columns]
+        else:
+            # Create empty DataFrames if no valid results
+            progress_bar.write("Warning: No valid results from any cadastral zones")
+            sbr_results = pd.DataFrame()
+            br_results = pd.DataFrame()
         del results
 
         sbr_results.to_pickle(f"{results_dir}/{code}_sbr_results.pkl",
@@ -239,7 +256,7 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
 # ==========================================
 
 def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, streets_gdf, buildings_CAT,
-                 results_dir, plots, orientation_discrete_interval_in_degrees):
+                 results_dir, plots, orientation_discrete_interval_in_degrees, floor_height):
     """
     Perform detailed analysis for an individual cadastral zone.
     
@@ -533,6 +550,7 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                 perimeter = {}
                 air_contact_wall = {}
                 shadows_at_distance = {}
+                vertical_distances_at_collision = {}  # New: vertical distances when hitting neighbors
                 parcel_at_distance = {}
                 adiabatic_wall = {}
                 patios_wall = {}
@@ -711,17 +729,43 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                         pdf = None
                     for floor in range(max(gdf_aux_footprint_building.floor.max(),
                                            gdf_aux_footprints_nearby.floor.max()) + 1):
-                        shadows_at_distance[floor] = utils.distance_from_centroid_to_polygons_by_orientation(
+                        
+                        # Calculate height of current building at this floor
+                        current_building_elevation = building_gdf_item['elevation'].iloc[0] if 'elevation' in building_gdf_item.columns else 0.0
+                        current_building_height = current_building_elevation + (floor * floor_height)
+                        
+                        # Filter nearby buildings and calculate their heights
+                        floor_nearby = gdf_aux_footprints_nearby[gdf_aux_footprints_nearby.floor == floor].copy()
+                        
+                        # Calculate building heights for shadow casting consideration
+                        building_heights = {}
+                        for _, nearby_building in floor_nearby.iterrows():
+                            nearby_elevation = nearby_building.get('elevation', 0.0)
+                            nearby_height = nearby_elevation + (floor * floor_height)
+                            building_heights[nearby_building.name] = {
+                                'height': nearby_height,
+                                'relative_height': nearby_height - current_building_height,
+                                'is_nearby': nearby_building.get('nearby_buildings', False)
+                            }
+                        
+                        shadow_result = utils.distance_from_centroid_to_polygons_by_orientation(
                             geom=building_geom.exterior if isinstance(building_geom, Polygon) else (
                                 ([LinearRing(polygon.exterior.coords) for polygon in building_geom.geoms])),
-                            other_polygons=gdf_aux_footprints_nearby[gdf_aux_footprints_nearby.floor == floor].geometry,
+                            other_polygons=floor_nearby.geometry,
                             centroid=building_geom.centroid,
                             orientation_interval=orientation_discrete_interval_in_degrees,
                             plots=plots,
                             pdf=pdf,
                             floor=floor,
-                            max_distance=150
+                            max_distance=150,
+                            current_height=current_building_height,
+                            building_heights=building_heights
                         )
+                        
+                        shadows_at_distance[floor] = shadow_result
+                        vertical_distances_at_collision[floor] = shadow_result.get('vertical_distances', {})
+                        if floor == 0:  # Store elevation data once (it's the same for all floors)
+                            elevation_at_shadow_data = shadow_result.get('elevation_at_shadow', {})
                     if plots:
                         pdf.close()
 
@@ -815,7 +859,10 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                     'sbr__shadows_at_distance': {key: [shadows_at_distance[d]['shadows'][key] for d in shadows_at_distance] for key in
                                             shadows_at_distance[0]['shadows']} if shadows_at_distance != {} else {},
                     'sbr__building_contour_at_distance': {key: np.mean([shadows_at_distance[d]['contour'][key] for d in shadows_at_distance]) for key in
-                                            shadows_at_distance[0]['contour']} if shadows_at_distance != {} else {}
+                                            shadows_at_distance[0]['contour']} if shadows_at_distance != {} else {},
+                    'sbr__vertical_distances_at_collision': {key: [vertical_distances_at_collision[d][key] for d in vertical_distances_at_collision] for key in
+                                            vertical_distances_at_collision[0]} if vertical_distances_at_collision != {} else {},
+                    'sbr__elevation_at_shadow': elevation_at_shadow_data if 'elevation_at_shadow_data' in locals() else {}
                 })
 
             if len(results_) > 0:
@@ -981,6 +1028,39 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                             )
                         }.items(),
                         key=lambda item: int(item[0])))]
+                        ,
+                        'br__vertical_distances_at_collision': [dict(sorted({
+                            k: [
+                                np.mean(x) if len(x) > 0 else np.inf
+                                for x in zip_longest(
+                                    *(
+                                        d.get(k, [np.inf] * max(
+                                                (len(v) for v in d.values() if isinstance(v, list)),
+                                                default=1,
+                                            ))[:max(
+                                                (len(v) for v in d.values() if isinstance(v, list)),
+                                                default=1,
+                                            )]
+                                        for d in sbr_results.get("sbr__vertical_distances_at_collision", [])
+                                    ),
+                                    fillvalue=np.inf,
+                                )
+                            ]
+                            for k in set(
+                                chain.from_iterable(
+                                    d.keys() for d in sbr_results.get("sbr__vertical_distances_at_collision", [])
+                                )
+                            ) if sbr_results.get("sbr__vertical_distances_at_collision")
+                        }.items(), key=lambda item: int(item[0])))] if sbr_results.get("sbr__vertical_distances_at_collision") else [{}],
+                        'br__elevation_at_shadow': [dict(sorted({
+                            k: np.mean([d.get(k, np.nan) for d in sbr_results.get("sbr__elevation_at_shadow", []) if isinstance(d, dict)])
+                            for k in set(
+                                chain.from_iterable(
+                                    d.keys() for d in sbr_results.get("sbr__elevation_at_shadow", [])
+                                    if isinstance(d, dict)
+                                )
+                            ) if sbr_results.get("sbr__elevation_at_shadow")
+                        }.items(), key=lambda item: int(item[0])))] if sbr_results.get("sbr__elevation_at_shadow") else [{}]
                     }
                     br_results = pd.DataFrame(br_agg_dict)
                     geoms_by_floor = list(sbr_results['sbr__building_footprint_by_floor'])
@@ -1191,7 +1271,8 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                     pd.read_pickle(f"{results_dir}/cache/{zone_reference}_br_results.pkl"))
 
     except Exception as e:
-        print(f" This cadastral zone failed: '{zone_reference}'. Error: {e}", file=sys.stderr)
+        # Error handling moved to calling function with tqdm.write() for clean progress bar
+        raise e
 
 # ==========================================
 # CAT FILE PROCESSING FUNCTIONS

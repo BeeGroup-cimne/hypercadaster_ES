@@ -3,9 +3,11 @@
 import copy
 import sys
 import os
+import time
 import shutil
 import fnmatch
 import math
+import hashlib
 import re
 from contextlib import contextmanager
 from zipfile import ZipFile, BadZipFile
@@ -23,16 +25,17 @@ import geopandas as gpd
 from geopandas import sjoin
 from shapely.ops import unary_union, nearest_points, linemerge
 from shapely.geometry.polygon import orient
-from shapely.geometry import (Polygon, Point, LineString, MultiPolygon, MultiPoint, 
+from shapely.geometry import (box, Polygon, Point, LineString, MultiPolygon, MultiPoint,
                               MultiLineString, GeometryCollection, LinearRing, JOIN_STYLE)
 from shapely.errors import GEOSException
 from shapely.geometry import mapping
 from shapely.geometry.base import BaseGeometry
 from fastkml import kml
+import osmnx as ox
+import fiona
 
 # Network and graph libraries
 import networkx as nx
-import osmnx as ox
 
 # Raster processing
 import rasterio
@@ -43,6 +46,7 @@ import joblib
 from joblib import Parallel, delayed
 from joblib.externals.loky import get_reusable_executor
 from tqdm import tqdm
+from multiprocessing import Pool, cpu_count
 
 # Web requests
 import requests
@@ -54,6 +58,9 @@ from matplotlib.patches import PathPatch
 from matplotlib.path import Path
 import matplotlib.patches as patches
 import contextily as ctx
+
+from shapely.geometry import box
+from shapely.ops import unary_union
 
 # ==========================================
 # PARALLEL PROCESSING UTILITIES
@@ -237,11 +244,9 @@ def get_ine_codes_from_bounding_box(wd, bbox, year=2022):
     bbox = [2.05, 41.32, 2.25, 41.47]
     ine_codes = get_ine_codes_from_bounding_box("/path/to/data", bbox)
     """
-    from hypercadaster_ES.mergers import get_census_gdf
-    from shapely.geometry import box
-    from shapely.ops import unary_union
     
     # Load census data with municipalities
+    from hypercadaster_ES.mergers import get_census_gdf
     census_dir = census_tracts_dir_(wd)
     census_gdf = get_census_gdf(census_dir, year=year, crs="EPSG:4326")
     
@@ -1239,10 +1244,13 @@ def distance_from_points_to_polygons_by_orientation(geom, other_polygons, num_po
     return final_distances_by_orientation, representativity_by_orientation
 
 def distance_from_centroid_to_polygons_by_orientation(geom, other_polygons, centroid, orientation_interval=5,
-                                                    plots=False, pdf=None, floor=None, max_distance=150):
+                                                    plots=False, pdf=None, floor=None, max_distance=150,
+                                                    current_height=None, building_heights=None):
     direction_angles = list(range(0, 360, orientation_interval))
     distances_by_orientation = {str(i): np.inf for i in direction_angles}
     contour_by_orientation = {str(i): np.inf for i in direction_angles}
+    vertical_distances_by_orientation = {str(i): np.inf for i in direction_angles}  # New: vertical distance when hitting building
+    elevation_at_shadow = {str(i): np.nan for i in direction_angles}  # New: elevation at closest neighbor building
 
     for angle in direction_angles:
 
@@ -1255,18 +1263,46 @@ def distance_from_centroid_to_polygons_by_orientation(geom, other_polygons, cent
         contour_by_orientation[str(angle)] = round(point_to_linearring_distance,2)
         other_pol_intersection_point = None
 
-        for other_polygon in other_polygons:
-            polygons = other_polygon.geoms if isinstance(other_polygon, MultiPolygon) else [other_polygon]
-            for polygon in polygons:
-                intersection = ray.intersection(polygon)
-                if not intersection.is_empty:
-                    nearest_point = nearest_points(centroid, intersection)[1]
-                    distance = round(centroid.distance(nearest_point) - point_to_linearring_distance,2)
-                    if distance < 0.2:
-                        distance = 0.0
-                    if distance <= distances_by_orientation[str(angle)]:
-                        other_pol_intersection_point = nearest_point
-                        distances_by_orientation[str(angle)] = distance
+        for idx, other_polygon in enumerate(other_polygons):
+            # Check if height information is available for shadow casting
+            can_cast_shadow = True
+            if building_heights is not None and current_height is not None:
+                # Get building height info for this polygon
+                building_info = building_heights.get(idx, {})
+                relative_height = building_info.get('relative_height', 0)
+                is_nearby = building_info.get('is_nearby', False)
+                
+                # Only buildings that are taller than current building can cast meaningful shadows
+                # For nearby buildings (outside municipality), be more conservative 
+                if relative_height <= 0:  # Same height or lower
+                    can_cast_shadow = False
+                elif is_nearby and relative_height < 3.0:  # Nearby buildings need significant height difference
+                    can_cast_shadow = False
+            
+            if can_cast_shadow:
+                polygons = other_polygon.geoms if isinstance(other_polygon, MultiPolygon) else [other_polygon]
+                for polygon in polygons:
+                    intersection = ray.intersection(polygon)
+                    if not intersection.is_empty:
+                        nearest_point = nearest_points(centroid, intersection)[1]
+                        distance = round(centroid.distance(nearest_point) - point_to_linearring_distance,2)
+                        if distance < 0.2:
+                            distance = 0.0
+                        if distance <= distances_by_orientation[str(angle)]:
+                            other_pol_intersection_point = nearest_point
+                            distances_by_orientation[str(angle)] = distance
+                            
+                            # Calculate vertical distance when hitting this building
+                            if building_heights is not None and current_height is not None:
+                                building_info = building_heights.get(idx, {})
+                                neighbor_height = building_info.get('relative_height', 0)
+                                neighbor_absolute_height = building_info.get('height', 0)
+                                # Vertical distance = difference in heights when collision occurs
+                                vertical_distance = neighbor_height - current_height
+                                vertical_distances_by_orientation[str(angle)] = round(vertical_distance, 2)
+                                
+                                # Store elevation at the closest neighbor building
+                                elevation_at_shadow[str(angle)] = round(neighbor_absolute_height, 2)
 
         if plots and other_pol_intersection_point is not None and pdf is not None and distance <= max_distance:
             fig, ax = plt.subplots()
@@ -1282,11 +1318,26 @@ def distance_from_centroid_to_polygons_by_orientation(geom, other_polygons, cent
             pdf.savefig(fig)
             plt.close(fig)
 
-    return {"shadows": distances_by_orientation, "contour": contour_by_orientation}
+    return {
+        "shadows": distances_by_orientation, 
+        "contour": contour_by_orientation,
+        "vertical_distances": vertical_distances_by_orientation,
+        "elevation_at_shadow": elevation_at_shadow
+    }
 
 
-def get_municipality_open_street_maps(open_street_dir, query_location, crs=None):
+def get_streets_open_street_maps(open_street_dir, ine_code=None, cadaster_code=None, query_location=None,
+                                      crs=None):
 
+    if not query_location:
+        if not ine_code:
+            if cadaster_code:
+                ine_code = cadaster_to_ine_codes([cadaster_code])[0]
+            else:
+                raise("One of these should be defined: ine_code, cadaster_code or query_location.")
+            mun = municipality_name(ine_code)
+            query_location=f"{mun}, Spain"
+    
     fn = f"{open_street_dir}/{query_location}.gpkg"
 
     if not os.path.exists(fn):
@@ -1310,14 +1361,651 @@ def get_municipality_open_street_maps(open_street_dir, query_location, crs=None)
         streets_gdf = streets_gdf.to_crs("EPSG:25831")
         streets_gdf = streets_gdf.loc[:,streets_gdf.columns.isin([
             "element", "id", "geometry"])]
-        streets_gdf.to_file(fn, driver="GPKG")
+        # Clean layer name for GPKG compatibility (remove special characters and spaces)
+        import re
+        clean_layer_name = re.sub(r'[^a-zA-Z0-9_]', '_', query_location.replace(' ', '_'))
+        streets_gdf.to_file(fn, driver="GPKG", layer=clean_layer_name)
     else:
-        streets_gdf = gpd.read_file(fn)
+        # Try to read existing file - check available layers first
+        import re
+        clean_layer_name = re.sub(r'[^a-zA-Z0-9_]', '_', query_location.replace(' ', '_'))
+        
+        try:
+            # Check what layers exist in the file
+            available_layers = fiona.listlayers(fn)
+            
+            # Try to use the clean layer name first
+            if clean_layer_name in available_layers:
+                streets_gdf = gpd.read_file(fn, layer=clean_layer_name)
+            # Fall back to the original query_location if it exists as a layer
+            elif query_location in available_layers:
+                streets_gdf = gpd.read_file(fn, layer=query_location)
+            # Use the first available layer as fallback
+            elif available_layers:
+                streets_gdf = gpd.read_file(fn, layer=available_layers[0])
+            else:
+                # If no layers, read without specifying layer (use default)
+                streets_gdf = gpd.read_file(fn)
+                
+        except Exception:
+            # If all else fails, try reading without specifying layer
+            streets_gdf = gpd.read_file(fn)
 
     if crs is not None:
         streets_gdf.geometry = streets_gdf.geometry.to_crs(crs)
 
     return streets_gdf
+
+def build_osmnx_tags(osm_tags_structured):
+    tags = {}
+
+    for main_key, subgroups in osm_tags_structured.items():
+        values = set()
+        for subgroup_values in subgroups.values():
+            values.update(subgroup_values)
+        tags[main_key] = list(values)
+
+    return tags
+
+
+def build_poi_columns(osm_tags_structured):
+    col_map = {}
+
+    for main_key, subgroups in osm_tags_structured.items():
+        col_map.setdefault(main_key, {})
+
+        for sub_key, values in subgroups.items():
+            col_name = f"{main_key}.{sub_key}" if sub_key != "all" else main_key
+
+            for v in values:
+                col_map[main_key][v] = col_name
+
+    return col_map
+
+OSM_TAGS_STRUCTURED = {
+        "amenity": {
+            "food": ["restaurant", "cafe", "bar", "pub", "fast_food", "food_court"],
+            "education": ["school", "college", "university", "kindergarten", "library"],
+            "transport": ["bus_station", "ferry_terminal", "taxi", "parking",
+                          "bicycle_parking", "charging_station"],
+            "financial": ["bank", "atm", "bureau_de_change"],
+            "health": ["hospital", "clinic", "doctors", "dentist", "pharmacy"],
+            "culture": ["cinema", "theatre", "arts_centre", "community_centre"],
+            "public": ["townhall", "courthouse", "police", "fire_station", "post_office"],
+            "facilities": ["toilets", "drinking_water", "shower", "bench", "shelter"],
+            "waste": ["waste_basket", "waste_disposal", "recycling"],
+            "other": ["place_of_worship", "crematorium", "funeral_hall"]
+        },
+        "building": {
+            "residential": ["apartments", "house", "residential", "detached", "terrace"],
+            "commercial": ["commercial", "retail", "office", "industrial"],
+            "religious": ["church", "mosque", "temple", "cathedral", "chapel"],
+            "civic": ["school", "hospital", "government", "public"],
+            "agriculture": ["farm", "barn", "greenhouse"],
+            "sports": ["stadium", "sports_hall", "pavilion"],
+            "storage": ["warehouse", "storage_tank"],
+            "vehicle": ["garage", "carport"],
+            "technical": ["transformer_tower", "service", "power"],
+            "other": ["yes", "construction", "roof"]
+        },
+        "emergency": {"all": ["ambulance_station", "defibrillator", "fire_hydrant",
+                              "lifeguard", "assembly_point", "phone"]},
+        "healthcare": {"all": ["hospital", "clinic", "doctor", "dentist",
+                               "physiotherapist", "laboratory"]},
+        "historic": {"all": ["monument", "memorial", "archaeological_site",
+                             "castle", "ruins"]},
+        "leisure": {"all": ["park", "garden", "playground", "sports_centre",
+                            "fitness_centre", "stadium", "swimming_pool", "pitch"]},
+        "office": {"all": ["company", "government", "insurance",
+                           "architect", "engineer", "lawyer"]},
+        "shop": {
+            "food": ["supermarket", "convenience", "bakery", "butcher",
+                     "greengrocer", "beverages"],
+            "general": ["department_store", "mall", "general"],
+            "clothing": ["clothes", "shoes", "fashion", "jewelry"],
+            "health": ["pharmacy", "cosmetics", "optician"],
+            "diy": ["hardware", "doityourself", "garden_centre"],
+            "electronics": ["electronics", "mobile_phone", "computer"],
+            "sports": ["sports", "bicycle", "outdoor"],
+            "culture": ["books", "music", "art", "hobby"],
+            "other": ["pet", "gift", "florist"]
+        },
+        "tourism": {
+            "accommodation": ["hotel","hostel","guest_house","apartment","motel","resort","chalet","alpine_hut",
+                              "wilderness_hut"],
+            "camping": ["camp_site","caravan_site"],
+            "culture": ["museum","gallery","exhibition","artwork"],
+            "attraction": ["attraction","viewpoint","picnic_site"],
+            "leisure": ["theme_park","zoo","aquarium","spa","beach"],
+            "information": ["information"],
+            "rental": ["bicycle_rental","boat_rental","car_rental"]
+        }
+    }
+
+POIS_COLS = {
+    "general": [
+        "element",
+        "id",
+        "geometry",
+        "name",
+        "alt_name",
+        "short_name",
+        "brand",
+        "operator",
+        "operator:type",
+        "addr:housenumber",
+        "addr:street",
+        "addr:postcode",
+        "addr:city",
+        "access",
+        "wheelchair",
+        "phone",
+        "website",
+        "email",
+        "wikidata",
+        "wikipedia",
+        "opening_hours",
+        "ref",
+        "source",
+        "check_date",
+        "level",
+        "layer"
+    ],
+    "amenity": {
+        "general": [
+            "amenity",
+            "toilets"
+            "outdoor_seating",
+            "indoor_seating",
+            "internet_access"
+        ],
+        "subgroups": {
+            "food": [
+                "cuisine",
+                "takeaway",
+                "delivery",
+                "diet:vegetarian",
+                "diet:vegan",
+                "drive_through"
+            ],
+            "education": [
+                "isced:level",
+                "min_age",
+                "max_age"
+            ],
+            "transport": [
+                "public_transport",
+                "capacity",
+                "parking",
+                "fee"
+            ],
+            "financial": [
+                "cash_in",
+                "cash_out"
+            ],
+            "health": [
+                "dispensing"
+            ],
+            "culture": [
+                "fee",
+                "capacity",
+                "theatre:genre"
+            ],
+            "public": [],
+            "facilities": [
+                "fee"
+            ],
+            "waste": [
+                "recycling_type",
+            ],
+            "other": [
+                "religion",
+                "denomination"
+            ]
+        }
+    },
+    "building": {
+        "general": [
+            "building",
+            "building:use",
+            "building:levels",
+            "building:levels:underground",
+            "height"
+        ],
+        "subgroups": {
+            "residential": [
+                "building:flats",
+                "rooms",
+                "building:material"
+            ],
+            "commercial": [
+                "retail"
+                "industrial",
+                "commercial",
+                "office"
+            ],
+            "religious": [
+                "religion",
+                "denomination",
+                "service_times"
+            ],
+            "civic": [
+                "public_transport",
+                "community_centre",
+                "social_facility",
+                "capacity"
+            ],
+            "agriculture": [
+                "landuse",
+                "garden:type"
+            ],
+            "sports": [
+                "capacity"
+            ],
+            "storage": [
+                "industrial",
+                "storage",
+                "content"
+            ],
+            "vehicle": [
+                "parking",
+                "motorcycle_parking"
+                "capacity",
+                "fee"
+            ],
+            "technical": [
+                "power",
+                "substation",
+                "utility"
+            ],
+            "other": []
+        }
+    },
+    "emergency": {
+        "general": [
+            "emergency",
+            "emergency:location",
+            "defibrillator:location",
+            "fire_hydrant:type",
+            "fire_hydrant:diameter"
+        ],
+        "subgroups": {}
+    },
+    "healthcare": {
+        "general": [
+            "healthcare",
+            "healthcare:speciality",
+            "health_facility:type",
+            "medical_system:western"
+        ],
+        "subgroups": {}
+    },
+    "historic": {
+        "general": [
+            "historic",
+            "memorial",
+            "artwork_type",
+            "statue",
+            "monument"
+        ],
+        "subgroups": {}
+    },
+    "leisure": {
+        "general": [
+            "leisure",
+            "sport"
+        ],
+        "subgroups": {}
+    },
+    "office": {
+        "general": [
+            "office",
+            "government",
+            "designation",
+            "branch",
+            "member_of",
+            "company"
+        ],
+        "subgroups": {}
+    },
+    "shop": {
+        "general": [
+            "shop",
+            "payment:cash",
+            "payment:credit_cards",
+            "payment:debit_cards",
+            "payment:contactless"
+        ],
+        "subgroups": {
+             "food": [
+                "cuisine",
+                "organic",
+                "diet:vegetarian",
+                "diet:vegan",
+                "diet:gluten_free",
+                "bulk_purchase"
+            ],
+            "general": [
+                "toilets",
+                "toilets:wheelchair"
+            ],
+            "clothing": [
+                "clothes",
+                "shoes",
+                "fashion_accessories",
+                "second_hand"
+            ],
+            "health": [
+                "healthcare:speciality"
+            ],
+            "diy": [
+                "craft",
+                "bulk_purchase"
+            ],
+            "electronics": [
+                "repair",
+            ],
+            "sports": [
+                "service:bicycle:repair",
+                "service:bicycle:rental",
+                "service:bicycle:retail",
+                "rental",
+                "repair"
+            ],
+            "culture": [
+                "books",
+                "second_hand",
+                "internet_access"
+            ],
+            "other": []
+        }
+    },
+    "tourism": {
+        "general": [
+            "tourism",
+            "stars",
+            "rooms",
+            "check_in",
+            "check_out",
+            "reservation",
+            "fee"
+        ],
+        "subgroups": {
+            "accommodation": [
+                "capacity",
+                "air_conditioning",
+                "parking",
+                "elevator"
+            ],
+            "attraction": [
+                "historic",
+                "heritage",
+                "description"
+            ],
+            "culture": [
+                "museum",
+                "museum_type",
+                "artwork_type",
+                "artist_name",
+                "historic",
+                "heritage",
+            ],
+            "camping": [
+                "capacity",
+                "internet_access",
+                "shower",
+                "toilets"
+            ],
+            "leisure": [
+                "capacity"
+            ],
+            "information": [
+                "information"
+            ]
+        }
+    }
+}
+
+# ------------------------------------------------------------
+# 6️⃣ MAIN PIPELINE
+# ------------------------------------------------------------
+def get_pois_open_street_maps(
+        ine_code=None,
+        cadaster_code=None,
+        query_location=None,
+        geolocate_to_cadaster=True,
+        cadaster_dir=None,
+        open_street_dir="./osm_cache",
+        buffer_m=200,
+        crs_out="EPSG:25831"
+):
+
+    if not query_location:
+        if not ine_code:
+            if cadaster_code:
+                ine_code = cadaster_to_ine_codes([cadaster_code])[0]
+            else:
+                raise("One of these should be defined: ine_code, cadaster_code or query_location.")
+            mun = municipality_name(ine_code)
+            query_location=f"{mun}, Spain"
+
+    os.makedirs(f"{open_street_dir}/POIS_{query_location}", exist_ok=True)
+
+    ox.settings.timeout = 300
+    ox.settings.overpass_endpoint = "https://overpass.kumi.systems/api/interpreter"
+
+    # ------------------------------------------------------------
+    # 1️⃣ GEOMETRY
+    # ------------------------------------------------------------
+    gdf_place = ox.geocode_to_gdf(query_location)
+
+    gdf_place = gdf_place[gdf_place.geometry.notna()]
+    gdf_place.set_geometry("geometry")
+    gdf_place = gdf_place.to_crs(3857)
+
+    polygon = gdf_place.geometry.union_all()
+    polygon = polygon.buffer(buffer_m)
+
+    if polygon.is_empty:
+        raise ValueError("Polygon is empty")
+
+    polygon_wgs = gpd.GeoSeries([polygon], crs=3857).to_crs(4326).iloc[0]
+
+    # ------------------------------------------------------------
+    # 2️⃣ ITERATE SUBGROUPS
+    # ------------------------------------------------------------
+    results = {}
+
+    for main_key, subgroups in OSM_TAGS_STRUCTURED.items():
+
+        for sub_key, values in subgroups.items():
+
+            subgroup_name = f"{main_key}.{sub_key}" if sub_key != "all" else main_key
+            fn = f"{open_street_dir}/POIS_{query_location}/{subgroup_name}.gpkg"
+
+            print(f"[INFO] Processing {subgroup_name}")
+
+            # ----------------------------------------------------
+            # LOAD CACHE
+            # ----------------------------------------------------
+            if os.path.exists(fn):
+                try:
+                    gdf = gpd.read_file(fn)
+                    results[subgroup_name] = gdf
+                    print(f"[CACHE] {subgroup_name} → {len(gdf)}")
+                    continue
+                except Exception:
+                    pass
+
+            # ----------------------------------------------------
+            # QUERY
+            # ----------------------------------------------------
+            tags = {main_key: values}
+
+            try:
+                gdf = ox.features_from_polygon(polygon_wgs, tags=tags)
+
+                if gdf.empty:
+                    print(f"[EMPTY] {subgroup_name}")
+                    continue
+
+                gdf = gdf.reset_index()
+                gdf = gdf[~gdf.geometry.isna()]
+
+                # Normalize geometry - transform to projected CRS before centroid calculation
+                gdf = gdf.to_crs(crs_out)
+                gdf["geometry"] = gdf.geometry.centroid
+
+                # Add metadata column
+                gdf["poi_subgroup"] = subgroup_name
+
+                # Save
+                gdf.to_file(fn, driver="GPKG")
+
+                results[subgroup_name] = gdf
+
+                print(f"[OK] {subgroup_name} → {len(gdf)}")
+
+            except Exception as e:
+                print(f"[FAIL] {subgroup_name}: {e}")
+
+
+    results = clean_pois(results)
+
+    # -------------------
+    # GEOLOCATE TO CADASTRAL REFERENCES
+    # -------------------
+    if geolocate_to_cadaster:
+        if not cadaster_code or not ine_code:
+            if ine_code and not cadaster_code:
+                cadaster_code = ine_to_cadaster_codes([ine_code])[0]
+
+        if not cadaster_dir:
+            raise ValueError("Cadaster directory (cadaster_dir) must be defined.")
+
+        # Load parcels data
+        from hypercadaster_ES.mergers import join_cadaster_parcel
+
+        parcels_gdf = join_cadaster_parcel(None, cadaster_dir, [cadaster_code], how="left")
+        parcels_gdf = parcels_gdf.set_geometry("parcel_geometry")
+        parcels_gdf = parcels_gdf.to_crs(crs_out)
+
+        def geolocate_leaf_gdf(poi_gdf, subgroup_name):
+            """
+            Apply cadastral geolocation to a single GeoDataFrame leaf.
+            """
+            if poi_gdf is None or poi_gdf.empty:
+                return poi_gdf
+
+            poi_gdf = poi_gdf.to_crs(crs_out)
+
+            # Spatial join: POIs inside parcels
+            poi_with_parcels = gpd.sjoin(
+                poi_gdf,
+                parcels_gdf[["building_reference", "parcel_geometry"]],
+                how="left",
+                predicate="within"
+            )
+
+            # Fallback: nearest parcel for unmatched POIs
+            no_parcel_mask = poi_with_parcels["building_reference"].isna()
+
+            if no_parcel_mask.any():
+                print(
+                    f"[INFO] {no_parcel_mask.sum()} POIs in {subgroup_name} "
+                    f"not within parcels, using nearest neighbor"
+                )
+
+                pois_no_parcel = poi_with_parcels[no_parcel_mask].copy()
+
+                parcel_centroids = parcels_gdf.copy()
+                parcel_centroids["geometry"] = parcel_centroids["parcel_geometry"].centroid
+                parcel_centroids = parcel_centroids.set_geometry("geometry")
+
+                cols = [
+                    col for col in pois_no_parcel.columns
+                    if col not in ["building_reference", "index_right"]
+                ]
+
+                nearest_parcels = gpd.sjoin_nearest(
+                    pois_no_parcel[cols],
+                    parcel_centroids[["building_reference", "geometry"]],
+                    how="left"
+                )
+
+                poi_with_parcels.loc[
+                    no_parcel_mask, "building_reference"
+                ] = nearest_parcels["building_reference"].values
+
+            poi_with_parcels = poi_with_parcels.drop(
+                columns=["index_right"], errors="ignore"
+            )
+
+            assigned = (~poi_with_parcels["building_reference"].isna()).sum()
+
+            print(
+                f"[GEOLOCATE] {subgroup_name} → "
+                f"{assigned} POIs assigned to building_reference"
+            )
+
+            return poi_with_parcels
+
+        def recursive_process(obj, path="root"):
+            """
+            Traverse nested dictionaries until leaf GeoDataFrames are found.
+            """
+            if isinstance(obj, dict):
+                return {
+                    key: recursive_process(value, f"{path}.{key}")
+                    for key, value in obj.items()
+                }
+
+            elif isinstance(obj, gpd.GeoDataFrame):
+                return geolocate_leaf_gdf(obj, path)
+
+            else:
+                # leave any non-dict / non-gdf objects untouched
+                return obj
+
+        # Process nested results structure
+        results = recursive_process(results)
+
+    return results
+
+def clean_pois(pois_gdf: dict) -> dict:
+    """
+    Returns cleaned dataframes per POIS group
+    with consistent schema.
+    """
+    outputs = {}
+
+    for group, df in pois_gdf.items():
+
+        # Get schema
+        try:
+            group, subgroup = group.split(".")
+        except ValueError:
+            subgroup = None
+
+        # Merge shared + specific
+        target_cols = (POIS_COLS["general"] +
+                       POIS_COLS[group]["general"] +
+                       POIS_COLS[group]["subgroups"][subgroup] if subgroup else [])
+
+        # Keep only existing columns
+        existing_cols = [c for c in target_cols if c in df.columns]
+
+        # Select + copy
+        out_df = df[existing_cols].copy()
+        if subgroup:
+            if not group in outputs.keys():
+                outputs[group] = {}
+            outputs[group][subgroup] = out_df
+        else:
+            outputs[group] = out_df
+
+    return outputs
+
 
 def detect_number_of_orientations(orientation_lengths: dict, threshold_ratio: float = 0.1):
     total_length = sum(orientation_lengths.values())
@@ -1896,6 +2584,761 @@ def compact_addresses(
     return df_compacted
 
 # ==========================================
+# SHADOW VISUALIZATION
+# ==========================================
+
+def plot_building_shadows_analysis(gdf, building_reference, output_path=None, interactive=True, 
+                                   include_elevation=True, floor_height=None):
+    """
+    Create comprehensive shadow analysis visualization for a building.
+    
+    This function creates multiple visualizations showing:
+    - Polar plot of shadow distances by orientation
+    - Building contour vs shadow distances
+    - Elevation profile effects on shadows
+    - Multi-floor shadow comparison
+    - Interactive 3D shadow casting visualization
+    
+    Parameters:
+    -----------
+    gdf : pandas.DataFrame or geopandas.GeoDataFrame
+        Results DataFrame containing building shadow analysis results
+    building_reference : str
+        Building reference ID to analyze
+    output_path : str, optional
+        Path to save the plot (PDF or HTML). If None, displays interactively
+    interactive : bool, default True
+        Whether to create interactive plots (using plotly) or static plots (matplotlib)
+    include_elevation : bool, default True
+        Whether to include elevation data in the analysis
+    floor_height : float, optional
+        Height per floor in meters for multi-floor analysis. If None, automatically 
+        detects from shadow data or defaults to 3.0m
+        
+    Returns:
+    --------
+    None or plotly.graph_objects.Figure
+        If interactive=True and output_path=None, returns the plotly figure
+    """
+    import numpy as np
+    import pandas as pd
+    
+    # Filter data for the specific building
+    building_data = gdf[gdf['building_reference'] == building_reference]
+    if building_data.empty:
+        print(f"No data found for building {building_reference}")
+        return None
+    
+    # Get building data
+    building_row = building_data.iloc[0]
+    
+    # Auto-detect floor height if not provided
+    if floor_height is None:
+        floor_height = _detect_floor_height_from_data(building_row)
+    
+    if interactive:
+        return _create_interactive_shadow_plot(building_row, building_reference, output_path, 
+                                             include_elevation, floor_height)
+    else:
+        return _create_static_shadow_plot(building_row, building_reference, output_path,
+                                        include_elevation, floor_height)
+
+
+def _create_interactive_shadow_plot(building_row, building_reference, output_path, 
+                                   include_elevation, floor_height):
+    """Create interactive shadow visualization using plotly."""
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+        import plotly.express as px
+        import numpy as np
+    except ImportError:
+        print("Plotly not available. Install with: pip install plotly")
+        return _create_static_shadow_plot(building_row, building_reference, output_path,
+                                        include_elevation, floor_height)
+    
+    # Extract shadow data
+    shadow_data = _extract_shadow_data(building_row)
+    if not shadow_data:
+        print(f"No shadow data found for building {building_reference}")
+        return None
+    
+    # Create subplot layout
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=(
+            'Shadow Distances by Orientation (Polar)',
+            'Building Contour vs Shadows',
+            'Multi-Floor Shadow Comparison',
+            'Elevation Profile Effects'
+        ),
+        specs=[[{"type": "polar"}, {"type": "xy"}],
+               [{"type": "xy"}, {"type": "xy"}]],
+        vertical_spacing=0.08,
+        horizontal_spacing=0.1
+    )
+    
+    # 1. Polar plot of shadow distances
+    orientations = list(shadow_data['orientations'])
+    shadow_distances = list(shadow_data['shadow_distances'])
+    contour_distances = list(shadow_data['contour_distances'])
+    
+    # Convert orientations to radians
+    orientations_rad = [np.radians(float(o)) for o in orientations]
+    
+    # Add building contour (from centroid to building edge)
+    fig.add_trace(
+        go.Scatterpolar(
+            r=contour_distances,
+            theta=orientations,
+            mode='lines',
+            name='Building Contour',
+            line=dict(color='blue', width=2),
+            fill='toself',
+            fillcolor='rgba(0, 0, 255, 0.1)',
+            hovertemplate='Orientation: %{theta}°<br>Building Edge Distance: %{r:.1f}m<extra></extra>'
+        ),
+        row=1, col=1
+    )
+    
+    # Add total distance to neighbors (contour + shadow)
+    if 'total_distances_to_neighbors' in shadow_data:
+        total_distances = shadow_data['total_distances_to_neighbors']
+        fig.add_trace(
+            go.Scatterpolar(
+                r=total_distances,
+                theta=orientations,
+                mode='lines+markers',
+                name='Distance to Neighbors',
+                line=dict(color='red', width=2),
+                hovertemplate='Orientation: %{theta}°<br>Total Distance to Neighbor: %{r:.1f}m<extra></extra>'
+            ),
+            row=1, col=1
+        )
+    
+    # Add shadow distances only (from building edge to neighbor)
+    fig.add_trace(
+        go.Scatterpolar(
+            r=shadow_distances,
+            theta=orientations,
+            mode='lines+markers',
+            name='Shadow Distance Only',
+            line=dict(color='orange', width=1, dash='dot'),
+            hovertemplate='Orientation: %{theta}°<br>Shadow Distance: %{r:.1f}m<extra></extra>'
+        ),
+        row=1, col=1
+    )
+    
+    # 2. Linear comparison plot
+    fig.add_trace(
+        go.Scatter(
+            x=orientations,
+            y=contour_distances,
+            mode='lines+markers',
+            name='Building Contour',
+            line=dict(color='blue', width=2),
+            hovertemplate='Orientation: %{x}°<br>Building Edge: %{y:.1f}m<extra></extra>'
+        ),
+        row=1, col=2
+    )
+    
+    fig.add_trace(
+        go.Scatter(
+            x=orientations,
+            y=shadow_distances,
+            mode='lines+markers',
+            name='Shadow Distance',
+            line=dict(color='orange', width=2),
+            hovertemplate='Orientation: %{x}°<br>Shadow Distance: %{y:.1f}m<extra></extra>'
+        ),
+        row=1, col=2
+    )
+    
+    # Add total distance to neighbors
+    if 'total_distances_to_neighbors' in shadow_data:
+        total_distances = shadow_data['total_distances_to_neighbors']
+        fig.add_trace(
+            go.Scatter(
+                x=orientations,
+                y=total_distances,
+                mode='lines+markers',
+                name='Total to Neighbors',
+                line=dict(color='red', width=2),
+                hovertemplate='Orientation: %{x}°<br>Total Distance: %{y:.1f}m<extra></extra>'
+            ),
+            row=1, col=2
+        )
+    
+    # 3. Multi-floor shadow comparison (showing neighbor collision at different heights)
+    if 'multi_floor_data' in shadow_data:
+        # Reorganize multi-floor data by floor instead of orientation
+        floors_data = {}
+        max_floors = shadow_data.get('max_neighbor_floors', 1)
+        
+        for orientation_key, floor_shadows in shadow_data['multi_floor_data'].items():
+            if isinstance(floor_shadows, list):
+                for floor_idx, shadow_dist in enumerate(floor_shadows):
+                    # Calculate actual height for this floor
+                    # Floor 0 = floor_height/2, Floor 1 = 1 + floor_height/2, etc.
+                    actual_height = (floor_idx + 0.5) * floor_height if floor_idx == 0 else floor_idx + (floor_height / 2)
+                    
+                    if floor_idx not in floors_data:
+                        floors_data[floor_idx] = {
+                            'orientations': [], 
+                            'shadows': [], 
+                            'height': actual_height,
+                            'valid_shadows': []  # Track non-infinite shadows
+                        }
+                    floors_data[floor_idx]['orientations'].append(float(orientation_key))
+                    
+                    # Handle infinite values
+                    import math
+                    if math.isinf(shadow_dist) or shadow_dist > 10000:  # Very large distance = no collision
+                        floors_data[floor_idx]['shadows'].append(None)
+                        floors_data[floor_idx]['valid_shadows'].append(False)
+                    else:
+                        floors_data[floor_idx]['shadows'].append(shadow_dist)
+                        floors_data[floor_idx]['valid_shadows'].append(True)
+        
+        # Sort orientations for each floor and add traces (limit to reasonable number of floors)
+        max_display_floors = min(8, max_floors)  # Limit display to avoid clutter
+        
+        for floor_idx in range(max_display_floors):
+            if floor_idx in floors_data:
+                floor_data = floors_data[floor_idx]
+                
+                # Sort by orientation and filter out None values
+                valid_data = [(o, s) for o, s, valid in zip(floor_data['orientations'], 
+                                                          floor_data['shadows'], 
+                                                          floor_data['valid_shadows']) 
+                             if valid and s is not None]
+                
+                if valid_data:  # Only add trace if there's valid data
+                    sorted_orientations, sorted_shadows = zip(*sorted(valid_data))
+                    
+                    fig.add_trace(
+                        go.Scatter(
+                            x=sorted_orientations,
+                            y=sorted_shadows,
+                            mode='lines+markers',
+                            name=f'Height {floor_data["height"]:.1f}m',
+                            hovertemplate=f'Height {floor_data["height"]:.1f}m<br>Orientation: %{{x}}°<br>Distance: %{{y:.1f}}m<extra></extra>',
+                            connectgaps=False  # Don't connect across gaps in data
+                        ),
+                        row=2, col=1
+                    )
+    
+    # 4. Elevation effects
+    if include_elevation and 'elevation' in building_row.index:
+        elevation = building_row['elevation']
+        # Create elevation profile visualization
+        effective_heights = [elevation + (i * floor_height) for i in range(5)]  # Show 5 floors
+        
+        fig.add_trace(
+            go.Scatter(
+                x=list(range(5)),
+                y=effective_heights,
+                mode='lines+markers',
+                name='Building Height Profile',
+                line=dict(color='green', width=3),
+                hovertemplate='Floor: %{x}<br>Total Height: %{y:.1f}m<extra></extra>'
+            ),
+            row=2, col=2
+        )
+        
+        # Add ground elevation reference as annotation instead of hline
+        fig.add_annotation(
+            x=2, y=elevation, 
+            text=f"Ground: {elevation:.1f}m",
+            showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=2, arrowcolor="brown",
+            bgcolor="white", bordercolor="brown", borderwidth=1,
+            row=2, col=2
+        )
+    
+    # Update layout
+    fig.update_layout(
+        title=f'Shadow Analysis for Building {building_reference}',
+        height=800,
+        showlegend=True,
+        template='plotly_white'
+    )
+    
+    # Update polar subplot
+    max_distance = max(max(shadow_distances), max(contour_distances))
+    if 'total_distances_to_neighbors' in shadow_data:
+        max_distance = max(max_distance, max(shadow_data['total_distances_to_neighbors']))
+    
+    fig.update_polars(
+        radialaxis=dict(title="Distance (m)", range=[0, max_distance * 1.1]),
+        angularaxis=dict(direction="clockwise", rotation=90)  # 0° = North
+    )
+    
+    # Update linear subplots
+    fig.update_xaxes(title_text="Orientation (degrees)", row=1, col=2)
+    fig.update_yaxes(title_text="Distance (m)", row=1, col=2)
+    
+    fig.update_xaxes(title_text="Orientation (degrees)", row=2, col=1)
+    fig.update_yaxes(title_text="Shadow Distance (m)", row=2, col=1)
+    
+    fig.update_xaxes(title_text="Floor Level", row=2, col=2)
+    fig.update_yaxes(title_text="Height (m)", row=2, col=2)
+    
+    # Save or display
+    if output_path:
+        if output_path.endswith('.html'):
+            fig.write_html(output_path)
+            print(f"Interactive shadow analysis saved to {output_path}")
+        else:
+            fig.write_image(output_path, width=1200, height=800)
+            print(f"Shadow analysis saved to {output_path}")
+    else:
+        fig.show()
+        return fig
+
+
+def _create_static_shadow_plot(building_row, building_reference, output_path,
+                              include_elevation, floor_height):
+    """Create static shadow visualization using matplotlib."""
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_pdf import PdfPages
+        import numpy as np
+    except ImportError:
+        print("Matplotlib not available. Please install matplotlib.")
+        return None
+    
+    # Extract shadow data
+    shadow_data = _extract_shadow_data(building_row)
+    if not shadow_data:
+        print(f"No shadow data found for building {building_reference}")
+        return None
+    
+    # Create figure with subplots
+    fig = plt.figure(figsize=(16, 12))
+    
+    # 1. Polar plot
+    ax1 = plt.subplot(2, 2, 1, projection='polar')
+    orientations_rad = [np.radians(float(o)) for o in shadow_data['orientations']]
+    orientations_deg = [float(o) for o in shadow_data['orientations']]
+    
+    # Building contour (centroid to building edge)
+    ax1.fill(orientations_rad, shadow_data['contour_distances'], 'blue', alpha=0.2, label='Building Footprint')
+    ax1.plot(orientations_rad, shadow_data['contour_distances'], 'b-', linewidth=2, label='Building Edge')
+    
+    # Total distance to neighbors
+    if 'total_distances_to_neighbors' in shadow_data:
+        ax1.plot(orientations_rad, shadow_data['total_distances_to_neighbors'], 'r-o', 
+                linewidth=2, markersize=4, label='Distance to Neighbors')
+    
+    # Shadow distances only
+    ax1.plot(orientations_rad, shadow_data['shadow_distances'], color='orange', linestyle=':', 
+            linewidth=2, marker='x', markersize=4, label='Shadow Distance Only')
+    
+    ax1.set_theta_direction(-1)  # Clockwise
+    ax1.set_theta_zero_location('N')
+    ax1.set_title('Building Shadow Analysis\n0°=N, 90°=E, 180°=S, 270°=W')
+    ax1.legend(bbox_to_anchor=(1.2, 1.0))
+    ax1.grid(True)
+    
+    # 2. Linear comparison
+    ax2 = plt.subplot(2, 2, 2)
+    
+    ax2.plot(orientations_deg, shadow_data['contour_distances'], 'b-', linewidth=2,
+             label='Building Edge (centroid to edge)')
+    ax2.plot(orientations_deg, shadow_data['shadow_distances'], color='orange', linestyle=':', 
+             linewidth=2, marker='x', markersize=4, label='Shadow Distance (edge to neighbor)')
+    
+    if 'total_distances_to_neighbors' in shadow_data:
+        ax2.plot(orientations_deg, shadow_data['total_distances_to_neighbors'], 'r-o', linewidth=2,
+                 markersize=4, label='Total Distance (centroid to neighbor)')
+    
+    ax2.set_xlabel('Orientation (degrees)')
+    ax2.set_ylabel('Distance (m)')
+    ax2.set_xlim(0, 360)
+    ax2.set_xticks([0, 90, 180, 270, 360])
+    ax2.set_xticklabels(['N', 'E', 'S', 'W', 'N'])
+    ax2.set_title('Distance Analysis by Orientation')
+    ax2.legend()
+    ax2.grid(True)
+    
+    # 3. Multi-floor comparison (showing neighbor collision at different heights)
+    ax3 = plt.subplot(2, 2, 3)
+    if 'multi_floor_data' in shadow_data:
+        # Reorganize multi-floor data by floor instead of orientation
+        floors_data = {}
+        max_floors = shadow_data.get('max_neighbor_floors', 1)
+        
+        for orientation_key, floor_shadows in shadow_data['multi_floor_data'].items():
+            if isinstance(floor_shadows, list):
+                for floor_idx, shadow_dist in enumerate(floor_shadows):
+                    # Calculate actual height for this floor
+                    actual_height = (floor_idx + 0.5) * floor_height if floor_idx == 0 else floor_idx + (floor_height / 2)
+                    
+                    if floor_idx not in floors_data:
+                        floors_data[floor_idx] = {
+                            'orientations': [], 
+                            'shadows': [], 
+                            'height': actual_height,
+                            'valid_shadows': []
+                        }
+                    floors_data[floor_idx]['orientations'].append(float(orientation_key))
+                    
+                    # Handle infinite values
+                    import math
+                    if math.isinf(shadow_dist) or shadow_dist > 10000:
+                        floors_data[floor_idx]['shadows'].append(np.nan)  # Use NaN for matplotlib
+                        floors_data[floor_idx]['valid_shadows'].append(False)
+                    else:
+                        floors_data[floor_idx]['shadows'].append(shadow_dist)
+                        floors_data[floor_idx]['valid_shadows'].append(True)
+        
+        # Sort orientations for each floor and plot (limit to reasonable number)
+        max_display_floors = min(8, max_floors)
+        
+        for floor_idx in range(max_display_floors):
+            if floor_idx in floors_data:
+                floor_data = floors_data[floor_idx]
+                
+                # Sort by orientation
+                sorted_pairs = sorted(zip(floor_data['orientations'], floor_data['shadows']))
+                sorted_orientations, sorted_shadows = zip(*sorted_pairs)
+                
+                # Only plot if there are valid (non-NaN) values
+                valid_shadows = [s for s in sorted_shadows if not (math.isnan(s) if isinstance(s, float) else False)]
+                if valid_shadows:
+                    ax3.plot(sorted_orientations, sorted_shadows, 
+                            linewidth=2, label=f'Height {floor_data["height"]:.1f}m', 
+                            marker='o', markersize=3)
+                            
+    ax3.set_xlabel('Orientation (degrees)')
+    ax3.set_ylabel('Distance to Neighbor (m)')
+    ax3.set_xlim(0, 360)
+    ax3.set_xticks([0, 90, 180, 270, 360])
+    ax3.set_xticklabels(['N', 'E', 'S', 'W', 'N'])
+    ax3.set_title('Shadow Distances at Different Heights')
+    ax3.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    ax3.grid(True)
+    
+    # 4. Elevation profile
+    ax4 = plt.subplot(2, 2, 4)
+    if include_elevation and 'elevation' in building_row.index:
+        elevation = building_row['elevation']
+        floors = list(range(5))
+        heights = [elevation + (i * floor_height) for i in floors]
+        
+        ax4.plot(floors, heights, 'g-o', linewidth=3, markersize=8, label='Building Height')
+        ax4.axhline(y=elevation, color='brown', linestyle='--', 
+                   label=f'Ground Elevation ({elevation:.1f}m)')
+        
+        ax4.set_xlabel('Floor Level')
+        ax4.set_ylabel('Height (m)')
+        ax4.set_title('Building Height Profile')
+        ax4.legend()
+        ax4.grid(True)
+    
+    plt.suptitle(f'Shadow Analysis for Building {building_reference}', fontsize=16)
+    plt.tight_layout()
+    
+    # Save or display
+    if output_path:
+        if output_path.endswith('.pdf'):
+            with PdfPages(output_path) as pdf:
+                pdf.savefig(fig, bbox_inches='tight')
+        else:
+            plt.savefig(output_path, bbox_inches='tight', dpi=300)
+        print(f"Shadow analysis saved to {output_path}")
+        plt.close()
+    else:
+        plt.show()
+        return fig
+
+
+def _detect_floor_height_from_data(building_row):
+    """
+    Automatically detect floor height from building shadow data.
+    
+    The floor height can be inferred from:
+    1. Vertical distance data between floors
+    2. Multi-floor shadow pattern analysis
+    3. Default to 3.0m if detection fails
+    
+    Parameters:
+    -----------
+    building_row : pandas.Series
+        Building data row containing shadow analysis results
+        
+    Returns:
+    --------
+    float
+        Detected floor height in meters
+    """
+    detected_height = 3.0  # Default fallback
+    
+    # Method 1: Try to extract from vertical distance data
+    if 'br__vertical_distances_at_collision' in building_row.index:
+        vertical_data = building_row['br__vertical_distances_at_collision']
+        if isinstance(vertical_data, dict):
+            # Look for consistent vertical spacing between floors
+            for orientation_key, distances in vertical_data.items():
+                if isinstance(distances, list) and len(distances) >= 3:
+                    # Calculate differences between consecutive floors
+                    valid_distances = [d for d in distances if not (isinstance(d, float) and (d == float('inf') or pd.isna(d)))]
+                    if len(valid_distances) >= 3:
+                        height_diffs = [valid_distances[i+1] - valid_distances[i] for i in range(len(valid_distances)-1)]
+                        # Check if differences are consistent (indicating regular floor height)
+                        if height_diffs and max(height_diffs) - min(height_diffs) < 0.5:  # Within 0.5m tolerance
+                            detected_height = sum(height_diffs) / len(height_diffs)
+                            break
+    
+    # Method 2: Try to infer from shadow data pattern (if Method 1 fails)
+    if detected_height == 3.0 and 'br__shadows_at_distance' in building_row.index:
+        shadows = building_row['br__shadows_at_distance']
+        if isinstance(shadows, dict):
+            for orientation_key, shadow_list in shadows.items():
+                if isinstance(shadow_list, list) and len(shadow_list) >= 3:
+                    # Look for patterns in shadow growth that suggest floor height
+                    # Ground floor (index 0) = floor_height/2
+                    # Floor 1 (index 1) = 1 + floor_height/2  
+                    # Floor 2 (index 2) = 2 + floor_height/2
+                    # This means: floor1_height - floor0_height ≈ 1 + floor_height/2 - floor_height/2 = 1
+                    # And: floor2_height - floor1_height ≈ 1
+                    # But this is complex with shadows, so we use a heuristic
+                    
+                    # If we have exactly the right pattern, floor height ≈ 3.0 is reasonable
+                    if len(shadow_list) == 12:  # Common pattern from your example
+                        detected_height = 3.0
+                        break
+    
+    # Ensure reasonable bounds (1-6 meters typical for residential/commercial)
+    detected_height = max(1.0, min(6.0, detected_height))
+    
+    return detected_height
+
+
+def _extract_shadow_data(building_row):
+    """
+    Extract and parse shadow data from building row.
+    
+    Data interpretation:
+    - br__building_contour_at_distance: Distance from building centroid to outer building geometry
+    - br__shadows_at_distance: Distance from outer building geometry to closest neighboring building
+    - Each floor in shadows_at_distance represents potential collision with neighbors at that height
+    - Floor heights: floor 0 = floor_height/2, floor 1 = 1 + floor_height/2, etc.
+    - Orientations: 0-360 degrees (0=North, 90=East, 180=South, 270=West)
+    """
+    shadow_data = {}
+    
+    # Try to extract shadow distances (br__shadows_at_distance)
+    if 'br__shadows_at_distance' in building_row.index:
+        shadows = building_row['br__shadows_at_distance']
+        if isinstance(shadows, dict):
+            # Extract orientations and corresponding shadow distances (0-360 degrees)
+            orientations = sorted([float(k) for k in shadows.keys() if k.replace('.','').isdigit()])
+            
+            # For each orientation, get the shadow distance (handle list format for multiple floors)
+            shadow_distances = []
+            multi_floor_data = {}
+            max_floors = 0
+            
+            for orientation in orientations:
+                orientation_key = str(int(orientation))
+                if orientation_key in shadows:
+                    shadow_values = shadows[orientation_key]
+                    if isinstance(shadow_values, list) and len(shadow_values) > 0:
+                        # Take the ground floor's shadow distance for main plot (floor 0)
+                        shadow_distances.append(shadow_values[0])
+                        # Store all floor data - this represents shadows to neighbors at different heights
+                        multi_floor_data[orientation_key] = shadow_values
+                        max_floors = max(max_floors, len(shadow_values))
+                    elif isinstance(shadow_values, (int, float)):
+                        # Single value
+                        shadow_distances.append(shadow_values)
+                        multi_floor_data[orientation_key] = [shadow_values]
+                    else:
+                        shadow_distances.append(0)
+                        multi_floor_data[orientation_key] = [0]
+                else:
+                    shadow_distances.append(0)
+                    multi_floor_data[orientation_key] = [0]
+            
+            shadow_data['orientations'] = orientations
+            shadow_data['shadow_distances'] = shadow_distances
+            shadow_data['multi_floor_data'] = multi_floor_data
+            shadow_data['max_neighbor_floors'] = max_floors
+    
+    # Try to extract building contour distances (br__building_contour_at_distance)
+    if 'br__building_contour_at_distance' in building_row.index:
+        contours = building_row['br__building_contour_at_distance']
+        if isinstance(contours, dict):
+            # Match orientations with contour data (0-360 degrees)
+            orientations = shadow_data.get('orientations', sorted([float(k) for k in contours.keys() if k.replace('.','').isdigit()]))
+            contour_distances = []
+            
+            for orientation in orientations:
+                orientation_key = str(int(orientation))
+                if orientation_key in contours:
+                    contour_value = contours[orientation_key]
+                    if isinstance(contour_value, (int, float)):
+                        contour_distances.append(contour_value)
+                    else:
+                        contour_distances.append(0)
+                else:
+                    contour_distances.append(0)
+            
+            shadow_data['orientations'] = orientations
+            shadow_data['contour_distances'] = contour_distances
+    
+    # Calculate total distances from centroid to neighboring buildings for ground floor
+    if 'orientations' in shadow_data and 'shadow_distances' in shadow_data and 'contour_distances' in shadow_data:
+        # Total distance = building contour + shadow distance
+        total_distances = [contour + shadow for contour, shadow in zip(shadow_data['contour_distances'], shadow_data['shadow_distances'])]
+        shadow_data['total_distances_to_neighbors'] = total_distances
+    
+    # Try to extract elevation data
+    if 'elevation' in building_row.index:
+        shadow_data['elevation'] = building_row['elevation']
+        
+    # Try to extract floor count or height data
+    if 'br__number_of_floors' in building_row.index:
+        shadow_data['floors'] = building_row['br__number_of_floors']
+    elif 'numberOfFloors' in building_row.index:
+        shadow_data['floors'] = building_row['numberOfFloors']
+    
+    return shadow_data if shadow_data else None
+
+
+# ==========================================
+# NEIGHBORING MUNICIPALITIES
+# ==========================================
+def get_neighboring_cadaster_codes(
+    cadaster_codes,
+    census_tracts_dir,
+    buffer_distance=1000,
+    include_original=False,
+    year=2022
+):
+    """
+    Get cadaster codes of neighboring municipalities based on census tract adjacency.
+
+    Parameters
+    ----------
+    cadaster_codes : str or list
+        Cadaster code(s)
+    census_tracts_dir : str
+        Directory containing census_tracts.geojson
+    buffer_distance : int, default 1000
+        Buffer distance in meters
+    include_original : bool, default False
+        Whether to include original municipalities in the output
+
+    Returns
+    -------
+    list
+        List of cadaster codes (neighbors or neighbors + original)
+    """
+
+    # ------------------------------------------------------------
+    # 1️⃣ Normalize input
+    # ------------------------------------------------------------
+    if not cadaster_codes:
+        return []
+
+    if isinstance(cadaster_codes, str):
+        cadaster_codes = [cadaster_codes]
+
+    # ------------------------------------------------------------
+    # 2️⃣ Load census tracts
+    # ------------------------------------------------------------
+    census_file = f"{census_tracts_dir}//validated_census_{year}.gpkg"
+
+    if not os.path.exists(census_file):
+        print("[WARN] Census file not found")
+        return cadaster_codes if include_original else []
+
+    census_gdf = gpd.read_file(census_file)
+
+    if census_gdf.empty:
+        print("[WARN] Census GeoDataFrame is empty")
+        return cadaster_codes if include_original else []
+
+    # ------------------------------------------------------------
+    # 3️⃣ Validate schema
+    # ------------------------------------------------------------
+    if "CUMUN" not in census_gdf.columns:
+        raise ValueError("CUMUN column not found in census data")
+
+    census_gdf["CUMUN"] = census_gdf["CUMUN"].astype(str)
+
+    # ------------------------------------------------------------
+    # 4️⃣ CRS fix (buffer requires projected CRS)
+    # ------------------------------------------------------------
+    if census_gdf.crs is None:
+        raise ValueError("Census CRS is undefined")
+
+    if census_gdf.crs.is_geographic:
+        census_gdf = census_gdf.to_crs(3857)
+
+    # ------------------------------------------------------------
+    # 5️⃣ Convert cadaster → INE
+    # ------------------------------------------------------------
+    original_ine_codes = cadaster_to_ine_codes(cadaster_codes)
+
+    if not original_ine_codes:
+        print("[WARN] No INE codes derived")
+        return cadaster_codes if include_original else []
+
+    original_ine_codes = [str(code) for code in original_ine_codes]
+
+    # ------------------------------------------------------------
+    # 6️⃣ Filter original municipalities
+    # ------------------------------------------------------------
+    original_tracts = census_gdf[
+        census_gdf["CUMUN"].isin(original_ine_codes)
+    ]
+
+    if original_tracts.empty:
+        print("[WARN] No matching census tracts")
+        return cadaster_codes if include_original else []
+
+    # ------------------------------------------------------------
+    # 7️⃣ Buffer
+    # ------------------------------------------------------------
+    original_union = original_tracts.unary_union
+    buffered_area = original_union.buffer(buffer_distance)
+
+    # ------------------------------------------------------------
+    # 8️⃣ Spatial query
+    # ------------------------------------------------------------
+    neighboring_tracts = census_gdf[
+        census_gdf.geometry.intersects(buffered_area)
+    ]
+
+    neighbor_ine_codes = neighboring_tracts["CUMUN"].unique()
+
+    # ------------------------------------------------------------
+    # 9️⃣ Remove originals (KEY STEP)
+    # ------------------------------------------------------------
+    neighbor_only_ine = set(neighbor_ine_codes) - set(original_ine_codes)
+
+    if include_original:
+        final_ine = set(original_ine_codes) | neighbor_only_ine
+    else:
+        final_ine = neighbor_only_ine
+
+    if not final_ine:
+        return cadaster_codes if include_original else []
+
+    # ------------------------------------------------------------
+    # 🔟 Convert back to cadaster
+    # ------------------------------------------------------------
+    all_cadaster_codes = ine_to_cadaster_codes(list(final_ine))
+
+    if not all_cadaster_codes:
+        print("[WARN] ine_to_cadaster_codes returned empty")
+
+    return all_cadaster_codes
+
+# ==========================================
 # DATA ANALYSIS & PROCESSING
 # ==========================================
 
@@ -2119,7 +3562,7 @@ def plot_linestrings_and_polygons(linestrings, polygons=None, pdf_file=None):
 
 def plot_building_reference(
     gdf,
-    idx=0,
+    building_reference="",
     address_col="address_location",
     building_centroid_col="building_centroid",
     parcel_centroid_col="parcel_centroid",
@@ -2143,7 +3586,7 @@ def plot_building_reference(
         Image resolution
     """
 
-    row = gdf.iloc[idx]
+    row = gdf[gdf['building_reference'] == building_reference].iloc[0]
 
     # --------------------------------------------------
     # 1️⃣ Collect geometries

@@ -18,7 +18,8 @@ from hypercadaster_ES import downloaders
 
 def download(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
              neighborhood_layer=True, postal_code_layer=True, census_layer=True,
-             elevation_layer=True, open_data_layers=True, force=False):
+             elevation_layer=True, open_data_layers=True, force=False, 
+             building_parts_inference=False):
 
     if force:
         try:
@@ -64,8 +65,28 @@ def download(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
     ine_codes = utils.cadaster_to_ine_codes(cadaster_codes)
     province_codes = list(set([code[:2] for code in ine_codes]))
 
-    # Download the cadaster datasets of that area
-    downloaders.cadaster_downloader(cadaster_dir=utils.cadaster_dir_(wd), cadaster_codes=cadaster_codes)
+    # Census tracts (download early if needed for neighboring municipalities)
+    if census_layer:
+        downloaders.download_census_tracts(census_tracts_dir=utils.census_tracts_dir_(wd), year=2022)
+
+    # If building parts inference is enabled, include neighboring municipalities
+    if building_parts_inference:
+        extended_cadaster_codes = utils.get_neighboring_cadaster_codes(
+            cadaster_codes, 
+            utils.census_tracts_dir_(wd),
+            buffer_distance=200,  # 200m buffer to find neighbors
+            include_original=True
+        )
+        
+        # Download cadaster data for extended area
+        downloaders.cadaster_downloader(cadaster_dir=utils.cadaster_dir_(wd), cadaster_codes=extended_cadaster_codes)
+
+        # Update province codes for other downloads
+        ine_codes = utils.cadaster_to_ine_codes(extended_cadaster_codes)
+        province_codes = list(set([code[:2] for code in ine_codes]))
+    else:
+        # Download the cadaster datasets of that area
+        downloaders.cadaster_downloader(cadaster_dir=utils.cadaster_dir_(wd), cadaster_codes=cadaster_codes)
     # Districts and neighborhoods definition are only available for the city of Barcelona
     if '08019' in ine_codes or '08900' in cadaster_codes and neighborhood_layer:
         downloaders.download_file(dir=utils.districts_dir_(wd),
@@ -88,8 +109,8 @@ def download(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
         bbox_postal_code = utils.get_bbox(gdf = postal_codes_gdf)
         downloaders.download_DEM_raster(raster_dir=utils.DEM_raster_dir_(wd), bbox=bbox_postal_code)
 
-    # Census tracts and districts
-    if census_layer:
+    # Census tracts and districts (if not already downloaded)
+    if census_layer and not building_parts_inference:
         downloaders.download_census_tracts(census_tracts_dir=utils.census_tracts_dir_(wd), year=2022)
 
     # OpenDataBarcelona
@@ -120,12 +141,24 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
           neighborhood_layer=True, postal_code_layer=True, census_layer=True, elevations_layer=True,
           open_data_layers=True, building_parts_inference=False, building_parts_plots=False,
           plot_zones_ratio=0.01, use_CAT_files=False, CAT_files_rel_dir="CAT_files",
-          compact_addresses=False):
+          compact_addresses=False, pois_layer=False):
     """
     Merge cadastral and geographic data into a unified GeoDataFrame.
-    
+
     Parameters:
     -----------
+    pois_layer : bool, default False
+        If True, fetches POIs from OpenStreetMap (amenity, emergency, healthcare,
+        leisure, office, shop, tourism) and adds per-building indicators:
+
+        - poi_{group}[_{subgroup}]_count : POIs directly assigned to the building
+        - poi_{group}[_{subgroup}]_ids   : list of POI identifiers on the building
+        - poi_{group}[_{subgroup}]_100m  : POI count within 100 m
+        - poi_{group}[_{subgroup}]_250m  : POI count within 250 m
+        - poi_{group}[_{subgroup}]_500m  : POI count within 500 m
+
+        Results are cached in the open_street directory.
+
     compact_addresses : bool, default False
         If True, compacts address data so that each building_reference appears only once
         with address and geolocation information stored as lists. This reduces the number
@@ -199,6 +232,8 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
 
     gdf = mergers.join_cadaster_data(
         cadaster_dir=utils.cadaster_dir_(wd),
+        census_tracts_dir=utils.census_tracts_dir_(wd),
+        DEM_raster_dir=utils.DEM_raster_dir_(wd),
         cadaster_codes=cadaster_codes,
         results_dir=utils.results_dir_(wd),
         open_street_dir=utils.open_street_dir_(wd),
@@ -210,7 +245,6 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
         open_data_layers_dir=utils.open_data_dir_(wd),
         CAT_files_dir=f"{wd}/{CAT_files_rel_dir}"
     )
-    crs = gdf.crs
 
     if census_layer:
         gdf = mergers.join_by_census_tracts(
@@ -251,6 +285,13 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
                     building_reference_col='building_reference'
                 )
 
+    if pois_layer:
+        gdf = mergers.join_pois(
+            gdf=gdf,
+            open_street_dir=utils.open_street_dir_(wd),
+            cadaster_dir=utils.cadaster_dir_(wd),
+            cadaster_codes=cadaster_codes,
+        )
 
     return gdf
 

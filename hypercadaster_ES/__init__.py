@@ -20,8 +20,9 @@ Examples:
 
 from .functions import download, merge
 from .utils import get_ine_codes_from_bounding_box, ine_to_cadaster_codes, municipality_name
+from . import mergers, utils, building_inference, downloaders, interoperability
 
-__version__ = "1.0.0"
+__version__ = "1.0.6"
 __author__ = "Jose Manuel Broto Vispe"
 __email__ = "jmbrotovispe@gmail.com"
 

@@ -19,6 +19,7 @@ Author: hypercadaster_ES examples
 
 import hypercadaster_ES as hc
 import pandas as pd
+import geopandas as gpd
 
 # Configuration
 # Working directory where all data will be stored
@@ -60,12 +61,13 @@ for i, municipality in enumerate(cadaster_codes, 1):
         plot_zones_ratio=0.02,          # Plot 2% of zones for visualization
         use_CAT_files=True,             # Use detailed CAT format files for space analysis
         CAT_files_rel_dir="CAT_files",   # Directory containing CAT files
-        compact_addresses=True
+        compact_addresses=True,
+        pois_layer=True
     )
-    hc.utils.plot_building_reference(gdf_municipality,10,output_path="/home/gmor/test.png")
-
-    # Add municipality identifier for tracking
-    gdf_municipality['processing_municipality'] = municipality
+    # import pprint
+    # pprint.pp(gdf_municipality[gdf_municipality["building_reference"]=="8341105DF2884A"].iloc[0].to_dict())
+    # hc.utils.plot_building_reference(gdf_municipality,'8341105DF2884A',output_path="/home/gmor/test.png")
+    # hc.utils.plot_building_shadows_analysis(gdf_municipality, '8341105DF2884A')
     
     # Save individual result
     individual_filename = f"{wd}/{municipality}_complete_inference.pkl"
@@ -75,47 +77,38 @@ for i, municipality in enumerate(cadaster_codes, 1):
     
     all_results.append(gdf_municipality)
 
-# Combine all results
-print("\n" + "="*60)
-print("COMBINING RESULTS FROM ALL MUNICIPALITIES")
-print("="*60)
+if len(cadaster_codes)>1:
 
-if len(all_results) > 1:
-    print("Concatenating results from all municipalities...")
-    combined_gdf = pd.concat(all_results, ignore_index=True)
-else:
-    combined_gdf = all_results[0]
+    # Combine all results
+    print("\n" + "="*60)
+    print("COMBINING RESULTS FROM ALL MUNICIPALITIES")
+    print("="*60)
 
-# Save combined results
-output_filename = f"{wd}/{'~'.join(cadaster_codes)}_complete_inference.pkl"
-print(f"Saving combined results to: {output_filename}")
-combined_gdf.to_pickle(output_filename, compression="gzip")
+    if len(all_results) > 1:
+        print("Concatenating results from all municipalities...")
+        combined_gdf = pd.concat(all_results, ignore_index=True)
+    else:
+        combined_gdf = all_results[0]
 
-## To read these results:
-#import pandas as pd
-#import pprint
-#df = pd.read_pickle("/Users/gmor-air/Downloads/08900.pkl", compression="gzip")
-## Characteristics for one building: main entrance location (EPSG:25831), general geometry (EPSG:25831),
-## elevation from sea level (m), number of floors (u) (multiply it by 3m and you will obtain and approximate building
-## height)
-#pprint.pp(dict(df[["building_reference", "location", "building_geometry", "elevation", "br__floors_above_ground"]].
-#               iloc[100]), width=100, depth=2, compact=True)
+    # Save combined results
+    output_filename = f"{wd}/{'~'.join(cadaster_codes)}_complete_inference.pkl"
+    print(f"Saving combined results to: {output_filename}")
+    combined_gdf.to_pickle(output_filename, compression="gzip")
 
+    # Summary statistics
+    print("\n" + "="*60)
+    print("ANALYSIS COMPLETED")
+    print("="*60)
+    print(f"Total buildings processed: {len(combined_gdf):,}")
+    print(f"Municipalities analyzed: {len(cadaster_codes)}")
+    print(f"Municipality breakdown:")
+    for municipality in cadaster_codes:
+        count = len(combined_gdf[combined_gdf['processing_municipality'] == municipality])
+        print(f"  - {municipality}: {count:,} buildings")
 
-# Summary statistics
-print("\n" + "="*60)
-print("ANALYSIS COMPLETED")
-print("="*60)
-print(f"Total buildings processed: {len(combined_gdf):,}")
-print(f"Municipalities analyzed: {len(cadaster_codes)}")
-print(f"Municipality breakdown:")
-for municipality in cadaster_codes:
-    count = len(combined_gdf[combined_gdf['processing_municipality'] == municipality])
-    print(f"  - {municipality}: {count:,} buildings")
-
-print(f"\nResults saved with compression to reduce file size.")
-print(f"Individual files: [municipality]_complete_inference.pkl")
-print(f"Combined file: {'~'.join(cadaster_codes)}_complete_inference.pkl")
+    print(f"\nResults saved with compression to reduce file size.")
+    print(f"Individual files: [municipality]_complete_inference.pkl")
+    print(f"Combined file: {'~'.join(cadaster_codes)}_complete_inference.pkl")
 
 # Note: The following commented list contains problematic zone references
 # from Barcelona analysis that may require special handling in future versions
@@ -127,3 +120,9 @@ print(f"Combined file: {'~'.join(cadaster_codes)}_complete_inference.pkl")
 #     '65192DF2861H', '75688DF2876H', '81041DF2880C', '83526DF2885A', '84654DF2786E', '86789DF2887H', '88235DF2882D',
 #     '92827DF2898C', '93655DF2796E', 'unknown'
 # ]
+
+# # Read a pickle file
+# import pandas as pd
+# import pprint
+# gdf = pd.read_pickle(f"{wd}/{'~'.join(cadaster_codes)}_complete_inference.pkl", compression="gzip")
+# pprint.pp(gdf.iloc[0].to_dict())
