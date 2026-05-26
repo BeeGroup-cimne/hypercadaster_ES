@@ -23,7 +23,7 @@ import geopandas as gpd
 import rasterio
 import regex as re
 from shapely import wkt
-from shapely.geometry import Point
+from shapely.geometry import Point, Polygon, box
 from tqdm import tqdm
 
 from hypercadaster_ES import utils
@@ -437,18 +437,31 @@ def assign_building_zones(gdf, cadaster_dir, cadaster_codes):
     
     start_time = time.time()
 
-    # Add cadaster_code column if not present
-    if 'cadaster_code' not in gdf.columns:
-        gdf['cadaster_code'] = gdf['building_reference'].str[:5]
-    
     # Initialize zone columns
     gdf['zone_reference'] = "unassigned"
     gdf['zone_type'] = "urban"
-    
+
     processed_buildings = 0
 
     codes = tqdm(cadaster_codes, desc="Processing zones by municipality") \
         if isinstance(cadaster_codes, list) else [cadaster_codes]
+
+    # Tag every row with the current municipality code. The first 5 chars of a
+    # Spanish cadastral reference are the parcel reference within a municipality
+    # — NOT the cadaster/municipality code — so deriving cadaster_code from
+    # building_reference[:5] silently drops the bulk of the data. When this
+    # function is called per-municipality the GDF rows all belong to `code`.
+    if 'cadaster_code' not in gdf.columns:
+        if isinstance(cadaster_codes, str):
+            gdf['cadaster_code'] = cadaster_codes
+        elif isinstance(cadaster_codes, list) and len(cadaster_codes) == 1:
+            gdf['cadaster_code'] = cadaster_codes[0]
+        else:
+            raise ValueError(
+                "assign_building_zones: gdf has no 'cadaster_code' column and "
+                "multiple cadaster_codes were passed; the caller must label rows "
+                "per municipality before calling this function."
+            )
 
     for code in codes:
         try:
@@ -479,45 +492,49 @@ def assign_building_zones(gdf, cadaster_dir, cadaster_codes):
                 
             processed_buildings += len(buildings_for_code)
             
-            # Create building centroids for zone assignment
+            # Create building centroids for zone assignment.
+            # Drop the pre-initialized zone columns so sjoin doesn't produce
+            # zone_reference_left / zone_reference_right suffixes that the
+            # downstream resolution can't disambiguate reliably.
+            buildings_for_code = buildings_for_code.drop(
+                columns=[c for c in ("zone_reference", "zone_type") if c in buildings_for_code.columns]
+            )
             buildings_for_code['centroid'] = buildings_for_code['building_geometry'].centroid
             buildings_centroids = buildings_for_code.set_geometry('centroid')
-            
+
             # Align CRS
             if buildings_centroids.crs != zone_gdf.crs:
                 buildings_centroids = buildings_centroids.to_crs(zone_gdf.crs)
-            
-            # Simple spatial join using building centroids - much more accurate than address points!
+
+            # Spatial join using building centroids
             joined = gpd.sjoin(buildings_centroids, zone_gdf, how="left", predicate="within")
-            
-            # Check what columns we got from the join
-            right_zone_ref_col = None
-            right_zone_type_col = None
-            for col in joined.columns:
-                if col.endswith('zone_reference'):
-                    right_zone_ref_col = col
-                elif col.endswith('zone_type'):
-                    right_zone_type_col = col
-            
-            # Update the main dataframe with zone assignments
-            if len(joined) > 0 and right_zone_ref_col and right_zone_type_col:
-                # Get successful assignments
-                assigned_mask = joined[right_zone_ref_col].notna()
-                assigned_buildings = joined[assigned_mask]
-                
-                for idx in assigned_buildings.index:
-                    zone_ref = assigned_buildings.loc[idx, right_zone_ref_col]
-                    zone_type = assigned_buildings.loc[idx, right_zone_type_col]
-                    
-                    gdf.loc[idx, "zone_reference"] = zone_ref
-                    # Clean up zone types
-                    if zone_type == "MANZANA ":
-                        gdf.loc[idx, "zone_type"] = "urban"
-                    elif zone_type == "POLIGONO ":
-                        gdf.loc[idx, "zone_type"] = "disseminated"
-                    else:
-                        gdf.loc[idx, "zone_type"] = "urban"  # default
-            
+
+            if len(joined) == 0 or "zone_reference" not in joined.columns:
+                continue
+
+            # Vectorized assignment back to the original gdf (sjoin preserves left index)
+            assigned_mask = joined["zone_reference"].notna()
+            if not assigned_mask.any():
+                continue
+
+            zone_ref_series = joined.loc[assigned_mask, "zone_reference"]
+            zone_type_series = joined.loc[assigned_mask, "zone_type"]
+
+            # MANZANA → urban, POLIGONO → disseminated, anything else → urban
+            zone_type_clean = np.where(
+                zone_type_series.astype(str).str.strip() == "POLIGONO",
+                "disseminated",
+                "urban",
+            )
+
+            gdf.loc[zone_ref_series.index, "zone_reference"] = zone_ref_series.values
+            gdf.loc[zone_ref_series.index, "zone_type"] = zone_type_clean
+
+            sys.stderr.write(
+                f"assign_building_zones[{code}]: {assigned_mask.sum()}/{len(joined)} "
+                f"buildings assigned to {zone_ref_series.nunique()} unique zones\n"
+            )
+
         except Exception as e:
             sys.stderr.write(f"Error processing zones for {code}: {e}\n")
             continue
@@ -535,7 +552,8 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
                            cadaster_codes, results_dir, open_street_dir, building_parts_plots=False,
                            plot_zones_ratio=0.01, building_parts_inference=False,
                            building_parts_inference_using_CAT_files=False, open_data_layers=False,
-                           open_data_layers_dir=None, CAT_files_dir=None):
+                           open_data_layers_dir=None, CAT_files_dir=None,
+                           floor_height=3.0, ground_floor_height=5.0, num_workers=-1):
 
     sys.stderr.write(f"\nJoining the buildings description for {len(cadaster_codes)} municipalities\n")
 
@@ -685,6 +703,18 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
                     how="left"
                 )
 
+            # Zone info lives on building_gdf_ (from assign_building_zones), not on
+            # the address gdf — pull it across so building parts can be grouped by zone.
+            if {'building_reference', 'zone_reference', 'zone_type'}.issubset(building_gdf_.columns):
+                zone_info = (building_gdf_[['building_reference', 'zone_reference', 'zone_type']]
+                             .drop_duplicates('building_reference'))
+                for col in ('zone_reference', 'zone_type'):
+                    if col in building_part_gdf_.columns:
+                        building_part_gdf_ = building_part_gdf_.drop(columns=[col])
+                building_part_gdf_ = building_part_gdf_.merge(
+                    zone_info, on='building_reference', how='left'
+                )
+
             # Ensure zone columns exist
             building_part_gdf_["zone_type"] = building_part_gdf_.get("zone_type", "unknown")
             building_part_gdf_["zone_reference"] = building_part_gdf_.get("zone_reference", "unknown")
@@ -759,7 +789,9 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
                 code=code, building_part_gdf_=building_part_gdf_, buildings_CAT=buildings_CAT,
                 parcels_gdf=parcels_gdf, results_dir=results_dir, cadaster_dir=cadaster_dir,
                 open_street_dir=open_street_dir, plots=building_parts_plots, plot_zones_ratio=plot_zones_ratio,
-                floor_height=3.0, nearby_buildings_buffer=nearby_buildings_buffer)  # Default 3m floor height
+                floor_height=floor_height, ground_floor_height=ground_floor_height,
+                DEM_raster_dir=DEM_raster_dir, nearby_buildings_buffer=nearby_buildings_buffer,
+                num_workers=num_workers)
 
             # Unpack the results: (sbr_results, br_results)
             sbr_results, br_results = building_part_gdf_
@@ -795,30 +827,42 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
                     multi_sbr = sbr_results[sbr_results["n_sbr"] > 1].copy()
 
                     if not multi_sbr.empty:
+                        # Vectorised replacement for the previous
+                        # `groupby.apply(aggregate_sbr)` which did
+                        # per-row .iterrows() × per-column work — the
+                        # dominant tail cost on Barcelona-scale runs.
+                        #
+                        # Approach: sort once by building_reference, find
+                        # group boundaries via np.unique, then for each
+                        # sbr_col slice that column's numpy array per group
+                        # and build a `{sbr_id: val}` dict, dropping invalid
+                        # values. Same output schema as before
+                        # (one row per building_reference, each sbr_col is
+                        # a dict or None).
+                        _ms = multi_sbr.sort_values("building_reference", kind="stable")
+                        _br_vals = _ms["building_reference"].to_numpy()
+                        _sbr_ids = _ms["single_building_reference"].to_numpy()
+                        _unique_refs, _start = np.unique(_br_vals, return_index=True)
+                        # np.unique returns sorted order; _start indices are
+                        # ascending because _ms was sorted by the same key.
+                        _end = np.r_[_start[1:], len(_br_vals)]
 
-                        def aggregate_sbr(group):
-                            result = {}
-
-                            for col in sbr_cols:
-                                result_col = {}
-
-                                for _, row in group.iterrows():
-                                    val = row[col]
-
-                                    if utils.is_valid_value(val):
-                                        sbr_id = row["single_building_reference"]
-                                        result_col[sbr_id] = val
-
-                                result[col] = result_col if result_col else None
-
-                            return pd.Series(result)
-
-                        sbr_multi = (
-                            multi_sbr
-                            .groupby("building_reference")
-                            .apply(aggregate_sbr, include_groups=False)
-                            .reset_index()
-                        )
+                        _is_valid = utils.is_valid_value
+                        _cols_out = {"building_reference": _unique_refs}
+                        for _col in sbr_cols:
+                            _col_arr = _ms[_col].to_numpy()
+                            _per_group = [None] * len(_unique_refs)
+                            for _gi, (_s, _e) in enumerate(zip(_start, _end)):
+                                _d = {
+                                    _sbr_ids[i]: _col_arr[i]
+                                    for i in range(_s, _e)
+                                    if _is_valid(_col_arr[i])
+                                }
+                                if _d:
+                                    _per_group[_gi] = _d
+                            _cols_out[_col] = _per_group
+                        sbr_multi = pd.DataFrame(_cols_out)
+                        del _ms, _br_vals, _sbr_ids, _cols_out
 
                     else:
                         sbr_multi = pd.DataFrame(columns=["building_reference"] + sbr_cols)
@@ -997,7 +1041,8 @@ def join_adm_div_naming(gdf, cadaster_dir, cadaster_codes):
 
 def join_cadaster_data(cadaster_dir, census_tracts_dir, DEM_raster_dir, cadaster_codes, results_dir, open_street_dir,
                        building_parts_plots=False, building_parts_inference=False, plot_zones_ratio=0.01,
-                       use_CAT_files=False, open_data_layers=False, open_data_layers_dir=None, CAT_files_dir = None):
+                       use_CAT_files=False, open_data_layers=False, open_data_layers_dir=None, CAT_files_dir = None,
+                       floor_height=3.0, ground_floor_height=5.0, num_workers=-1):
 
     # Address
     gdf = get_cadaster_address(
@@ -1022,7 +1067,9 @@ def join_cadaster_data(cadaster_dir, census_tracts_dir, DEM_raster_dir, cadaster
                                  building_parts_inference=building_parts_inference,
                                  building_parts_inference_using_CAT_files=use_CAT_files,
                                  open_data_layers=open_data_layers, open_data_layers_dir=open_data_layers_dir,
-                                 CAT_files_dir = CAT_files_dir)
+                                 CAT_files_dir = CAT_files_dir,
+                                 floor_height=floor_height, ground_floor_height=ground_floor_height,
+                                 num_workers=num_workers)
     # Administrative layers naming
     gdf = join_adm_div_naming(gdf=gdf, cadaster_dir=cadaster_dir, cadaster_codes=cadaster_codes)
 
@@ -1291,3 +1338,214 @@ def join_pois(gdf, open_street_dir, cadaster_dir, cadaster_codes):
             gdf[col_name] = gdf[col_name].fillna(0).astype(int)
 
     return gdf
+
+
+# ==========================================
+# SPATIAL AGGREGATION (grid / hexbins)
+# ==========================================
+
+# Default aggregation operation per known building-level column. Columns not
+# listed here and not provided via the user `aggregations` kwarg are dropped.
+DEFAULT_BUILDING_AGGS = {
+    # Building stock counts and areas
+    "n_dwellings": "sum",
+    "n_building_units": "sum",
+    "n_floors_above_ground": "mean",
+    "n_floors_below_ground": "mean",
+    "building_area": "sum",
+    "year_of_construction": "mean",
+    "elevation": "mean",
+    # CAT-derived use type areas
+    "building_area_residential": "sum",
+    "building_area_commercial": "sum",
+    "building_area_offices": "sum",
+    "building_area_warehouse_parking": "sum",
+    "building_area_industrial": "sum",
+    "building_area_religious": "sum",
+    "building_area_cultural": "sum",
+    "building_area_healthcare_and_charity": "sum",
+    "building_area_sports_facilities": "sum",
+    "building_area_entertainment_venues": "sum",
+    "building_area_leisure_and_hospitality": "sum",
+    "building_area_singular_building": "sum",
+    "building_area_urbanization_and_landscaping_works_undeveloped_land": "sum",
+    "building_area_unknown": "sum",
+    # Inference outputs (scalars)
+    "br__floors_above_ground": "mean",
+    "br__floors_below_ground": "mean",
+    "br__building_footprint_area": "sum",
+    "br__above_ground_built_area": "sum",
+    "br__below_ground_built_area": "sum",
+    "br__above_ground_roof_area": "sum",
+    "br__adiabatic_wall": "sum",
+    "br__walls_between_slabs": "sum",
+    "br__patios_wall_total": "sum",
+    "br__parcel_main_orientation": "mean",
+    "br__street_width_main_orientation": "mean",
+    "br__next_building_main_orientation": "mean",
+    "br__exists_ground_commercial_premises": "sum",
+    "br__detached": "sum",
+}
+
+
+def _coerce_centroid_gdf(gdf, geometry_col):
+    """Return a GeoDataFrame using `geometry_col` (or its centroid) as geometry."""
+    if geometry_col in gdf.columns:
+        pts = gdf.set_geometry(geometry_col)
+    else:
+        pts = gdf.copy()
+        if not isinstance(pts, gpd.GeoDataFrame) or pts.geometry.name is None:
+            raise ValueError(
+                f"geometry_col '{geometry_col}' not found and gdf has no active geometry"
+            )
+        if pts.geometry.geom_type.dropna().iloc[0] != "Point":
+            pts["__centroid__"] = pts.geometry.centroid
+            pts = pts.set_geometry("__centroid__")
+    pts = pts[pts.geometry.notna() & ~pts.geometry.is_empty]
+    return pts
+
+
+def _resolve_aggregations(columns, aggregations):
+    """Merge user overrides with defaults; return (agg_map, dropped, missing)."""
+    user = dict(aggregations) if aggregations else {}
+    agg_map = {}
+    for col in columns:
+        if col in user:
+            agg_map[col] = user[col]
+        elif col in DEFAULT_BUILDING_AGGS:
+            agg_map[col] = DEFAULT_BUILDING_AGGS[col]
+    dropped = [c for c in columns if c not in agg_map]
+    missing = [c for c in user if c not in columns]
+    return agg_map, dropped, missing
+
+
+def aggregate_to_grid(gdf, cell_size_m=100, aggregations=None,
+                      geometry_col="building_centroid", cell_id_col="cell_id"):
+    """Aggregate a building-level GeoDataFrame onto a regular square grid.
+
+    Parameters
+    ----------
+    gdf : geopandas.GeoDataFrame
+        Output of `join_cadaster_data` (or `hc.merge`). Must be in a metric CRS.
+    cell_size_m : float, default 100
+        Side length of each square cell in metres.
+    aggregations : dict[str, str|callable], optional
+        Override or extend `DEFAULT_BUILDING_AGGS`. Columns absent from both
+        the override and the defaults are dropped (with a warning printed).
+    geometry_col : str, default "building_centroid"
+        Column to use as the building point for cell assignment.
+    cell_id_col : str, default "cell_id"
+        Name of the integer cell-id column on the output.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        One row per non-empty cell, geometry = cell polygon, with `n_buildings`
+        plus all aggregated columns.
+    """
+    if gdf.empty:
+        return gpd.GeoDataFrame(columns=[cell_id_col, "n_buildings", "geometry"],
+                                geometry="geometry", crs=gdf.crs)
+
+    pts = _coerce_centroid_gdf(gdf, geometry_col)
+    if pts.crs is None or not pts.crs.is_projected:
+        raise ValueError(
+            "aggregate_to_grid requires a projected (metric) CRS. "
+            "Reproject the input GeoDataFrame first (e.g. to EPSG:25831)."
+        )
+
+    minx, miny, maxx, maxy = pts.total_bounds
+    # Snap origin to the cell grid so cell IDs are stable across calls.
+    x0 = np.floor(minx / cell_size_m) * cell_size_m
+    y0 = np.floor(miny / cell_size_m) * cell_size_m
+
+    ix = np.floor((pts.geometry.x.values - x0) / cell_size_m).astype(int)
+    iy = np.floor((pts.geometry.y.values - y0) / cell_size_m).astype(int)
+    pts = pts.assign(__ix=ix, __iy=iy)
+
+    candidate_cols = [c for c in gdf.columns
+                      if c not in ("geometry", geometry_col, "building_geometry",
+                                   "parcel_geometry", "parcel_centroid",
+                                   "address_location", "building_centroid")]
+    agg_map, dropped, missing = _resolve_aggregations(candidate_cols, aggregations)
+    if missing:
+        sys.stderr.write(
+            f"aggregate_to_grid: ignoring {len(missing)} aggregations for columns not in gdf: {missing}\n"
+        )
+
+    pts_subset = pts[["__ix", "__iy"] + list(agg_map.keys())]
+    grouped = pts_subset.groupby(["__ix", "__iy"], as_index=False)
+    counts = grouped.size().rename(columns={"size": "n_buildings"})
+    if agg_map:
+        agg = grouped.agg(agg_map)
+        agg = agg.merge(counts, on=["__ix", "__iy"], how="left")
+    else:
+        agg = counts
+
+    def _cell_geom(row):
+        cx = x0 + row["__ix"] * cell_size_m
+        cy = y0 + row["__iy"] * cell_size_m
+        return box(cx, cy, cx + cell_size_m, cy + cell_size_m)
+
+    agg["geometry"] = agg.apply(_cell_geom, axis=1)
+    agg[cell_id_col] = agg["__ix"].astype(str) + "_" + agg["__iy"].astype(str)
+    agg = agg.drop(columns=["__ix", "__iy"])
+    return gpd.GeoDataFrame(agg, geometry="geometry", crs=pts.crs)
+
+
+def aggregate_to_h3(gdf, resolution=10, aggregations=None,
+                    geometry_col="building_centroid", cell_id_col="h3_id"):
+    """Aggregate a building-level GeoDataFrame onto H3 hexagons.
+
+    Requires the `h3` package (>= 4.x). Resolution 10 ≈ 15 000 m² hexagons,
+    similar in order of magnitude to a 100 m grid cell; resolution 11 ≈
+    2 100 m² for finer aggregation.
+    """
+    try:
+        import h3
+    except ImportError as exc:
+        raise ImportError(
+            "aggregate_to_h3 requires the h3 package. Install with `pip install h3`."
+        ) from exc
+
+    if gdf.empty:
+        return gpd.GeoDataFrame(columns=[cell_id_col, "n_buildings", "geometry"],
+                                geometry="geometry", crs="EPSG:4326")
+
+    pts = _coerce_centroid_gdf(gdf, geometry_col)
+    pts_wgs = pts.to_crs("EPSG:4326")
+
+    lons = pts_wgs.geometry.x.values
+    lats = pts_wgs.geometry.y.values
+    cell_ids = [h3.latlng_to_cell(float(lat), float(lon), resolution)
+                for lat, lon in zip(lats, lons)]
+    pts = pts.assign(__h3=cell_ids)
+
+    candidate_cols = [c for c in gdf.columns
+                      if c not in ("geometry", geometry_col, "building_geometry",
+                                   "parcel_geometry", "parcel_centroid",
+                                   "address_location", "building_centroid")]
+    agg_map, dropped, missing = _resolve_aggregations(candidate_cols, aggregations)
+    if missing:
+        sys.stderr.write(
+            f"aggregate_to_h3: ignoring {len(missing)} aggregations for columns not in gdf: {missing}\n"
+        )
+
+    pts_subset = pts[["__h3"] + list(agg_map.keys())]
+    grouped = pts_subset.groupby("__h3", as_index=False)
+    counts = grouped.size().rename(columns={"size": "n_buildings"})
+    if agg_map:
+        agg = grouped.agg(agg_map)
+        agg = agg.merge(counts, on="__h3", how="left")
+    else:
+        agg = counts
+
+    def _hex_geom(hid):
+        # h3 v4: cell_to_boundary returns (lat, lng) tuples
+        boundary = h3.cell_to_boundary(hid)
+        coords = [(lon, lat) for lat, lon in boundary]
+        return Polygon(coords)
+
+    agg["geometry"] = agg["__h3"].map(_hex_geom)
+    agg = agg.rename(columns={"__h3": cell_id_col})
+    return gpd.GeoDataFrame(agg, geometry="geometry", crs="EPSG:4326")

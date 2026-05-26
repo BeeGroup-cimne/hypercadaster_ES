@@ -1,4 +1,5 @@
 import sys
+import gzip
 import zipfile
 import geopandas as gpd
 import os
@@ -1577,57 +1578,95 @@ def parse_CAT_file(cadaster_code, CAT_files_dir, allowed_dataset_types = [14, 15
 
     # Main function to process the file in chunks and save as Parquet
     def process_file_in_chunks(inputfile, CAT_files_dir, cadaster_code, allowed_dataset_types):
-        with open(inputfile, encoding='latin-1') as rf:
-            lines = rf.readlines()  # Read all lines at once for chunk processing
-
-        if isinstance(allowed_dataset_types, str) or isinstance(allowed_dataset_types,int):
+        if isinstance(allowed_dataset_types, str) or isinstance(allowed_dataset_types, int):
             allowed_dataset_types = [int(allowed_dataset_types)]
         elif isinstance(allowed_dataset_types, list):
             allowed_dataset_types = [int(dt) for dt in allowed_dataset_types]
 
-        if not all([os.path.exists(f"{CAT_files_dir}/parquet/{cadaster_code}_{dataset_type}.parquet") for
-                    dataset_type in allowed_dataset_types]):
-            # Process each line in parallel
-            with utils.tqdm_joblib(tqdm(desc="Reading the CAT file...", total=len(lines))):
-                parsed_rows = Parallel(n_jobs=-1)(
-                    delayed(process_line)(line, allowed_dataset_types) for line in lines
-                )
-            get_reusable_executor().shutdown(wait=True)
-
-            # Combine all parsed rows into DataFrames
-            combined_dfs = combine_dataframes(parsed_rows)
-
-            # Save each DataFrame to Parquet
-            for dataset_type, df in combined_dfs.items():
-                if len(df)>1:
-                    output_path = f"{CAT_files_dir}/parquet/{cadaster_code}_{dataset_type}.parquet"
-                    df.write_parquet(output_path)
-
-        else:
-            combined_dfs = {k:None for k in catstruct.keys()}
+        if all(os.path.exists(f"{CAT_files_dir}/parquet/{cadaster_code}_{dataset_type}.parquet")
+               for dataset_type in allowed_dataset_types):
+            combined_dfs = {k: None for k in catstruct.keys()}
             for dataset_type in allowed_dataset_types:
-                combined_dfs[dataset_type] = pl.read_parquet(f"{CAT_files_dir}/parquet/{cadaster_code}_{dataset_type}.parquet")
+                combined_dfs[dataset_type] = pl.read_parquet(
+                    f"{CAT_files_dir}/parquet/{cadaster_code}_{dataset_type}.parquet"
+                )
+            return combined_dfs
+
+        # Decompress .gz to a temporary plain file, delete it after reading
+        decompressed_path = None
+        if inputfile.endswith('.gz'):
+            decompressed_path = inputfile[:-3]
+            with gzip.open(inputfile, 'rb') as gz_file, open(decompressed_path, 'wb') as out_file:
+                out_file.write(gz_file.read())
+
+        try:
+            read_path = decompressed_path if decompressed_path else inputfile
+            with open(read_path, encoding='latin-1') as rf:
+                lines = rf.readlines()
+        finally:
+            if decompressed_path and os.path.exists(decompressed_path):
+                os.remove(decompressed_path)
+
+        # Process each line in parallel
+        with utils.tqdm_joblib(tqdm(desc="Reading the CAT file...", total=len(lines))):
+            parsed_rows = Parallel(n_jobs=-1)(
+                delayed(process_line)(line, allowed_dataset_types) for line in lines
+            )
+        get_reusable_executor().shutdown(wait=True)
+
+        # Combine all parsed rows into DataFrames
+        combined_dfs = combine_dataframes(parsed_rows)
+
+        # Save each DataFrame to Parquet
+        for dataset_type, df in combined_dfs.items():
+            if len(df) > 1:
+                output_path = f"{CAT_files_dir}/parquet/{cadaster_code}_{dataset_type}.parquet"
+                df.write_parquet(output_path)
 
         return combined_dfs
 
 
     def get_CAT_file_path(CAT_files_dir, cadaster_code, timeout=3600):
+        def sort_key(path):
+            # Strip .CAT.gz or .CAT extension to get base like "08001U_23012026"
+            base = os.path.basename(path)
+            if base.endswith('.CAT.gz'):
+                base = base[:-7]
+            elif base.endswith('.CAT'):
+                base = base[:-4]
+            # Date at end of base is DDMMYYYY; sort as YYYYMMDD
+            return f"{base[:5]}_{base[-4:]}{base[-6:-4]}{base[-8:-6]}"
+
         CAT_file = None
-        message_displayed = False  # Track whether the message has been displayed
+        message_displayed = False
         task_time = 0
         start_time = time.time()
+        province_code = cadaster_code[:2]
+
         while CAT_file is None or task_time < timeout:
             try:
-                CAT_files = os.listdir(f"{CAT_files_dir}")
-                CAT_files = sorted(
-                    CAT_files,
-                    key=lambda i: f"{i[:5]}_{i[-8:-4]}{i[-10:-8]}{i[-12:-10]}",
-                    reverse=True
-                )
-                CAT_files = [file for file in CAT_files if file.startswith(cadaster_code)]
-                if len(CAT_files) > 0:
-                    CAT_file = CAT_files[0]
-                    return os.path.join(CAT_files_dir, CAT_file)
+                all_entries = os.listdir(CAT_files_dir)
+
+                # Search province subdirectories for .CAT.gz files
+                CAT_files = []
+                for entry in all_entries:
+                    entry_path = os.path.join(CAT_files_dir, entry)
+                    if (os.path.isdir(entry_path)
+                            and entry.startswith(f"{province_code}_U_")
+                            and entry.endswith("_CAT")):
+                        for fname in os.listdir(entry_path):
+                            if fname.startswith(cadaster_code) and fname.endswith('.CAT.gz'):
+                                CAT_files.append(os.path.join(entry_path, fname))
+
+                # Fall back to plain .CAT files directly in CAT_files_dir
+                if not CAT_files:
+                    for fname in all_entries:
+                        if fname.startswith(cadaster_code) and fname.endswith('.CAT'):
+                            CAT_files.append(os.path.join(CAT_files_dir, fname))
+
+                if CAT_files:
+                    CAT_files.sort(key=sort_key, reverse=True)
+                    return CAT_files[0]
                 else:
                     if not message_displayed:
                         sys.stderr.write(
@@ -1637,7 +1676,6 @@ def parse_CAT_file(cadaster_code, CAT_files_dir, allowed_dataset_types = [14, 15
                         )
                         sys.stderr.flush()
                         message_displayed = True
-                    # Check again after a short delay
                     time.sleep(3)
                     task_time = time.time() - start_time
             except KeyboardInterrupt:

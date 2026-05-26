@@ -16,6 +16,7 @@ Key features demonstrated:
 
 Author: hypercadaster_ES examples
 """
+import os.path
 
 import hypercadaster_ES as hc
 import pandas as pd
@@ -46,31 +47,34 @@ all_results = []
 for i, municipality in enumerate(cadaster_codes, 1):
     print(f"\n[{i}/{len(cadaster_codes)}] Processing municipality: {municipality}")
     print("-" * 50)
-    
-    # Process single municipality with full inference
-    gdf_municipality = hc.merge(
-        wd=wd,
-        cadaster_codes=[municipality],  # Single municipality (as list)
-        neighborhood_layer=True,        # Include Barcelona neighborhood data (if applicable)
-        postal_code_layer=True,         # Include postal code boundaries
-        census_layer=True,              # Include INE census tract data
-        elevations_layer=True,          # Include digital elevation model
-        open_data_layers=True,          # Include Barcelona open data layers (if applicable)
-        building_parts_inference=True,  # ✅ Now allowed: single municipality
-        building_parts_plots=False,     # ✅ Enable plots for single municipality
-        plot_zones_ratio=0.02,          # Plot 2% of zones for visualization
-        use_CAT_files=True,             # Use detailed CAT format files for space analysis
-        CAT_files_rel_dir="CAT_files",   # Directory containing CAT files
-        compact_addresses=True,
-        pois_layer=True
-    )
+    individual_filename = f"{wd}/{municipality}_complete_inference.pkl"
+    if not os.path.exists(individual_filename):
+        # Process single municipality with full inference
+        gdf_municipality = hc.merge(
+            wd=wd,
+            cadaster_codes=[municipality],  # Single municipality (as list)
+            neighborhood_layer=True,        # Include Barcelona neighborhood data (if applicable)
+            postal_code_layer=True,         # Include postal code boundaries
+            census_layer=True,              # Include INE census tract data
+            elevations_layer=True,          # Include digital elevation model
+            open_data_layers=True,          # Include Barcelona open data layers (if applicable)
+            building_parts_inference=True,  # ✅ Now allowed: single municipality
+            building_parts_plots=False,     # ✅ Enable plots for single municipality
+            plot_zones_ratio=0.02,          # Plot 2% of zones for visualization
+            use_CAT_files=True,             # Use detailed CAT format files for space analysis
+            CAT_files_rel_dir="cadaster/CAT_files",   # Directory containing CAT files
+            compact_addresses=True,
+            pois_layer=True
+        )
+    else:
+        gdf_municipality = pd.read_pickle(individual_filename, compression="gzip")
+
     # import pprint
     # pprint.pp(gdf_municipality[gdf_municipality["building_reference"]=="8341105DF2884A"].iloc[0].to_dict())
-    # hc.utils.plot_building_reference(gdf_municipality,'8341105DF2884A',output_path="/home/gmor/test.png")
-    # hc.utils.plot_building_shadows_analysis(gdf_municipality, '8341105DF2884A')
+    hc.utils.plot_building_reference(gdf_municipality,'8341105DF2884A',output_path="/home/gmor/test.png")
+    hc.utils.plot_building_shadows_analysis(gdf_municipality, '8341105DF2884A',output_path="/home/gmor/test2.png")
     
     # Save individual result
-    individual_filename = f"{wd}/{municipality}_complete_inference.pkl"
     gdf_municipality.to_pickle(individual_filename, compression="gzip")
     print(f"Individual result saved: {individual_filename}")
     print(f"Buildings processed: {len(gdf_municipality):,}")

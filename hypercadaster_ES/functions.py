@@ -141,7 +141,8 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
           neighborhood_layer=True, postal_code_layer=True, census_layer=True, elevations_layer=True,
           open_data_layers=True, building_parts_inference=False, building_parts_plots=False,
           plot_zones_ratio=0.01, use_CAT_files=False, CAT_files_rel_dir="CAT_files",
-          compact_addresses=False, pois_layer=False):
+          compact_addresses=False, pois_layer=False,
+          floor_height=3.0, ground_floor_height=5.0, num_workers=-1):
     """
     Merge cadastral and geographic data into a unified GeoDataFrame.
 
@@ -243,7 +244,10 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
         plot_zones_ratio=plot_zones_ratio,
         open_data_layers=open_data_layers,
         open_data_layers_dir=utils.open_data_dir_(wd),
-        CAT_files_dir=f"{wd}/{CAT_files_rel_dir}"
+        CAT_files_dir=f"{wd}/{CAT_files_rel_dir}",
+        floor_height=floor_height,
+        ground_floor_height=ground_floor_height,
+        num_workers=num_workers,
     )
 
     if census_layer:

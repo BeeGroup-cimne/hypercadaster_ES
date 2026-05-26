@@ -176,8 +176,14 @@ The resulting GeoDataFrame provides comprehensive building-level information org
 ### Building Contour Analysis (Shadow Casting)
 | Column | Type | Description |
 |--------|------|-------------|
-| `br__building_contour_at_distance` | Dict | {orientation: shadow_distance_m} |
-| `br__shadows_at_distance` | Dict | {orientation: [shadow_polygons]} |
+| `br__building_contour_at_distance` | Dict | {orientation: distance_from_centroid_to_edge_m} |
+| `br__building_shadows_at_distance` | Dict | {orientation: [distance_to_first_taller_neighbor_m, per floor]} |
+| `br__vertical_distances_at_collision` | Dict | {orientation: [neighbor_roof_height_above_floor_m, per floor]} |
+| `br__elevation_at_shadow` | Dict | {orientation: absolute_neighbor_roof_elevation_m} |
+| `br__terrain_shadows_at_distance` | Dict | {orientation: distance_to_blocking_terrain_m} — evaluated once at the building's top-floor eye level |
+| `br__terrain_elevation_at_shadow` | Dict | {orientation: absolute_terrain_elevation_at_block_m} |
+| `br__terrain_elevation_profile` | Dict | {orientation: [terrain_elevation_at_each_sample_m]} — observer-independent DEM samples along each outgoing ray |
+| `br__terrain_profile_distances` | List | [distance_from_centroid_m, ...] — sample offset grid that `br__terrain_elevation_profile` is aligned to |
 
 ## 🌡️ Thermal Analysis Properties (building_inference=True)
 
@@ -234,6 +240,41 @@ The resulting GeoDataFrame provides comprehensive building-level information org
 | `br__mean_building_space_category_by_floor` | Dict | Per-floor category averages |
 | `br__mean_building_space_communal_area_by_floor` | Dict | Per-floor shared area averages |
 
+## 📍 Points of Interest (pois_layer=True)
+
+POI indicators are added when `pois_layer=True` is passed to `merge()`. Data is sourced from OpenStreetMap and joined at building level for the following groups: `amenity`, `emergency`, `healthcare`, `leisure`, `office`, `shop`, `tourism`.
+
+For groups with subgroups (e.g. `amenity` → `food`, `education`, …) the column prefix is `poi_{group}_{subgroup}`. For groups without subgroups (e.g. `emergency`, `healthcare`) the prefix is `poi_{group}`.
+
+### Per-group/subgroup Columns
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `poi_{prefix}_count` | Integer | Number of POIs located on the building footprint |
+| `poi_{prefix}_ids` | List | OSM identifiers of POIs on the building |
+| `poi_{prefix}_100m` | Integer | POI count within 100 m of building centroid |
+| `poi_{prefix}_250m` | Integer | POI count within 250 m of building centroid |
+| `poi_{prefix}_500m` | Integer | POI count within 500 m of building centroid |
+
+### POI Groups and Subgroups
+
+| Group | Subgroups | Example values |
+|-------|-----------|----------------|
+| `amenity` | `food`, `education`, `transport`, `financial`, `health`, `culture`, `public`, `facilities`, `waste`, `other` | restaurants, schools, banks, hospitals… |
+| `emergency` | *(none)* | ambulance stations, defibrillators, fire hydrants… |
+| `healthcare` | *(none)* | hospitals, clinics, doctors, dentists… |
+| `leisure` | *(none)* | parks, playgrounds, sports centres, swimming pools… |
+| `office` | *(none)* | company offices, government, lawyers… |
+| `shop` | `food`, `general`, `clothing`, `health`, `diy`, `electronics`, `sports`, `culture`, `other` | supermarkets, pharmacies, electronics stores… |
+| `tourism` | `accommodation`, `camping`, `culture`, `attraction`, `leisure`, `information`, `rental` | hotels, museums, viewpoints… |
+
+**Examples of generated column names:**
+- `poi_amenity_food_count` — restaurants/cafes/bars on the building
+- `poi_amenity_food_250m` — food amenities within 250 m
+- `poi_emergency_100m` — emergency facilities within 100 m
+- `poi_shop_clothing_500m` — clothing shops within 500 m
+- `poi_tourism_accommodation_ids` — OSM IDs of accommodation on the building
+
 ## 🏪 Commercial Premises Analysis (Barcelona open_data_layers=True)
 
 ### Ground Floor Commercial Analysis
@@ -272,6 +313,7 @@ The resulting GeoDataFrame provides comprehensive building-level information org
 | Thermal Properties | - | - | ✓ | ✓ |
 | Space Breakdown | - | - | - | ✓ |
 | Economic Data | - | ✓ | - | ✓ |
+| POI Proximity | pois_layer=True | pois_layer=True | pois_layer=True | pois_layer=True |
 | Commercial Premises | Barcelona Only | Barcelona Only | Barcelona Only | Barcelona Only |
 
 ---

@@ -24,6 +24,7 @@ import os
 import sys
 import math
 import multiprocessing
+import pickle as pickle_module
 import re
 import warnings
 from datetime import date
@@ -41,7 +42,8 @@ from tqdm import tqdm
 import geopandas as gpd
 from shapely.ops import linemerge
 from shapely.geometry.polygon import orient
-from shapely.geometry import (Polygon, LineString, LinearRing, MultiPolygon, MultiLineString)
+from shapely.geometry import (Polygon, LineString, LinearRing, MultiPolygon, MultiLineString,
+                              GeometryCollection)
 
 # Visualization
 import matplotlib
@@ -59,9 +61,307 @@ warnings.filterwarnings(
     message=re.escape("FigureCanvasAgg is non-interactive, and thus cannot be shown")
 )
 
-# Note: Parallel processing imports commented out for performance
-# from joblib import Parallel, delayed
-# from joblib.externals.loky import get_reusable_executor
+# Pseudo-zone bookkeeping for neighbouring-municipality buildings. Such
+# buildings are loaded only as shadow-casting context — they have no real
+# cadastral zone in the municipality being analyzed and must NOT produce
+# inferred result rows. We bin them spatially so chunking stays balanced.
+NEARBY_ZONE_PREFIX = "_nb_"
+NEARBY_GRID_SIZE_M = 200
+
+
+def _read_compressed_pickle(path):
+    """Read a pickle whose compression we may not know.
+
+    We migrated the municipality result pickles from gzip to zstd for speed,
+    but older runs left gzip files on disk. Detect from the magic bytes and
+    pick the matching pandas decoder so both keep working.
+    """
+    with open(path, "rb") as fh:
+        head = fh.read(4)
+    if head.startswith(b"\x1f\x8b"):
+        return pd.read_pickle(path, compression="gzip")
+    if head.startswith(b"\x28\xb5\x2f\xfd"):
+        return pd.read_pickle(path, compression="zstd")
+    # Plain pickle or anything else — let pandas infer.
+    return pd.read_pickle(path)
+
+
+def _safe_nanmean(values):
+    """np.nanmean that returns nan silently on empty / all-nan input."""
+    arr = np.asarray(list(values), dtype=float)
+    finite = arr[np.isfinite(arr)]
+    return float(finite.mean()) if finite.size else float("nan")
+
+
+# Per-space CAT columns that leak into br_results in multi-building zones
+# as all-NaN `_x` / `_y` pairs from an unintended merge. Strip them so the
+# building-level output stays at the building grain.
+_BR_PER_SPACE_LEAK_BASES = frozenset({
+    "use_type", "floor_number", "building_space_floor_number",
+    "building_space_reference", "building_space_reference_last_digits",
+    "street_type", "street_name", "street_number1", "street_letter1",
+    "street_number2", "street_letter2", "km",
+    "building_space_block_name", "building_space_stair_name",
+    "building_space_floor_name", "building_space_door_name",
+    "building_space_year", "retrofitted", "building_space_retroffiting_year",
+    "building_space_effective_year", "building_space_total_area",
+    "building_space_area_without_communal",
+    "building_space_area_balconies_terraces",
+    "building_space_area_imputable_to_other_floors",
+    "building_space_participation_rate", "building_space_use_type",
+    "building_space_detailed_use_type", "building_space_typology",
+    "building_space_total_area_without_communal", "building_spaces_considered",
+    "building_space_communal_area", "building_space_area_with_communal",
+    "building_space_typology_category", "building_space_typology_id",
+    "building_space_age", "building_space_typology_category_booster",
+    "building_space_typology_use", "building_space_typology_use_class",
+    "building_space_typology_use_class_modality",
+    "building_space_typology_use_level", "building_space_age_key",
+    "construction_relative_economic_value",
+    "age_correction_relative_economic_value",
+    "building_space_relative_economic_value", "building_space_economic_value",
+    "building_space_address", "building_space_inner_address",
+    "building_space_floor_order_above_ground",
+    "building_space_floor_order_below_ground", "building_space_floor_order",
+    "building_floor_total_area", "building_total_area", "_typ_cat_int",
+})
+
+
+def _strip_per_space_leak_columns(df):
+    if df is None or len(df.columns) == 0:
+        return df
+    to_drop = []
+    for c in df.columns:
+        base = c[:-2] if c.endswith("_x") or c.endswith("_y") else c
+        if base in _BR_PER_SPACE_LEAK_BASES:
+            to_drop.append(c)
+    if to_drop:
+        df = df.drop(columns=to_drop)
+    return df
+
+
+_BR_SPACES_LIST_COLS = (
+    "br__building_spaces_reference",
+    "br__building_spaces_postal_address",
+    "br__building_spaces_inner_address",
+    "br__building_spaces_floor_number",
+    "br__building_spaces_category",
+    "br__building_spaces_effective_year",
+    "br__building_spaces_area_without_communal",
+    "br__building_spaces_area_with_communal",
+    "br__building_spaces_economic_value",
+    "br__building_spaces_detailed_use_type",
+)
+_BR_SPACES_LIST_ADDITIVE = frozenset({
+    "br__building_spaces_area_without_communal",
+    "br__building_spaces_area_with_communal",
+    "br__building_spaces_economic_value",
+})
+
+
+def _dedup_br_building_spaces_lists(df):
+    """Collapse duplicate building-space entries inside the per-building
+    br__building_spaces_* parallel lists.
+
+    Dedup key is the triple (reference, postal_address, inner_address).
+    Different (escalera, planta, puerta) tuples in CAT produce distinct
+    inner_address values and are kept as separate entries, even when they
+    share a building_space_reference. Only true duplicates (same triple)
+    are folded: additive fields are summed, descriptive fields take the
+    first occurrence.
+
+    Each column is a {use_type: [values]} dict. Lists across columns are
+    index-aligned per use_type.
+    """
+    if df is None or df.empty:
+        return df
+    list_cols = [c for c in _BR_SPACES_LIST_COLS if c in df.columns]
+    if "br__building_spaces_reference" not in list_cols:
+        return df
+
+    has_postal = "br__building_spaces_postal_address" in list_cols
+    has_inner = "br__building_spaces_inner_address" in list_cols
+
+    def _fold_row(row):
+        ref_dict = row["br__building_spaces_reference"]
+        if not isinstance(ref_dict, dict):
+            return row
+        new_values = {c: {} for c in list_cols}
+        for use_type, refs in ref_dict.items():
+            if refs is None:
+                for c in list_cols:
+                    new_values[c][use_type] = refs
+                continue
+            refs_list = list(refs)
+            per_col = {c: list(row[c].get(use_type, [])) if isinstance(row[c], dict) else []
+                       for c in list_cols}
+            postal_list = per_col.get("br__building_spaces_postal_address", []) if has_postal else []
+            inner_list = per_col.get("br__building_spaces_inner_address", []) if has_inner else []
+
+            def _at(lst, i):
+                return lst[i] if i < len(lst) else None
+
+            first_idx = {}
+            order = []
+            for i, r in enumerate(refs_list):
+                key = (r, _at(postal_list, i), _at(inner_list, i))
+                if key not in first_idx:
+                    first_idx[key] = i
+                    order.append(key)
+                else:
+                    j = first_idx[key]
+                    for c in list_cols:
+                        if c in _BR_SPACES_LIST_ADDITIVE:
+                            try:
+                                a = per_col[c][j]
+                                b = per_col[c][i]
+                                if a is None or (isinstance(a, float) and np.isnan(a)):
+                                    a = 0.0
+                                if b is None or (isinstance(b, float) and np.isnan(b)):
+                                    b = 0.0
+                                per_col[c][j] = float(a) + float(b)
+                            except (IndexError, TypeError):
+                                pass
+            for c in list_cols:
+                new_values[c][use_type] = [per_col[c][first_idx[k]] for k in order]
+        for c in list_cols:
+            row[c] = new_values[c]
+        # Update the building space count to the deduped count.
+        if "br__building_spaces" in row.index:
+            bs = row["br__building_spaces"]
+            if isinstance(bs, dict):
+                row["br__building_spaces"] = {
+                    use_type: len(new_values["br__building_spaces_reference"].get(use_type, []))
+                    for use_type in bs
+                }
+        return row
+
+    return df.apply(_fold_row, axis=1)
+
+
+# Module-level state for the per-zone parallel worker. We run the pool under
+# `fork`, so children inherit this dict via copy-on-write — no pickling, and
+# the large shared geodata (gdf_footprints_global, parcels_gdf, streets_gdf,
+# zone groupby, CAT lookup) stays a single physical copy across all workers.
+# This is what keeps memory roughly flat in the number of workers; spawn/
+# forkserver duplicated the state into each child and caused linear blow-up.
+_ZONE_WORKER_STATE = {}
+
+_ZONE_WORKER_INITIALIZED = False
+
+
+def _init_zone_worker():
+    """Per-worker one-time setup. Called lazily on the first task.
+
+    - Limits BLAS/OpenMP threads to 1: fork-inherited thread pools in
+      numpy/scipy/pandas/scikit-learn cause silent deadlocks. With many
+      workers each running CPU-light geometric work, single-threaded BLAS
+      is also a perf win (avoids 32×N thread contention).
+    - Clears the DEM sampler cache so each worker opens its own DEM
+      handle rather than reusing a parent-inherited (broken) one.
+
+    Note: polars is intentionally NOT used from inside workers (all hot-path
+    DataFrames are pandas) so the Rayon thread pool is never touched after
+    fork, which is the original reason fork was unsafe.
+    """
+    global _ZONE_WORKER_INITIALIZED
+    if _ZONE_WORKER_INITIALIZED:
+        return
+    try:
+        from threadpoolctl import threadpool_limits
+        threadpool_limits(1)
+    except Exception:
+        pass
+    try:
+        utils._DEM_SAMPLER_CACHE.clear()
+    except Exception:
+        pass
+    _ZONE_WORKER_INITIALIZED = True
+
+
+def _process_zone_worker(zone_reference):
+    """Run process_zone for one cadastral zone.
+
+    Only the zone key is passed across the fork boundary; the per-zone
+    GeoDataFrame slice and CAT slice are looked up from the inherited
+    `_ZONE_WORKER_STATE` so nothing big is pickled per task.
+
+    We do NOT return the per-zone DataFrames back to the parent. process_zone
+    already caches them to `{results_dir}/cache/{zone_reference}_{sbr,br}_results.pkl`
+    on success, so the worker just reports an outcome tag and lets the parent
+    re-read those files in batches at the end. This keeps the parent's heap
+    flat across thousands of zones (the old code accumulated every zone's
+    DataFrames in a Python list until the final concat, which was the OOM).
+    """
+    _init_zone_worker()
+    s = _ZONE_WORKER_STATE
+    try:
+        gdf_zone = s["grouped"].get_group(zone_reference).reset_index(drop=True)
+        cat_slice = s["zone_cat_lookup"].get(zone_reference)
+        zone_plots = s["plots"] and (zone_reference in s["zones_to_plot"])
+        sbr, br = process_zone(
+            gdf_zone,
+            zone_reference,
+            s["gdf_footprints_global"],
+            s["parcels_gdf"],
+            s["streets_gdf"],
+            cat_slice,
+            s["results_dir"],
+            zone_plots,
+            s["orientation_discrete_interval_in_degrees"],
+            s["floor_height"],
+            s["ground_floor_height"],
+            s["DEM_raster_dir"],
+        )
+        if sbr is None or br is None:
+            return ("__EMPTY__", zone_reference)
+        return ("__OK__", zone_reference)
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        return ("__ERR__", zone_reference, str(e), "\n".join(tb.splitlines()[-8:]))
+
+
+def _spatially_bin_nearby_zones(gdf, grid_size_m=NEARBY_GRID_SIZE_M,
+                                zone_prefix=NEARBY_ZONE_PREFIX):
+    """Replace zone_reference on neighbouring/unknown rows with spatial-grid pseudo-zones.
+
+    A row is treated as 'neighbour/unknown' if its `nearby_buildings` flag is
+    True or its `zone_reference` is missing / "unknown" / "unassigned". Those
+    rows get a pseudo-zone id of the form `f"{zone_prefix}{ix}_{iy}"` based on
+    their centroid's `grid_size_m`-snapped position. Real cadastral zones are
+    left untouched.
+    """
+    if gdf is None or len(gdf) == 0:
+        return gdf
+
+    nearby_flag = gdf["nearby_buildings"].fillna(False).astype(bool) \
+        if "nearby_buildings" in gdf.columns else pd.Series(False, index=gdf.index)
+    zone_missing = gdf["zone_reference"].isna() | gdf["zone_reference"].isin(
+        ["unknown", "unassigned"]
+    ) if "zone_reference" in gdf.columns else pd.Series(True, index=gdf.index)
+
+    mask = nearby_flag | zone_missing
+    if not mask.any():
+        return gdf
+
+    geom = gdf["building_part_geometry"] if "building_part_geometry" in gdf.columns else gdf.geometry
+    centroids = geom[mask].centroid
+    ix = np.floor(centroids.x.values / grid_size_m).astype(int)
+    iy = np.floor(centroids.y.values / grid_size_m).astype(int)
+    pseudo = [f"{zone_prefix}{a}_{b}" for a, b in zip(ix, iy)]
+
+    if "zone_reference" not in gdf.columns:
+        gdf["zone_reference"] = "unknown"
+    gdf.loc[mask, "zone_reference"] = pseudo
+
+    n_pseudo = len(set(pseudo))
+    sys.stderr.write(
+        f"_spatially_bin_nearby_zones: assigned {int(mask.sum())} neighbour/unknown "
+        f"building parts to {n_pseudo} spatial grid pseudo-zones "
+        f"(prefix='{zone_prefix}', cell={grid_size_m}m)\n"
+    )
+    return gdf
 
 
 # ==========================================
@@ -69,8 +369,9 @@ warnings.filterwarnings(
 # ==========================================
 
 def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf, results_dir=None, cadaster_dir=None,
-                           open_street_dir=None, plots=False, plot_zones_ratio=0.01, 
+                           open_street_dir=None, plots=False, plot_zones_ratio=0.01,
                            orientation_discrete_interval_in_degrees=5, floor_height=3.0,
+                           ground_floor_height=5.0, DEM_raster_dir=None,
                            num_workers=-1, nearby_buildings_buffer=80):#max(1, math.ceil(multiprocessing.cpu_count()/3))):
     """
     Main function to process building parts and perform comprehensive building analysis.
@@ -114,8 +415,40 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
         and comprehensive analysis results
     """
 
-    if (not os.path.exists(f"{results_dir}/{code}_sbr_results.pkl") and
-        not os.path.exists(f"{results_dir}/{code}_br_results.pkl")):
+    # Try to reuse the municipality-level cache. A previous run may have been
+    # killed (OOM) mid-write, leaving truncated pickles whose existence check
+    # passes but whose pd.read_pickle raises EOFError. Attempt the load up
+    # front; on any read failure, fall through to the recompute branch (which
+    # will overwrite the broken files at the end).
+    sbr_path = f"{results_dir}/{code}_sbr_results.pkl"
+    br_path = f"{results_dir}/{code}_br_results.pkl"
+
+    def _municipality_cache_present():
+        for p in (sbr_path, br_path):
+            if not os.path.exists(p):
+                return False
+            try:
+                if os.path.getsize(p) == 0:
+                    return False
+            except OSError:
+                return False
+        return True
+
+    cache_loaded = False
+    if _municipality_cache_present():
+        try:
+            sbr_results = _read_compressed_pickle(sbr_path)
+            br_results = _read_compressed_pickle(br_path)
+            sbr_results = _strip_per_space_leak_columns(sbr_results)
+            br_results = _strip_per_space_leak_columns(br_results)
+            br_results = _dedup_br_building_spaces_lists(br_results)
+            cache_loaded = True
+        except (EOFError, pickle_module.UnpicklingError, OSError) as e:
+            sys.stderr.write(
+                f"Municipality cache for '{code}' unreadable ({e}); recomputing\n"
+            )
+
+    if not cache_loaded:
 
         os.makedirs(f"{results_dir}/cache", exist_ok=True)
         if plots:
@@ -124,6 +457,18 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
             os.makedirs(f"{results_dir}/plots", exist_ok=True)
 
         if (not os.path.exists(f"{results_dir}/cache/{code}_aux1.pkl")):
+            # Neighbouring-municipality buildings (added for shadow-casting context)
+            # have no valid zone_reference in the analyzed municipality, so they
+            # all collapse into one giant chunk under "unknown"/"unassigned".
+            # That single chunk's buffered convex hull then sweeps across the
+            # entire metropolitan area and proximity detection becomes O(N²).
+            # Tag those rows with a deterministic 200 m spatial grid pseudo-zone
+            # so detect_close_buildings_parallel produces many small bounded chunks.
+            building_part_gdf_ = _spatially_bin_nearby_zones(
+                building_part_gdf_, grid_size_m=NEARBY_GRID_SIZE_M,
+                zone_prefix=NEARBY_ZONE_PREFIX,
+            )
+
             gdf_global = utils.detect_close_buildings_parallel(gdf_building_parts=building_part_gdf_,
                                                          buffer_neighbours=nearby_buildings_buffer,
                                                          neighbours_column_name="nearby_buildings",
@@ -160,10 +505,39 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
         else:
             gdf_footprints_global = pd.read_pickle(f"{results_dir}/cache/{code}_aux2.pkl")
 
+        # Carry the per-building ground elevation into the global footprints
+        # frame. The shadow gate in `process_zone` needs each neighbour's
+        # roof elevation to compare against the current floor's mid-floor
+        # eye level; without elevation here, every neighbour defaults to
+        # ground=0 m, sits ~tens of metres below the analysed building, and
+        # every potential shadow caster gets rejected by the `roof > eye`
+        # gate (so `shadows_at_distance` is all-inf for every building).
+        if "elevation" in gdf_global.columns and "elevation" not in gdf_footprints_global.columns:
+            elev_by_ref = (
+                gdf_global.groupby("building_reference")["elevation"].mean()
+            )
+            gdf_footprints_global = gdf_footprints_global.merge(
+                elev_by_ref.rename("elevation"),
+                left_on="group", right_index=True, how="left",
+            )
 
         grouped = gdf_global.groupby("zone_reference")
-        zone_references = list(grouped.groups.keys())
-        
+        # Exclude spatial-grid pseudo-zones from result emission: those rows are
+        # neighbouring-municipality buildings present only as shadow-casting
+        # context. They are still available to process_zone via gdf_footprints_global.
+        # Sort biggest-first so OOM (if it happens) hits early instead of after hours,
+        # and so the long-tail of giant zones gets distributed across workers early
+        # rather than stacking up at the end of the queue.
+        _zone_sizes = grouped.size()
+        zone_references = [z for z in _zone_sizes.sort_values(ascending=False).index
+                           if not str(z).startswith(NEARBY_ZONE_PREFIX)]
+        n_skipped_pseudo = len(grouped.groups) - len(zone_references)
+        if n_skipped_pseudo:
+            sys.stderr.write(
+                f"Skipping {n_skipped_pseudo} neighbour-pseudo-zones from result emission; "
+                f"{len(zone_references)} real zones will be processed\n"
+            )
+
         # Random zone selection for plots when building_parts_plots is True
         if plots:
             total_zones = len(zone_references)
@@ -186,67 +560,207 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
             crs=gdf_global.crs)
         streets_gdf = streets_gdf[streets_gdf.geometry.apply(lambda geom: isinstance(geom, LineString))]
 
-        # Define zone processing function
-        def process_zone_delayed(zone_reference):
-            gdf_zone = grouped.get_group(zone_reference).reset_index(drop=True)
-            # Determine if this zone should be plotted based on selection
-            zone_plots = plots and (zone_reference in zones_to_plot)
-            return process_zone(
-                gdf_zone,
-                zone_reference,
-                gdf_footprints_global,
-                parcels_gdf,
-                streets_gdf,
-                buildings_CAT,
-                results_dir,
-                zone_plots,
-                orientation_discrete_interval_in_degrees,
-                floor_height
-            )
+        # All shared state lives in this module-level dict. Workers fork()ed
+        # from this process inherit it via copy-on-write — no pickling, no
+        # per-worker duplication.
+        global _ZONE_WORKER_STATE
+        _ZONE_WORKER_STATE = {
+            "gdf_footprints_global": gdf_footprints_global,
+            "parcels_gdf": parcels_gdf,
+            "streets_gdf": streets_gdf,
+            "grouped": grouped,
+            "results_dir": results_dir,
+            "plots": plots,
+            "zones_to_plot": zones_to_plot,
+            "orientation_discrete_interval_in_degrees": orientation_discrete_interval_in_degrees,
+            "floor_height": floor_height,
+            "ground_floor_height": ground_floor_height,
+            "DEM_raster_dir": DEM_raster_dir,
+        }
 
-        # Process each zone sequentially with progress tracking
-        results = []
-        progress_bar = tqdm(zone_references, desc="Inferring building KPIs", 
-                           mininterval=1.0, leave=True, ncols=80)
-        
-        def safe_process_zone(zone_ref):
-            try:
-                return process_zone_delayed(zone_ref)
-            except Exception as e:
-                progress_bar.write(f"This cadastral zone failed: '{zone_ref}'. Error: {e}")
-                return None
-        
-        for zone_reference in progress_bar:
-            results.append(safe_process_zone(zone_reference))
-            
-        # Note: Parallel processing commented out for performance reasons
-        # Alternative parallel implementation available if needed
+        # Build a per-zone CAT lookup once. For each zone, we keep only the
+        # CAT rows whose building_reference appears in that zone. With Spanish
+        # cadastre conventions every building belongs to exactly one zone, so
+        # the slices are disjoint and small (typically <1 KB each).
+        # Slices are materialised as pandas DataFrames so the parallel workers
+        # never touch polars — that lets us run under `fork` without tripping
+        # polars' Rayon thread pool, which is the main reason memory blew up
+        # under spawn/forkserver (state had to be pickled into every worker).
+        def _build_zone_cat_lookup():
+            if buildings_CAT is None:
+                return {zr: None for zr in zone_references}
+            empty_pd = buildings_CAT.head(0).to_pandas()
+            refs_in_zone = (gdf_global[gdf_global["zone_reference"].isin(zone_references)]
+                            .groupby("zone_reference")["building_reference"]
+                            .unique())
+            lookup = {}
+            for zr in zone_references:
+                refs = refs_in_zone.get(zr, [])
+                if len(refs) == 0:
+                    lookup[zr] = empty_pd
+                else:
+                    lookup[zr] = buildings_CAT.filter(
+                        pl.col("building_reference").is_in(list(refs))
+                    ).to_pandas()
+            return lookup
 
-        # del streets_gdf
-        # del gdf_global
-        # del gdf_footprints_global
-        # del grouped
+        zone_cat_lookup = _build_zone_cat_lookup()
+        _ZONE_WORKER_STATE["zone_cat_lookup"] = zone_cat_lookup
 
-        # Concatenate all results into a single DataFrame
-        valid_results = [i for i in results if i is not None]
-        if valid_results:
-            sbr_results = pd.concat([i[0] for i in valid_results])[valid_results[0][0].columns]
-            br_results = pd.concat([i[1] for i in valid_results])[valid_results[0][1].columns]
+        # Resolve worker count: -1 → all CPUs, 0/None → 1, else as given.
+        if num_workers is None or num_workers == 0:
+            effective_workers = 1
+        elif num_workers < 0:
+            effective_workers = multiprocessing.cpu_count()
         else:
-            # Create empty DataFrames if no valid results
-            progress_bar.write("Warning: No valid results from any cadastral zones")
+            effective_workers = num_workers
+        effective_workers = min(effective_workers, len(zone_references)) or 1
+
+        progress_bar = tqdm(total=len(zone_references), desc="Inferring building KPIs",
+                            mininterval=1.0, leave=True, ncols=80)
+
+        # Workers only report an outcome tag ("__OK__" / "__EMPTY__" / "__ERR__"),
+        # never the DataFrames themselves — those are read back from each zone's
+        # cache pickle after the pool finishes. This keeps the parent's heap
+        # flat in the number of zones.
+        ok_zone_refs = []
+
+        def _record(r):
+            tag = r[0] if isinstance(r, tuple) and r else None
+            if tag == "__OK__":
+                ok_zone_refs.append(r[1])
+            elif tag == "__EMPTY__":
+                pass  # zone had nothing to emit; no cache files written
+            elif tag == "__ERR__":
+                _, zr, msg, tail = r
+                progress_bar.write(f"This cadastral zone failed: '{zr}'. Error: {msg}\n{tail}")
+            progress_bar.update(1)
+
+        if effective_workers == 1:
+            # Sequential path (preserves original behavior when num_workers=1)
+            for zr in zone_references:
+                _record(_process_zone_worker(zr))
+        else:
+            # Parallel path under `fork`. Workers inherit `_ZONE_WORKER_STATE`
+            # via copy-on-write so RAM stays roughly flat in the number of
+            # workers (vs. linear blow-up with spawn/forkserver, which had to
+            # pickle the full state into each child). Safe here because the
+            # hot path is polars-free — all in-worker DataFrames are pandas,
+            # so polars' Rayon thread pool is never touched post-fork.
+            #
+            # maxtasksperchild recycles workers periodically so per-process
+            # allocator fragmentation (numpy/shapely/pandas) doesn't accumulate
+            # over thousands of zones. 50 is a reasonable balance: enough that
+            # fork overhead is amortised, low enough that RSS stays bounded.
+            ctx = multiprocessing.get_context("fork")
+            pool_kwargs = {
+                "processes": effective_workers,
+                "initializer": _init_zone_worker,
+                "maxtasksperchild": 50,
+            }
+            with ctx.Pool(**pool_kwargs) as pool:
+                for r in pool.imap_unordered(
+                    _process_zone_worker, zone_references, chunksize=1
+                ):
+                    _record(r)
+
+        progress_bar.close()
+        # Release the large shared state before the disk-aggregation pass —
+        # we no longer need grouped, the CAT lookup, or the global GDFs and
+        # they together can be many GB on Barcelona-sized inputs.
+        _ZONE_WORKER_STATE = {}
+        del grouped, zone_cat_lookup, streets_gdf, gdf_global, gdf_footprints_global
+        import gc as _gc
+        _gc.collect()
+
+        # Read per-zone caches back from disk in batches and concatenate.
+        # Batching avoids the quadratic-ish blowup of one giant pd.concat over
+        # tens of thousands of small DataFrames, and lets intermediate slices
+        # be freed between batches.
+        def _downcast_floats(df):
+            if df is None or df.empty:
+                return df
+            f64 = df.select_dtypes(include=["float64"]).columns
+            if len(f64):
+                df[f64] = df[f64].astype("float32")
+            return df
+
+        BATCH = 200
+        sbr_parts, br_parts = [], []
+        cache_dir = f"{results_dir}/cache"
+
+        # Apply strip + dedup per-batch (not on the final giant concat). Leak
+        # columns therefore never propagate into the final frame, and the
+        # dedup's row-wise df.apply runs on small chunks instead of doubling
+        # memory of the full br_results. Row-independence makes per-batch
+        # dedup equivalent to a single pass at the end.
+        def _flush_batch(buf_sbr, buf_br):
+            if buf_sbr:
+                merged = pd.concat(buf_sbr, ignore_index=True, copy=False)
+                merged = _strip_per_space_leak_columns(merged)
+                sbr_parts.append(merged)
+                buf_sbr.clear()
+            if buf_br:
+                merged = pd.concat(buf_br, ignore_index=True, copy=False)
+                merged = _strip_per_space_leak_columns(merged)
+                merged = _dedup_br_building_spaces_lists(merged)
+                br_parts.append(merged)
+                buf_br.clear()
+
+        buf_sbr, buf_br = [], []
+        agg_bar = tqdm(total=len(ok_zone_refs), desc="Aggregating zone results",
+                       mininterval=1.0, leave=True, ncols=80)
+        for zr in ok_zone_refs:
+            try:
+                sbr_z = pd.read_pickle(f"{cache_dir}/{zr}_sbr_results.pkl")
+                br_z = pd.read_pickle(f"{cache_dir}/{zr}_br_results.pkl")
+            except (FileNotFoundError, EOFError, pickle_module.UnpicklingError, OSError) as e:
+                # Worker said ok but the file is missing/corrupt at read time.
+                # Don't let one zone block the whole aggregation.
+                agg_bar.write(f"Unreadable cache for zone '{zr}' ({e}); skipping")
+                agg_bar.update(1)
+                continue
+            buf_sbr.append(_downcast_floats(sbr_z))
+            buf_br.append(_downcast_floats(br_z))
+            if len(buf_sbr) >= BATCH:
+                _flush_batch(buf_sbr, buf_br)
+            agg_bar.update(1)
+        _flush_batch(buf_sbr, buf_br)
+        agg_bar.close()
+
+        # Serialize sbr and br so they're never both fully materialised at
+        # the same time. Write sbr, drop it, then build br; re-read sbr from
+        # disk at the very end. The peak shrinks from "sbr_parts + sbr_results
+        # + br_parts + br_results" (~4 frames) to ~3 frames at the worst point
+        # (sbr concat while br_parts is still pending).
+        # zstd at level 1 is dramatically faster than gzip on large pandas
+        # pickles (often 5-10× write speed) while compressing better. The
+        # serial gzip write was a multi-minute tail on Barcelona-scale outputs.
+        if sbr_parts:
+            sbr_results = pd.concat(sbr_parts, ignore_index=True, copy=False)
+            del sbr_parts
+            _gc.collect()
+            sbr_results.to_pickle(sbr_path,
+                                  compression={'method': 'zstd', 'level': 1})
+            del sbr_results
+            _gc.collect()
+
+            br_results = pd.concat(br_parts, ignore_index=True, copy=False)
+            del br_parts
+            _gc.collect()
+            br_results.to_pickle(br_path,
+                                 compression={'method': 'zstd', 'level': 1})
+
+            # Re-read sbr now that the heavy br work is done.
+            sbr_results = _read_compressed_pickle(sbr_path)
+        else:
+            sys.stderr.write("Warning: No valid results from any cadastral zones\n")
             sbr_results = pd.DataFrame()
             br_results = pd.DataFrame()
-        del results
-
-        sbr_results.to_pickle(f"{results_dir}/{code}_sbr_results.pkl",
-                              compression={'method': 'gzip', 'compresslevel': 1, 'mtime': 1})
-        br_results.to_pickle(f"{results_dir}/{code}_br_results.pkl",
-                             compression={'method': 'gzip', 'compresslevel': 1, 'mtime': 1})
-
-    else:
-        sbr_results = pd.read_pickle(f"{results_dir}/{code}_sbr_results.pkl", compression="gzip")
-        br_results = pd.read_pickle(f"{results_dir}/{code}_br_results.pkl", compression="gzip")
+            sbr_results.to_pickle(sbr_path,
+                                  compression={'method': 'zstd', 'level': 1})
+            br_results.to_pickle(br_path,
+                                 compression={'method': 'zstd', 'level': 1})
 
     return sbr_results, br_results
 
@@ -256,7 +770,8 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
 # ==========================================
 
 def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, streets_gdf, buildings_CAT,
-                 results_dir, plots, orientation_discrete_interval_in_degrees, floor_height):
+                 results_dir, plots, orientation_discrete_interval_in_degrees, floor_height,
+                 ground_floor_height=5.0, DEM_raster_dir=None):
     """
     Perform detailed analysis for an individual cadastral zone.
     
@@ -293,8 +808,25 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
     """
 
     try:
-        if (not os.path.exists(f"{results_dir}/cache/{zone_reference}_sbr_results.pkl") and
-            not os.path.exists(f"{results_dir}/cache/{zone_reference}_br_results.pkl")):
+        sbr_cache_path = f"{results_dir}/cache/{zone_reference}_sbr_results.pkl"
+        br_cache_path = f"{results_dir}/cache/{zone_reference}_br_results.pkl"
+
+        # A previous run may have been killed (OOM) mid-write, leaving zero-byte
+        # or truncated pickles on disk. Treat any unreadable cache pair as
+        # "missing" and recompute, so we don't propagate EOFError up the stack.
+        def _cache_is_usable(path):
+            if not os.path.exists(path):
+                return False
+            try:
+                if os.path.getsize(path) == 0:
+                    return False
+            except OSError:
+                return False
+            return True
+
+        cache_present = _cache_is_usable(sbr_cache_path) and _cache_is_usable(br_cache_path)
+
+        if not cache_present:
 
             # PDF setup for the zone if pdf_plots is True
             if plots:
@@ -338,6 +870,15 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                 gap_tolerance=0.05,
                 num_workers=1)
 
+            # If no building in the zone has any positive floor count (e.g. a
+            # ruins-only zone with n_floors_above_ground==0 everywhere),
+            # there's nothing to analyse — skip cleanly instead of crashing
+            # in the per-floor loop below.
+            if gdf_aux_footprints.empty:
+                if plots:
+                    pdf.close()
+                return None, None
+
             if plots:
                 fig, ax = plt.subplots()
                 utils.plot_shapely_geometries(gdf_aux_footprints.geometry, clusters=gdf_aux_footprints.group, ax=ax)
@@ -362,6 +903,14 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
             if plots:
                 pdf.close()
 
+            # DEM sampler for terrain-aware shadow analysis (shared across buildings in the zone)
+            dem_sampler = None
+            if DEM_raster_dir is not None:
+                try:
+                    dem_sampler = utils.make_dem_sampler(DEM_raster_dir, gdf_zone.crs)
+                except Exception:
+                    dem_sampler = None
+
             results_ = []
 
             for single_building_reference, building_gdf_item in gdf_zone.groupby('single_building_reference'):
@@ -379,26 +928,40 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                 parcel_geom = utils.union_geoseries_with_tolerance(building_gdf_item["parcel_geometry"],
                                                              gap_tolerance=0.5, resolution=0.5)
 
+                # Some upstream rows carry NaN (float) instead of a comma-joined
+                # string for these neighbour columns. Coerce non-strings to ""
+                # so the .split(",") never sees a float.
+                def _split_neighbour_column(series):
+                    out = set()
+                    for ids in series:
+                        if not isinstance(ids, str) or not ids:
+                            continue
+                        for token in ids.split(","):
+                            token = token.strip()
+                            if token:
+                                out.add(token)
+                    return out
+
                 # Extract and clean the set of neighbouring buildings
-                adjacent_buildings_set = {id for ids in building_gdf_item['adjacent_buildings'] for id in ids.split(",")}
+                adjacent_buildings_set = _split_neighbour_column(building_gdf_item['adjacent_buildings'])
                 adjacent_buildings_set.discard(
                     single_building_reference)  # Safely remove the single_building_reference itself if present
                 adjacent_buildings = sorted(adjacent_buildings_set)
 
                 # Extract and clean the set of nearby buildings
-                nearby_buildings_set = {id for ids in building_gdf_item['nearby_buildings'] for id in ids.split(",")}
+                nearby_buildings_set = _split_neighbour_column(building_gdf_item['nearby_buildings'])
                 nearby_buildings_set.discard(
                     single_building_reference.split("_")[0])  # Safely remove the single_building_reference itself
                 nearby_buildings = sorted(nearby_buildings_set)
 
                 # Extract and clean the set of nearby parcels
-                nearby_parcels_set = {id for ids in building_gdf_item['nearby_parcels'] for id in ids.split(",")}
+                nearby_parcels_set = _split_neighbour_column(building_gdf_item['nearby_parcels'])
                 nearby_parcels_set.discard(
                     single_building_reference.split("_")[0]) # Safely remove the single_building_reference itself
                 nearby_parcels = sorted(nearby_parcels_set)
 
                 # Extract and clean the set of adjacent parcels
-                adjacent_parcels_set = {id for ids in building_gdf_item['adjacent_parcels'] for id in ids.split(",")}
+                adjacent_parcels_set = _split_neighbour_column(building_gdf_item['adjacent_parcels'])
                 adjacent_parcels_set.discard(
                     single_building_reference)  # Safely remove the single_building_reference itself if present
                 adjacent_parcels = sorted(adjacent_parcels_set)
@@ -409,8 +972,10 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                 premises_names = []
                 premises_last_revision = []
                 if "number_of_ground_premises" in building_gdf_item.columns:
-                    if (~np.isfinite(building_gdf_item.iloc[0]["number_of_ground_premises"]) and
-                            building_gdf_item.iloc[0]["number_of_ground_premises"] > 0):
+                    n_ground_premises = utils._coerce_scalar_float(
+                        building_gdf_item.iloc[0]["number_of_ground_premises"], default=float("nan")
+                    )
+                    if np.isfinite(n_ground_premises) and n_ground_premises > 0:
                         premises = True
                         premises_activity_typologies = building_gdf_item.iloc[0]["ground_premises_activities"]
                         premises_names = building_gdf_item.iloc[0]["ground_premises_names"]
@@ -464,9 +1029,25 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                 filtered_streets = filtered_streets[filtered_streets.element == "way"]
 
                 if isinstance(parcel_geom, MultiPolygon):
-                    parcel_limits = [walls_i for walls_i in list(parcel_geom)[0].geoms]
-                else:
+                    # Shapely 2 dropped iteration on MultiPolygon — use .geoms.
+                    # (The previous `list(parcel_geom)[0].geoms` was also wrong
+                    # under Shapely 1, since Polygon has no `.geoms`.)
+                    parcel_limits = list(parcel_geom.geoms)
+                elif isinstance(parcel_geom, GeometryCollection):
+                    # make_valid on degenerate inputs can return a mixed
+                    # GeometryCollection (Polygon + LineString + Point). Only
+                    # polygonal pieces have an `.exterior`, so filter the rest.
+                    parcel_limits = [g for g in parcel_geom.geoms
+                                     if isinstance(g, (Polygon, MultiPolygon))]
+                    parcel_limits = list(chain.from_iterable(
+                        g.geoms if isinstance(g, MultiPolygon) else [g]
+                        for g in parcel_limits
+                    ))
+                elif isinstance(parcel_geom, Polygon):
                     parcel_limits = [parcel_geom]
+                else:
+                    # No polygonal area at all — nothing to compute against streets.
+                    parcel_limits = []
 
                 all_parcel_segments = []
                 touching_street_and_non_adjacent_parcel_segments = []
@@ -509,7 +1090,13 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                         street_parcel_limits["by_orientation"][segment_orientation] += segment.length
                     else:
                         street_parcel_limits["by_orientation"][segment_orientation] = segment.length
-                if utils.detect_number_of_orientations(street_parcel_limits["by_orientation"])==1:
+                if not street_parcel_limits["by_orientation"]:
+                    # No parcel-edge segments at all (e.g. parcel_geom was a
+                    # non-polygonal GeometryCollection or all segments were
+                    # filtered out). Treat orientation as unknown and let
+                    # downstream code propagate NaN safely.
+                    street_parcel_limits["main_orientation"] = np.nan
+                elif utils.detect_number_of_orientations(street_parcel_limits["by_orientation"])==1:
                     street_parcel_limits["main_orientation"] = utils.weighted_circular_mean(
                         degrees=[float(i) for i in street_parcel_limits["by_orientation"].keys()],
                         weights=[float(i) for i in street_parcel_limits["by_orientation"].values()])
@@ -550,7 +1137,10 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                 perimeter = {}
                 air_contact_wall = {}
                 shadows_at_distance = {}
-                vertical_distances_at_collision = {}  # New: vertical distances when hitting neighbors
+                # Stay-empty defaults: terrain grid is the only terrain-related
+                # field surfaced now. The combined per-floor `shadows_at_distance`
+                # is populated inside the per-floor block below.
+                terrain_grid = {}
                 parcel_at_distance = {}
                 adiabatic_wall = {}
                 patios_wall = {}
@@ -722,33 +1312,139 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
 
                 if max(gdf_aux_footprint_building.floor.max(), gdf_aux_footprints_nearby.floor.max()) > 0:
 
-                    # Shadows depending orientation
+                    # Combined per-floor "first horizontal blocker" analysis.
+                    # For each (orientation, floor) we cast a horizontal ray at
+                    # mid-floor eye level and return the distance to the first
+                    # blocker, where a blocker is either:
+                    #   - a nearby building polygon whose roof rises above the
+                    #     eye level (line of sight blocked at the building's
+                    #     ground-level edge — equivalent to a terrain step), or
+                    #   - rising terrain that crosses the eye level
+                    # whichever comes first. There is no separate "terrain
+                    # shadow" output — it's folded into `shadows_at_distance`.
                     if plots:
                         pdf = PdfPages(f"{results_dir}/plots/building_{single_building_reference}_shadows.pdf")
                     else:
                         pdf = None
-                    for floor in range(max(gdf_aux_footprint_building.floor.max(),
-                                           gdf_aux_footprints_nearby.floor.max()) + 1):
-                        
-                        # Calculate height of current building at this floor
-                        current_building_elevation = building_gdf_item['elevation'].iloc[0] if 'elevation' in building_gdf_item.columns else 0.0
-                        current_building_height = current_building_elevation + (floor * floor_height)
-                        
-                        # Filter nearby buildings and calculate their heights
-                        floor_nearby = gdf_aux_footprints_nearby[gdf_aux_footprints_nearby.floor == floor].copy()
-                        
-                        # Calculate building heights for shadow casting consideration
+
+                    if 'elevation' in building_gdf_item.columns:
+                        current_building_elevation = utils._coerce_scalar_float(
+                            building_gdf_item['elevation'], 0.0)
+                    else:
+                        current_building_elevation = 0.0
+
+                    # Pre-compute neighbour roof elevations (one per nearby
+                    # building, not per-row). n_floors_above_ground per
+                    # neighbour = max(footprint.floor) + 1; roof elevation =
+                    # floor_base_elevation(elev, n_floors_above_ground).
+                    if len(gdf_aux_footprints_nearby) > 0:
+                        _max_floor_per_nb = (
+                            gdf_aux_footprints_nearby.groupby("group")["floor"].max()
+                        )
+                        if "elevation" in gdf_aux_footprints_nearby.columns:
+                            _elev_per_nb = (
+                                gdf_aux_footprints_nearby.groupby("group")["elevation"].first()
+                            )
+                        else:
+                            _elev_per_nb = pd.Series(dtype=float)
+                        nearby_roof_elev = {
+                            grp: utils.floor_base_elevation(
+                                utils._coerce_scalar_float(_elev_per_nb.get(grp, 0.0), 0.0),
+                                int(_max_floor_per_nb[grp]) + 1,
+                                ground_floor_height, floor_height,
+                            )
+                            for grp in _max_floor_per_nb.index
+                        }
+                    else:
+                        nearby_roof_elev = {}
+
+                    # Sample the DEM profile ONCE per building (observer-
+                    # independent); per-floor blocker derivation reuses it.
+                    terrain_profile = {}
+                    terrain_profile_distances = []
+                    if dem_sampler is not None:
+                        terrain_profile, terrain_profile_distances = (
+                            utils.sample_terrain_profile_around_centroid(
+                                centroid=building_geom.centroid,
+                                dem_sampler=dem_sampler,
+                                orientation_interval=orientation_discrete_interval_in_degrees,
+                                max_distance=150.0,
+                                sample_step=5.0,
+                            )
+                        )
+
+                    # Per-neighbour, per-floor footprint table for the new
+                    # `compute_floor_shadow_region`. Stepped buildings (wider
+                    # podium, narrower tower) keep distinct shapes per floor;
+                    # the shadow function picks the lowest neighbour-floor
+                    # whose top exceeds the analyzed building's eye level
+                    # and unions footprints from that floor upward.
+                    nearby_buildings_data = []
+                    if len(gdf_aux_footprints_nearby) > 0:
+                        for grp, group_df in gdf_aux_footprints_nearby.groupby('group'):
+                            floors_dict = {}
+                            for _, row in group_df.iterrows():
+                                g = row.geometry
+                                if g is None or g.is_empty:
+                                    continue
+                                try:
+                                    fi = int(row['floor'])
+                                except (TypeError, ValueError):
+                                    continue
+                                floors_dict[fi] = g
+                            if not floors_dict:
+                                continue
+                            nb_elev = utils._coerce_scalar_float(
+                                group_df.iloc[0].get('elevation', 0.0), 0.0,
+                            )
+                            nearby_buildings_data.append({
+                                'elev': float(nb_elev),
+                                'floors': floors_dict,
+                            })
+
+                    max_floor_idx = max(gdf_aux_footprint_building.floor.max(),
+                                        gdf_aux_footprints_nearby.floor.max())
+                    for floor in range(max_floor_idx + 1):
+                        # Mid-floor eye level. Floor 0 sits on the DEM with the
+                        # ground-floor height; eye = DEM + g/2. Upper floors
+                        # are floor_height tall; eye = DEM + g + (f - 0.5) * h.
+                        if floor == 0:
+                            eye_level = current_building_elevation + ground_floor_height / 2.0
+                        else:
+                            eye_level = (current_building_elevation + ground_floor_height
+                                         + (floor - 0.5) * floor_height)
+
+                        # Only consider neighbours that exist at this floor for
+                        # ray intersections (their geometry is needed); the
+                        # roof-vs-eye-level gate uses the precomputed roof.
+                        floor_nearby = gdf_aux_footprints_nearby[
+                            gdf_aux_footprints_nearby.floor == floor
+                        ].copy()
+
                         building_heights = {}
                         for _, nearby_building in floor_nearby.iterrows():
-                            nearby_elevation = nearby_building.get('elevation', 0.0)
-                            nearby_height = nearby_elevation + (floor * floor_height)
+                            grp = nearby_building.get("group")
+                            nearby_top = nearby_roof_elev.get(
+                                grp,
+                                utils.floor_base_elevation(
+                                    utils._coerce_scalar_float(
+                                        nearby_building.get('elevation', 0.0), 0.0),
+                                    int(nearby_building.get('floor', 0)) + 1,
+                                    ground_floor_height, floor_height,
+                                ),
+                            )
                             building_heights[nearby_building.name] = {
-                                'height': nearby_height,
-                                'relative_height': nearby_height - current_building_height,
-                                'is_nearby': nearby_building.get('nearby_buildings', False)
+                                'height': nearby_top,
+                                'relative_height': nearby_top - eye_level,
+                                'is_nearby': False,
                             }
-                        
-                        shadow_result = utils.distance_from_centroid_to_polygons_by_orientation(
+
+                        # Building-blocker pass — single ray per orientation
+                        # from the building's centroid. The same eye-level
+                        # gate applies. The points-based variant remains
+                        # available but the centroid version is simpler and
+                        # deterministic (no random sampling noise).
+                        building_shadow_result = utils.distance_from_centroid_to_polygons_by_orientation(
                             geom=building_geom.exterior if isinstance(building_geom, Polygon) else (
                                 ([LinearRing(polygon.exterior.coords) for polygon in building_geom.geoms])),
                             other_polygons=floor_nearby.geometry,
@@ -758,16 +1454,66 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                             pdf=pdf,
                             floor=floor,
                             max_distance=150,
-                            current_height=current_building_height,
-                            building_heights=building_heights
+                            current_height=eye_level,
+                            building_heights=building_heights,
                         )
-                        
-                        shadows_at_distance[floor] = shadow_result
-                        vertical_distances_at_collision[floor] = shadow_result.get('vertical_distances', {})
-                        if floor == 0:  # Store elevation data once (it's the same for all floors)
-                            elevation_at_shadow_data = shadow_result.get('elevation_at_shadow', {})
+                        contour_by_orientation = building_shadow_result.get("contour", {})
+                        building_dist = building_shadow_result.get("building_shadows", {})
+
+                        # Terrain-blocker pass — distance to first DEM sample
+                        # above eye level along each ray, relative to contour.
+                        if terrain_profile:
+                            terrain_dist, _ = utils.derive_terrain_shadow_from_profile(
+                                profile=terrain_profile,
+                                sample_distances=terrain_profile_distances,
+                                contour_by_orientation=contour_by_orientation,
+                                observer_height=eye_level,
+                                clearance=0.0,
+                            )
+                        else:
+                            terrain_dist = {k: np.inf for k in contour_by_orientation}
+
+                        combined_shadows = {
+                            k: float(min(building_dist.get(k, np.inf),
+                                         terrain_dist.get(k, np.inf)))
+                            for k in contour_by_orientation
+                        }
+
+                        # New: full plan-view multipolygon of the area blocked
+                        # from this floor's eye level. Terrain shadow + the
+                        # above-eye-level portion of each nearby building's
+                        # per-floor footprints (stepped buildings project
+                        # only their tower at high analyzed floors), with
+                        # everything behind a closer terrain rise dropped.
+                        floor_shadow_geom = utils.compute_floor_shadow_region(
+                            building_geom=building_geom,
+                            nearby_buildings=nearby_buildings_data,
+                            dem_sampler=dem_sampler,
+                            eye_level=eye_level,
+                            ground_floor_height=ground_floor_height,
+                            floor_height=floor_height,
+                            max_distance=150.0,
+                            orientation_interval=orientation_discrete_interval_in_degrees,
+                        )
+
+                        shadows_at_distance[floor] = {
+                            "shadows": combined_shadows,
+                            "contour": contour_by_orientation,
+                            "shadows_geom": floor_shadow_geom,
+                        }
                     if plots:
                         pdf.close()
+
+                    # 5 m DEM grid around the building (bbox + 100 m margin)
+                    # for contour-line rendering in the shadow plot.
+                    terrain_grid = {}
+                    if dem_sampler is not None:
+                        terrain_grid = utils.sample_dem_grid_around_geometry(
+                            geometry=building_geom,
+                            dem_sampler=dem_sampler,
+                            cell_size=5.0,
+                            margin=100.0,
+                        )
 
                 if len(nearby_related_parcels_geom)>0:
                     # Street widths
@@ -801,13 +1547,22 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                             orientation_discrete_interval_in_degrees))
                     ]
 
-                street_parcel_limits["street_width_by_orientation"] = parcel_at_distance[0]
-                filtered = {k: v for k, v in street_parcel_limits["street_width_by_orientation"].items() if np.isfinite(v)}
+                # `parcel_at_distance` is the {distances-by-orientation,
+                # representativity-by-orientation} tuple returned by
+                # distance_from_points_to_polygons_by_orientation when nearby
+                # parcels exist; otherwise it's still the initial empty dict.
+                # The first element is the orientation→width mapping.
+                if isinstance(parcel_at_distance, tuple) and len(parcel_at_distance) > 0:
+                    widths_at_zero = parcel_at_distance[0]
+                else:
+                    widths_at_zero = {}
+                street_parcel_limits["street_width_by_orientation"] = widths_at_zero
+                filtered = {k: v for k, v in widths_at_zero.items() if np.isfinite(v)}
                 if not filtered:
                     street_parcel_limits["street_width_main_orientation"] = np.inf
                 else:
                     street_parcel_limits["main_orientation"] = max(filtered, key=filtered.get)
-                    street_parcel_limits["street_width_main_orientation"] = parcel_at_distance[0][
+                    street_parcel_limits["street_width_main_orientation"] = widths_at_zero[
                             max(filtered, key=filtered.get)]
 
                 # Store results
@@ -856,13 +1611,21 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                     'sbr__adiabatic_wall': np.sum([adiabatic_wall[floor] for floor in range(n_floors + 1)]) if adiabatic_wall != {} else 0.0,
                     'sbr__patios_wall_by_floor': [patios_wall[floor] for floor in range(n_floors + 1)] if patios_wall != {} else [],
                     'sbr__patios_wall_total': np.sum([patios_wall[floor] for floor in range(n_floors + 1)]) if patios_wall != {} else 0.0,
+                    # Combined per-floor shadows (building + terrain blocker at
+                    # mid-floor eye level). Shape: {orient: [floor0, floor1, ...]}.
                     'sbr__shadows_at_distance': {key: [shadows_at_distance[d]['shadows'][key] for d in shadows_at_distance] for key in
                                             shadows_at_distance[0]['shadows']} if shadows_at_distance != {} else {},
                     'sbr__building_contour_at_distance': {key: np.mean([shadows_at_distance[d]['contour'][key] for d in shadows_at_distance]) for key in
                                             shadows_at_distance[0]['contour']} if shadows_at_distance != {} else {},
-                    'sbr__vertical_distances_at_collision': {key: [vertical_distances_at_collision[d][key] for d in vertical_distances_at_collision] for key in
-                                            vertical_distances_at_collision[0]} if vertical_distances_at_collision != {} else {},
-                    'sbr__elevation_at_shadow': elevation_at_shadow_data if 'elevation_at_shadow_data' in locals() else {}
+                    # New: per-floor blocked-region multipolygon (plan view).
+                    # Each key is a floor index, each value is a Polygon /
+                    # MultiPolygon covering the area blocked from that floor's
+                    # eye level within 150 m of the building.
+                    'sbr__shadows': {f: shadows_at_distance[f].get('shadows_geom')
+                                     for f in shadows_at_distance} if shadows_at_distance != {} else {},
+                    # 5 m DEM grid (bbox + 100 m margin) for contour-line
+                    # rendering in the shadow plot.
+                    'sbr__terrain_grid': terrain_grid,
                 })
 
             if len(results_) > 0:
@@ -989,35 +1752,35 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                         'br__patios_wall_by_floor': [[sum(values) for values in zip_longest(
                             *sbr_results['sbr__patios_wall_by_floor'], fillvalue=0)]],
                         'br__patios_wall_total': [sum(sbr_results['sbr__patios_wall_total'])],
+                        # Combined per-floor shadows (building + terrain blocker
+                        # at mid-floor eye level). Per-orientation lists are
+                        # averaged element-wise across sbrs (missing floors
+                        # treated as inf = no blocker). We use np.mean directly,
+                        # not _safe_nanmean, because inf here is a meaningful
+                        # "no blocker in range" signal — collapsing it to nan
+                        # would lose information at the building grain.
                         'br__shadows_at_distance': [dict(sorted({
                             k: [
-                                np.mean(x)
+                                float(np.mean(list(x)))
                                 for x in zip_longest(
                                     *(
-                                        d.get(
-                                            k,
-                                            [0] * (
-                                                max(
-                                                    (len(v) for v in d.values() if isinstance(v, list)),
-                                                    default=1,  # Default to 1 if no valid lists are found
-                                                )
-                                            )
-                                        )
-                                        for d in sbr_results["sbr__shadows_at_distance"]
+                                        d.get(k, []) for d in sbr_results["sbr__shadows_at_distance"]
+                                        if isinstance(d, dict)
                                     ),
-                                    fillvalue=0,
+                                    fillvalue=np.inf,
                                 )
                             ]
                             for k in set(
                                 chain.from_iterable(
                                     d.keys() for d in sbr_results["sbr__shadows_at_distance"]
+                                    if isinstance(d, dict)
                                 )
                             )
-                        }.items(), key=lambda item: int(item[0])))],
+                        }.items(), key=lambda item: int(item[0])))] if "sbr__shadows_at_distance" in sbr_results.columns else [{}],
                         'br__building_contour_at_distance': [dict(sorted({
                             k: np.mean(
                                 list(
-                                    d.get(k, 0)  # Get scalar value or default to 0
+                                    d.get(k, 0)
                                     for d in sbr_results["sbr__building_contour_at_distance"]
                                 )
                             )
@@ -1026,41 +1789,38 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                                     d.keys() for d in sbr_results["sbr__building_contour_at_distance"]
                                 )
                             )
-                        }.items(),
-                        key=lambda item: int(item[0])))]
-                        ,
-                        'br__vertical_distances_at_collision': [dict(sorted({
-                            k: [
-                                np.mean(x) if len(x) > 0 else np.inf
-                                for x in zip_longest(
-                                    *(
-                                        d.get(k, [np.inf] * max(
-                                                (len(v) for v in d.values() if isinstance(v, list)),
-                                                default=1,
-                                            ))[:max(
-                                                (len(v) for v in d.values() if isinstance(v, list)),
-                                                default=1,
-                                            )]
-                                        for d in sbr_results.get("sbr__vertical_distances_at_collision", [])
-                                    ),
-                                    fillvalue=np.inf,
-                                )
-                            ]
-                            for k in set(
-                                chain.from_iterable(
-                                    d.keys() for d in sbr_results.get("sbr__vertical_distances_at_collision", [])
-                                )
-                            ) if sbr_results.get("sbr__vertical_distances_at_collision")
-                        }.items(), key=lambda item: int(item[0])))] if sbr_results.get("sbr__vertical_distances_at_collision") else [{}],
-                        'br__elevation_at_shadow': [dict(sorted({
-                            k: np.mean([d.get(k, np.nan) for d in sbr_results.get("sbr__elevation_at_shadow", []) if isinstance(d, dict)])
-                            for k in set(
-                                chain.from_iterable(
-                                    d.keys() for d in sbr_results.get("sbr__elevation_at_shadow", [])
-                                    if isinstance(d, dict)
-                                )
-                            ) if sbr_results.get("sbr__elevation_at_shadow")
-                        }.items(), key=lambda item: int(item[0])))] if sbr_results.get("sbr__elevation_at_shadow") else [{}]
+                        }.items(), key=lambda item: int(item[0])))],
+                        # New: per-floor blocked-region multipolygon.
+                        # Aggregate across sbrs of this building_reference
+                        # by unioning per floor. Geometries from sbrs of the
+                        # same building cover overlapping disks, and unary
+                        # union handles that cleanly.
+                        'br__shadows': [{
+                            f: utils.union_geoseries_with_tolerance(
+                                [d.get(f) for d in sbr_results["sbr__shadows"]
+                                 if isinstance(d, dict)
+                                 and d.get(f) is not None
+                                 and not d.get(f).is_empty],
+                                gap_tolerance=0.05, resolution=4,
+                            ) if any(
+                                isinstance(d, dict)
+                                and d.get(f) is not None
+                                and not d.get(f).is_empty
+                                for d in sbr_results["sbr__shadows"]
+                            ) else Polygon()
+                            for f in sorted(set(chain.from_iterable(
+                                d.keys() for d in sbr_results["sbr__shadows"]
+                                if isinstance(d, dict)
+                            )))
+                        }] if "sbr__shadows" in sbr_results.columns else [{}],
+                        # 5 m DEM grid for contour-line rendering in the
+                        # shadow plot. SBRs of a building share centroid area,
+                        # so the first non-empty grid is representative.
+                        'br__terrain_grid': [next(
+                            (g for g in sbr_results["sbr__terrain_grid"]
+                             if isinstance(g, dict) and g.get("elev")),
+                            {},
+                        )] if "sbr__terrain_grid" in sbr_results.columns else [{}],
                     }
                     br_results = pd.DataFrame(br_agg_dict)
                     geoms_by_floor = list(sbr_results['sbr__building_footprint_by_floor'])
@@ -1082,14 +1842,19 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                         # Consider the information from CAT files
                         if buildings_CAT is not None:
 
-                            # Integrate all CAT file information
+                            # Integrate all CAT file information. buildings_CAT
+                            # is a pandas DataFrame here (sliced for this zone
+                            # in process_building_parts so workers stay polars-
+                            # free and can run under `fork` safely).
                             agg_CAT = aggregate_CAT_file_building_spaces(
-                                building_CAT_df=buildings_CAT.filter(pl.col("building_reference") == building_reference))
+                                building_CAT_df=buildings_CAT[
+                                    buildings_CAT["building_reference"] == building_reference
+                                ])
 
                             building_gdf_by_floor = building_gdf_by_floor.drop(columns="geometry")
 
                             # Reduce agg_CAT["by_floors"] to each single building reference
-                            sbr_with_CAT = building_gdf_by_floor.merge(agg_CAT["by_floors"].to_pandas(),
+                            sbr_with_CAT = building_gdf_by_floor.merge(agg_CAT["by_floors"],
                                                                             on=["floor_number", "building_reference"])
                             def process_variable(df, variable, ops, multiplier=1, divider=1):
                                 return {
@@ -1127,7 +1892,7 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                             )
 
                             # Reduce agg_CAT["building"] to each single building reference
-                            sbr_with_CAT = building_gdf_by_floor.merge(agg_CAT["building"].to_pandas(),
+                            sbr_with_CAT = building_gdf_by_floor.merge(agg_CAT["building"],
                                                                             on=["building_reference"])
                             def process_variable(df, variable, summarise_op=None, digits=0, multiplier=1, divider=1):
                                 return {
@@ -1191,7 +1956,7 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                                         ("mean_building_space_economic_value", [lambda x: round(x, 2)], 1, 1)
                                         ]
                             br_with_CAT_by_floors = (
-                                agg_CAT["by_floors"].to_pandas().groupby(["building_reference"])
+                                agg_CAT["by_floors"].groupby(["building_reference"])
                                 .apply(lambda df: pd.Series({
                                         key: value
                                         for agg_elem in agg_list
@@ -1237,7 +2002,7 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                                         ('building_spaces_detailed_use_type',[chain.from_iterable, list],1,1)
                                         ]
                             br_with_CAT_summarised = (
-                                agg_CAT["building"].to_pandas().groupby(["building_reference"])
+                                agg_CAT["building"].groupby(["building_reference"])
                                 .apply(lambda df: pd.Series({
                                     key: value
                                     for agg_elem in agg_list
@@ -1258,8 +2023,16 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                     sbr_results_concat = pd.concat([sbr_results_concat, sbr_results], ignore_index=True)
                     br_results_concat = pd.concat([br_results_concat, br_results], ignore_index=True)
 
-                sbr_results_concat.to_pickle(f"{results_dir}/cache/{zone_reference}_sbr_results.pkl")
-                br_results_concat.to_pickle(f"{results_dir}/cache/{zone_reference}_br_results.pkl")
+                # Atomic write: stage to a sibling .tmp and rename. Avoids the
+                # zero-byte/truncated pickle problem when the process is killed
+                # (OOM, SIGTERM) between open() and pickle flush — which then
+                # poisons subsequent runs with EOFError on read.
+                sbr_tmp = sbr_cache_path + ".tmp"
+                br_tmp = br_cache_path + ".tmp"
+                sbr_results_concat.to_pickle(sbr_tmp)
+                br_results_concat.to_pickle(br_tmp)
+                os.replace(sbr_tmp, sbr_cache_path)
+                os.replace(br_tmp, br_cache_path)
 
                 return sbr_results_concat, br_results_concat
 
@@ -1267,8 +2040,27 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                 return None, None
 
         else:
-            return (pd.read_pickle(f"{results_dir}/cache/{zone_reference}_sbr_results.pkl"),
-                    pd.read_pickle(f"{results_dir}/cache/{zone_reference}_br_results.pkl"))
+            try:
+                return (pd.read_pickle(sbr_cache_path),
+                        pd.read_pickle(br_cache_path))
+            except (EOFError, pickle_module.UnpicklingError, OSError) as cache_err:
+                # Cache turned out to be corrupt even though both files passed
+                # the size check. Remove the bad pair and recompute by recursing.
+                sys.stderr.write(
+                    f"Corrupt cache for zone '{zone_reference}' ({cache_err}); "
+                    f"deleting and recomputing.\n"
+                )
+                for _p in (sbr_cache_path, br_cache_path):
+                    try:
+                        os.remove(_p)
+                    except OSError:
+                        pass
+                return process_zone(
+                    gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf,
+                    streets_gdf, buildings_CAT, results_dir, plots,
+                    orientation_discrete_interval_in_degrees, floor_height,
+                    ground_floor_height, DEM_raster_dir,
+                )
 
     except Exception as e:
         # Error handling moved to calling function with tqdm.write() for clean progress bar
@@ -1619,191 +2411,207 @@ def parse_horizontal_division_buildings_CAT_files(cadaster_code, CAT_files_dir):
 def aggregate_CAT_file_building_spaces(building_CAT_df):
     """
     Aggregate building space information from CAT file data.
-    
-    This function processes detailed building space data and aggregates it
-    by building reference, calculating total areas by usage type and
-    floor distributions.
-    
+
+    Pandas implementation (called from inside the per-zone parallel worker —
+    keeping it polars-free is what lets the worker pool run under `fork`
+    without deadlocking on polars' Rayon thread pool).
+
     Parameters:
     -----------
-    building_CAT_df : polars.DataFrame
-        Detailed building space data from CAT files
-        
+    building_CAT_df : pandas.DataFrame
+        Detailed building space data from CAT files (per-zone slice).
+
     Returns:
     --------
-    polars.DataFrame
-        Aggregated building data with space summaries and usage statistics
+    dict[str, pandas.DataFrame]
+        ``{"by_floors": ..., "building": ...}`` — both pandas DataFrames.
     """
-    building_CAT_df = building_CAT_df.with_columns(
-        pl.col("building_space_floor_name").map_elements(
-            lambda x: utils.classify_above_ground_floor_names(x) if x is not None else None,
-            return_dtype=pl.Int32
-        ).alias("building_space_floor_order_above_ground"),
-        pl.col("building_space_floor_name").map_elements(
-            lambda x: utils.classify_below_ground_floor_names(x) if x is not None else None,
-            return_dtype=pl.Int32
-        ).alias("building_space_floor_order_below_ground")
+    df = building_CAT_df.copy()
+
+    # Raw classify outputs include fractional markers (0.5 for ground floor,
+    # 0.25 increments for PR-prefixed floors) — these are *ordering* values
+    # that the compaction step below converts to consecutive integers.
+    def _classify_above_as_float(x):
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return np.nan
+        v = utils.classify_above_ground_floor_names(x)
+        return np.nan if v is None else float(v)
+
+    def _classify_below_as_float(x):
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return np.nan
+        v = utils.classify_below_ground_floor_names(x)
+        return np.nan if v is None else float(v)
+
+    df["building_space_floor_order_above_ground"] = (
+        df["building_space_floor_name"].map(_classify_above_as_float).astype(float)
+    )
+    df["building_space_floor_order_below_ground"] = (
+        df["building_space_floor_name"].map(_classify_below_as_float).astype(float)
     )
 
-    # Map the original Series to ordered values
-    unique_values = building_CAT_df[
-        "building_space_floor_order_above_ground"].unique().drop_nulls().sort()
-    value_to_order = {val: i for i, val in enumerate(unique_values)}
-    building_CAT_df = building_CAT_df.with_columns(
-        building_CAT_df["building_space_floor_order_above_ground"]
-        .map_elements(lambda x: value_to_order.get(x, None), return_dtype=pl.Int32)
-        .alias("building_space_floor_order_above_ground")
-    )
-    unique_values = building_CAT_df[
-        "building_space_floor_order_below_ground"].unique().drop_nulls().sort()
-    value_to_order = {val: -(i + 1) for i, val in enumerate(unique_values)}
-    building_CAT_df = building_CAT_df.with_columns(
-        building_CAT_df["building_space_floor_order_below_ground"]
-        .map_elements(lambda x: value_to_order.get(x, None), return_dtype=pl.Int32)
-        .alias("building_space_floor_order_below_ground")
+    # Map raw fractional ordering values to consecutive integers.
+    above_unique = sorted(v for v in df["building_space_floor_order_above_ground"].dropna().unique())
+    value_to_order_above = {val: i for i, val in enumerate(above_unique)}
+    df["building_space_floor_order_above_ground"] = (
+        df["building_space_floor_order_above_ground"]
+        .map(lambda x: value_to_order_above.get(x) if pd.notna(x) else None)
+        .astype("Int32")
     )
 
-    # Join floor orders below and above ground
-    building_CAT_df = building_CAT_df.with_columns(
-        pl.when(pl.col("building_space_floor_order_above_ground").is_null()).
-        then(pl.col("building_space_floor_order_below_ground")).
-        otherwise(pl.col("building_space_floor_order_above_ground")).alias(
-            "building_space_floor_order"
-        )
+    below_unique = sorted(v for v in df["building_space_floor_order_below_ground"].dropna().unique())
+    value_to_order_below = {val: -(i + 1) for i, val in enumerate(below_unique)}
+    df["building_space_floor_order_below_ground"] = (
+        df["building_space_floor_order_below_ground"]
+        .map(lambda x: value_to_order_below.get(x) if pd.notna(x) else None)
+        .astype("Int32")
     )
 
-    def adjust_to_consecutive_floor(series):
-        unique_sorted = series.unique().sort()
-        unique_sorted = unique_sorted.drop_nulls()
-        value_to_consecutive = {val: idx + unique_sorted[0] for idx, val in enumerate(unique_sorted)}
-        return series.map_elements(lambda x: value_to_consecutive[x], return_dtype=pl.Int32)
-
-    adjusted_floors = building_CAT_df.group_by("building_space_address").agg(
-        [
-            pl.col("building_space_floor_name"),
-            pl.col("building_space_floor_order").map_elements(adjust_to_consecutive_floor,
-                                                              return_dtype=pl.List(pl.Int32)).alias(
-                "building_space_floor_number")
-        ]
-    )
-    adjusted_floors = (
-        adjusted_floors.explode(["building_space_floor_name", "building_space_floor_number"]).
-        unique().sort(["building_space_address", "building_space_floor_number"]))
-    building_CAT_df = building_CAT_df.join(adjusted_floors,
-                                           on=["building_space_address", "building_space_floor_name"])
-
-    # Compute total areas of the buildings
-    building_CAT_df = building_CAT_df.join(
-        building_CAT_df.group_by("building_space_floor_number").agg(
-            pl.col("building_space_area_with_communal").sum().alias("building_floor_total_area")
-        ), on=["building_space_floor_number"])
-    building_CAT_df = building_CAT_df.join(
-        building_CAT_df.group_by("building_reference").agg(
-            pl.col("building_space_area_with_communal").sum().alias("building_total_area")
-        ), on=["building_reference"])
-    building_CAT_df = building_CAT_df.with_columns(
-        pl.col("building_space_area_without_communal").round(2).alias(
-            "building_space_area_without_communal"),
-        pl.col("building_space_area_with_communal").round(2).alias("building_space_area_with_communal"),
-        pl.col("building_space_economic_value").round(2).alias("building_space_economic_value"),
+    # Join below/above orders into a single floor order.
+    df["building_space_floor_order"] = df["building_space_floor_order_above_ground"].where(
+        df["building_space_floor_order_above_ground"].notna(),
+        df["building_space_floor_order_below_ground"],
     )
 
-    # Sort the dataset
-    building_CAT_df = building_CAT_df.sort(
-        ["building_space_address", "building_space_inner_address"]
-    )
+    # Per-address, compact non-consecutive floor orders into consecutive integers
+    # while preserving the minimum value. Example: [3, 5, 7, 7, 5] → [3, 4, 5, 5, 4].
+    grouped_addr = df.groupby("building_space_address")["building_space_floor_order"]
+    dense_rank = grouped_addr.rank(method="dense").astype("Int32")
+    min_per_addr = grouped_addr.transform("min").astype("Int32")
+    df["building_space_floor_number"] = (dense_rank - 1 + min_per_addr).astype("Int32")
+
+    # Building-floor and per-building total areas.
+    df["building_floor_total_area"] = df.groupby("building_space_floor_number")[
+        "building_space_area_with_communal"
+    ].transform("sum")
+    df["building_total_area"] = df.groupby("building_reference")[
+        "building_space_area_with_communal"
+    ].transform("sum")
+
+    df["building_space_area_without_communal"] = df["building_space_area_without_communal"].round(2)
+    df["building_space_area_with_communal"] = df["building_space_area_with_communal"].round(2)
+    df["building_space_economic_value"] = df["building_space_economic_value"].round(2)
+
+    df = df.sort_values(["building_space_address", "building_space_inner_address"], kind="stable")
+
+    category_map = {"A": "1", "B": "2", "C": "3", "0": "1", "O": "1"}
+    # Plain float (not nullable Int8/Float64) so that .mean() on an all-NA
+    # group returns numpy NaN — Python's `round` chokes on pandas NAType but
+    # handles float NaN fine, matching the polars null-propagation semantics.
+    df["_typ_cat_int"] = pd.to_numeric(
+        df["building_space_typology_category"].map(lambda v: category_map.get(v, v)),
+        errors="coerce",
+    ).astype(float)
+
+    def _safe_round(x, digits):
+        # Polars-style null propagation: pd.NA / None / NaN → NaN, no TypeError.
+        if x is None or pd.isna(x):
+            return float("nan")
+        return round(float(x), digits)
+
+    def _safe_div_round(num, den, digits):
+        # Mirrors polars `(num / den).round(digits)` with null propagation:
+        # divide by 0 or NaN denominator yields NaN, never warns.
+        if num is None or pd.isna(num) or den is None or pd.isna(den) or float(den) == 0.0:
+            return float("nan")
+        return round(float(num) / float(den), digits)
+
+    def _by_floors(group):
+        floor_total_area = group["building_floor_total_area"].mean()
+        out = {
+            "building_reference": group["building_reference"].iloc[0],
+            "br__building_spaces_by_floor": int(group["building_space_reference"].count()),
+            "br__mean_building_space_area_with_communals_by_floor": _safe_round(group["building_space_area_with_communal"].mean(), 2),
+            "br__mean_building_space_area_without_communals_by_floor": _safe_round(group["building_space_area_without_communal"].mean(), 2),
+            "br__mean_building_space_communal_area_by_floor": _safe_round(group["building_space_communal_area"].mean(), 2),
+            "br__mean_building_space_effective_year_by_floor": _safe_round(group["building_space_effective_year"].mean(), 1),
+            "br__mean_building_space_category_by_floor": _safe_round(group["_typ_cat_int"].mean(), 1),
+            "br__mean_building_space_economic_value_by_floor": _safe_round(group["building_space_economic_value"].mean(), 2),
+            "br__area_with_communals_by_floor": group["building_space_area_with_communal"].sum(),
+            "br__area_without_communals_by_floor": group["building_space_area_without_communal"].sum(),
+            "br__communal_area_by_floor": group["building_space_communal_area"].sum(),
+            "br__economic_value_by_floor": group["building_space_economic_value"].sum(),
+            "br__relative_area_with_communals_by_floor": _safe_div_round(group["building_space_area_with_communal"].sum(), floor_total_area, 2) * 100,
+            "br__relative_area_without_communals_by_floor": _safe_div_round(group["building_space_area_without_communal"].sum(), floor_total_area, 2) * 100,
+            "br__relative_communal_area_by_floor": _safe_div_round(group["building_space_communal_area"].sum(), floor_total_area, 2) * 100,
+        }
+        return pd.Series(out)
 
     agg_CAT_by_floors = (
-        building_CAT_df.group_by("building_space_floor_number", "building_space_inferred_use_type").agg(
-            pl.col("building_reference").first().alias("building_reference"),
-            pl.col("building_space_reference").count().alias("br__building_spaces_by_floor"),
-            # Average values per building space
-            pl.col("building_space_area_with_communal").mean().round(2).alias(
-                "br__mean_building_space_area_with_communals_by_floor"),
-            pl.col("building_space_area_without_communal").mean().round(2).alias(
-                "br__mean_building_space_area_without_communals_by_floor"),
-            pl.col("building_space_communal_area").mean().round(2).alias(
-                "br__mean_building_space_communal_area_by_floor"),
-            pl.col("building_space_effective_year").mean().round(1).alias(
-                "br__mean_building_space_effective_year_by_floor"),
-            pl.col("building_space_typology_category").
-                replace({"A":"1","B":"2","C":"3","0":"1","O":"1"}).
-                cast(pl.Int8).mean().round(1).alias(
-                    "br__mean_building_space_category_by_floor"),
-            pl.col("building_space_economic_value").mean().round(2).alias(
-                "br__mean_building_space_economic_value_by_floor"),
-            # Total value for the whole building
-            pl.col("building_space_area_with_communal").sum().alias("br__area_with_communals_by_floor"),
-            pl.col("building_space_area_without_communal").sum().alias(
-                "br__area_without_communals_by_floor"),
-            pl.col("building_space_communal_area").sum().alias("br__communal_area_by_floor"),
-            pl.col("building_space_economic_value").sum().alias("br__economic_value_by_floor"),
-            ((pl.col("building_space_area_with_communal").sum() / pl.col(
-                "building_floor_total_area").mean()).round(2) * 100).alias(
-                "br__relative_area_with_communals_by_floor"),
-            ((pl.col("building_space_area_without_communal").sum() / pl.col(
-                "building_floor_total_area").mean()).round(2) * 100).alias(
-                "br__relative_area_without_communals_by_floor"),
-            ((pl.col("building_space_communal_area").sum() / pl.col(
-                "building_floor_total_area").mean()).round(2) * 100).alias(
-                "br__relative_communal_area_by_floor")
-        ))
-    agg_CAT_by_floors = agg_CAT_by_floors.rename(
-        {"building_space_floor_number": "floor_number", "building_space_inferred_use_type": "use_type"})
-    agg_CAT_by_floors = agg_CAT_by_floors.sort("floor_number")
-
-    agg_CAT_building = building_CAT_df.group_by("building_space_inferred_use_type").agg(
-        pl.col("building_reference").first().alias("building_reference"),
-        pl.col("building_space_reference").count().alias("br__building_spaces"),
-        pl.col("building_space_floor_number").unique().sort().alias("br__floors"),
-        # Average values per building space
-        pl.col("building_space_area_with_communal").mean().round(2).alias(
-            "br__mean_building_space_area_with_communals"),
-        pl.col("building_space_area_without_communal").mean().round(2).alias(
-            "br__mean_building_space_area_without_communals"),
-        pl.col("building_space_communal_area").mean().round(2).alias(
-            "br__mean_building_space_communal_area"),
-        pl.col("building_space_effective_year").mean().round(1).alias(
-            "br__mean_building_space_effective_year"),
-        pl.col("building_space_typology_category").
-            replace({"A":"1","B":"2","C":"3","0":"1","O":"1"}).
-            cast(pl.Int8).mean().round(1).alias(
-            "br__mean_building_space_category"),
-        pl.col("building_space_economic_value").mean().round(2).alias(
-            "br__mean_building_space_economic_value"),
-        # Total value for the whole building
-        pl.col("building_space_area_with_communal").sum().alias("br__area_with_communals"),
-        pl.col("building_space_area_without_communal").sum().alias(
-            "br__area_without_communals"),
-        pl.col("building_space_communal_area").sum().alias("br__communal_area"),
-        pl.col("building_space_economic_value").sum().alias("br__economic_value"),
-        ((pl.col("building_space_area_with_communal").sum() / pl.col(
-            "building_total_area").mean()).round(2) * 100).alias(
-            "br__relative_area_with_communals"),
-        ((pl.col("building_space_area_without_communal").sum() / pl.col(
-            "building_total_area").mean()).round(2) * 100).alias(
-            "br__relative_area_without_communals"),
-        ((pl.col("building_space_communal_area").sum() / pl.col("building_total_area").mean()).round(
-            2) * 100).alias("br__relative_communal_area"),
-        # Arrays of values per building
-        pl.col("building_space_reference").alias("br__building_spaces_reference"),
-        pl.col("building_space_address").alias("br__building_spaces_postal_address"),
-        pl.col("building_space_inner_address").alias("br__building_spaces_inner_address"),
-        pl.col("building_space_floor_number").alias("br__building_spaces_floor_number"),
-        (pl.col("building_space_typology_category").
-            replace({"A":"1","B":"2","C":"3","0":"1","O":"1"}).
-            cast(pl.Int8).alias("br__building_spaces_category")),
-        pl.col("building_space_effective_year").alias("br__building_spaces_effective_year"),
-        pl.col("building_space_area_without_communal").alias(
-            "br__building_spaces_area_without_communal"),
-        pl.col("building_space_area_with_communal").alias("br__building_spaces_area_with_communal"),
-        pl.col("building_space_economic_value").alias("br__building_spaces_economic_value"),
-        pl.col("building_space_detailed_use_type").alias("br__building_spaces_detailed_use_type")
+        df.groupby(["building_space_floor_number", "building_space_inferred_use_type"], dropna=False)
+        .apply(_by_floors, include_groups=False)
+        .reset_index()
+        .rename(columns={
+            "building_space_floor_number": "floor_number",
+            "building_space_inferred_use_type": "use_type",
+        })
+        .sort_values("floor_number", kind="stable")
+        .reset_index(drop=True)
     )
-    agg_CAT_building = agg_CAT_building.rename(
-        {"building_space_inferred_use_type": "use_type"})
+
+    def _by_building(group):
+        total_area = group["building_total_area"].mean()
+        # CAT splits a single space across the floors it occupies, so the
+        # same building_space_reference shows up once per floor with split
+        # area/economic value. Fold those back into one row per space:
+        # additive fields summed, descriptive fields kept from the first row.
+        additive = {
+            "building_space_area_without_communal": "sum",
+            "building_space_area_with_communal": "sum",
+            "building_space_communal_area": "sum",
+            "building_space_economic_value": "sum",
+        }
+        first_fields = {
+            "building_space_address": "first",
+            "building_space_inner_address": "first",
+            "building_space_floor_number": "first",
+            "_typ_cat_int": "first",
+            "building_space_effective_year": "first",
+            "building_space_detailed_use_type": "first",
+        }
+        agg_spec = {**additive, **first_fields}
+        agg_spec = {c: how for c, how in agg_spec.items() if c in group.columns}
+        dedup = (group.groupby("building_space_reference", sort=False, dropna=False)
+                       .agg(agg_spec)
+                       .reset_index())
+        out = {
+            "building_reference": group["building_reference"].iloc[0],
+            "br__building_spaces": int(len(dedup)),
+            "br__floors": sorted(pd.unique(dedup["building_space_floor_number"].dropna()).tolist()),
+            "br__mean_building_space_area_with_communals": _safe_round(dedup["building_space_area_with_communal"].mean(), 2),
+            "br__mean_building_space_area_without_communals": _safe_round(dedup["building_space_area_without_communal"].mean(), 2),
+            "br__mean_building_space_communal_area": _safe_round(dedup["building_space_communal_area"].mean(), 2),
+            "br__mean_building_space_effective_year": _safe_round(dedup["building_space_effective_year"].mean(), 1),
+            "br__mean_building_space_category": _safe_round(dedup["_typ_cat_int"].mean(), 1),
+            "br__mean_building_space_economic_value": _safe_round(dedup["building_space_economic_value"].mean(), 2),
+            "br__area_with_communals": dedup["building_space_area_with_communal"].sum(),
+            "br__area_without_communals": dedup["building_space_area_without_communal"].sum(),
+            "br__communal_area": dedup["building_space_communal_area"].sum(),
+            "br__economic_value": dedup["building_space_economic_value"].sum(),
+            "br__relative_area_with_communals": _safe_div_round(dedup["building_space_area_with_communal"].sum(), total_area, 2) * 100,
+            "br__relative_area_without_communals": _safe_div_round(dedup["building_space_area_without_communal"].sum(), total_area, 2) * 100,
+            "br__relative_communal_area": _safe_div_round(dedup["building_space_communal_area"].sum(), total_area, 2) * 100,
+            "br__building_spaces_reference": list(dedup["building_space_reference"]),
+            "br__building_spaces_postal_address": list(dedup["building_space_address"]),
+            "br__building_spaces_inner_address": list(dedup["building_space_inner_address"]),
+            "br__building_spaces_floor_number": list(dedup["building_space_floor_number"]),
+            "br__building_spaces_category": list(dedup["_typ_cat_int"]),
+            "br__building_spaces_effective_year": list(dedup["building_space_effective_year"]),
+            "br__building_spaces_area_without_communal": list(dedup["building_space_area_without_communal"]),
+            "br__building_spaces_area_with_communal": list(dedup["building_space_area_with_communal"]),
+            "br__building_spaces_economic_value": list(dedup["building_space_economic_value"]),
+            "br__building_spaces_detailed_use_type": list(dedup["building_space_detailed_use_type"]),
+        }
+        return pd.Series(out)
+
+    agg_CAT_building = (
+        df.groupby("building_space_inferred_use_type", dropna=False)
+        .apply(_by_building, include_groups=False)
+        .reset_index()
+        .rename(columns={"building_space_inferred_use_type": "use_type"})
+    )
 
     return {
         "by_floors": agg_CAT_by_floors,
-        "building": agg_CAT_building
+        "building": agg_CAT_building,
     }

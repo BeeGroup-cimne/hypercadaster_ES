@@ -12,7 +12,7 @@ sys.path.insert(0, '/')
 print("=== STARTING HC.MERGE() EXECUTION PATH ===")
 
 # Configuration - same as your example
-wd = "/home/gmor/Nextcloud2/Beegroup/data/hypercadaster_ES"
+wd = "/media/gmor/data2/hypercadaster_ES"
 cadaster_codes = ["08900"]  # Barcelona
 code = cadaster_codes[0]
 
@@ -40,7 +40,7 @@ DEM_raster_dir = hc.utils.DEM_raster_dir_(wd)
 results_dir = hc.utils.results_dir_(wd)
 open_street_dir = hc.utils.open_street_dir_(wd)
 open_data_layers_dir = hc.utils.open_data_dir_(wd)
-CAT_files_dir = f"{wd}/CAT_files"
+CAT_files_dir = f"{wd}/cadaster/CAT_files"
 
 print("\n=== STEP 2: Preparing join_cadaster_data arguments ===")
 
@@ -93,7 +93,8 @@ gdf = join_cadaster_data(
     use_CAT_files=use_CAT_files,
     open_data_layers=open_data_layers,
     open_data_layers_dir=open_data_layers_dir,
-    CAT_files_dir=CAT_files_dir
+    CAT_files_dir=CAT_files_dir,
+    num_workers=32
 )
 
 print(f"join_cadaster_data completed!")

@@ -295,7 +295,8 @@ Context manager for progress tracking in parallel operations, enabling efficient
 ### Street & Infrastructure Analysis
 
 #### OpenStreetMap Integration
-- `get_municipality_open_street_maps()`: OSM data integration
+- `get_municipality_open_street_maps()`: OSM street network data integration
+- `get_pois_open_street_maps()`: Fetch and cache POIs by municipality; queries OSM via `osmnx` and stores results as GeoPackage files
 - `detect_number_of_orientations()`: Analyze building orientation complexity
 - `is_segment_in_contact_with_street()`: Building-street relationships
 - `split_linestring_to_segments()`: Linear geometry processing

@@ -40,6 +40,7 @@ import networkx as nx
 # Raster processing
 import rasterio
 from rasterio.merge import merge
+from rasterio.warp import transform as warp_transform
 
 # Parallel processing
 import joblib
@@ -135,6 +136,7 @@ def create_dirs(data_dir):
     os.makedirs(postal_codes_dir_(data_dir), exist_ok=True)
     os.makedirs(f"{postal_codes_dir_(data_dir)}/raw", exist_ok=True)
     os.makedirs(open_data_dir_(data_dir), exist_ok=True)
+    os.makedirs(open_street_dir_(data_dir), exist_ok=True)
 
 # PyCatastro.ConsultaMunicipio("BARCELONA")['consulta_municipalero'][]
 # def dwellings_per_building_reference(province_name, municipality_name, building_reference):
@@ -454,22 +456,28 @@ def concatenate_tiffs(input_dir, output_file):
         src.close()
 
 
-def create_graph(gdf, geometry_name="building_part_geometry", buffer = 0.5):
+def create_graph(gdf, geometry_name="building_part_geometry", buffer=0.5):
+    """Build a networkx Graph where nodes are gdf rows and edges connect
+    geometries whose `buffer`-expanded version intersects the original of another.
+    """
     G = nx.Graph()
     G.add_nodes_from(gdf.index)
 
-    # Create a copy of the DataFrame to avoid the SettingWithCopyWarning
-    gdf = gdf[[geometry_name]].copy()
-    gdf['id'] = gdf.index
-    gdf = gdf.set_geometry(geometry_name)
-    buffered_gdf = gdf.copy()
-    buffered_gdf[geometry_name] = gdf[geometry_name].buffer(buffer)
-    # Perform a spatial join to find nearest neighbors
-    joined = sjoin(buffered_gdf, gdf, how='inner', predicate='intersects', lsuffix='left', rsuffix='right')
+    base = gdf[[geometry_name]].copy()
+    base['id'] = base.index
+    base = base.set_geometry(geometry_name)
+    buffered = base.copy()
+    buffered[geometry_name] = base[geometry_name].buffer(buffer)
+    # Spatial self-join on buffered-vs-original
+    joined = sjoin(buffered, base, how='inner', predicate='intersects',
+                   lsuffix='left', rsuffix='right')
 
-    # Create edges between nearest neighbors
-    edges = [(row['id_left'], row['id_right']) for _, row in joined.iterrows()]
-    G.add_edges_from(edges)
+    # Vectorized edge construction (iterrows() was the previous bottleneck on
+    # dense Barcelona zones where `joined` can have millions of rows).
+    left = joined['id_left'].to_numpy()
+    right = joined['id_right'].to_numpy()
+    mask = left != right  # drop self-loops; sjoin includes them
+    G.add_edges_from(zip(left[mask].tolist(), right[mask].tolist()))
 
     return G
 
@@ -510,36 +518,40 @@ def detect_close_buildings(gdf_building_parts, buffer_neighbours, neighbours_col
 def detect_close_geometries_chunk(chunk, buffer_neighbours, neighbours_column_name, neighbours_id_column_name,
                                   geometry_variable):
     G = create_graph(chunk, geometry_name=geometry_variable, buffer=buffer_neighbours)
-    clusters = list(nx.connected_components(G))
-    cluster_map = {node: i for i, cluster in enumerate(clusters) for node in cluster}
 
-    if neighbours_id_column_name == "single_building_reference":
+    # Connected components are only needed when callers ask for the
+    # "single_building_reference" clustering (adjacent-buildings case).
+    needs_clusters = neighbours_id_column_name == "single_building_reference"
+    if needs_clusters:
+        clusters = list(nx.connected_components(G))
+        cluster_map = {node: i for i, cluster in enumerate(clusters) for node in cluster}
+        chunk = chunk.copy()
         chunk['cluster_id'] = chunk.index.map(cluster_map)
-        chunk['single_building_reference'] = chunk['building_reference'].str.cat(chunk['cluster_id'].astype(str),
-                                                                                 sep='_')
+        chunk['single_building_reference'] = chunk['building_reference'].str.cat(
+            chunk['cluster_id'].astype(str), sep='_'
+        )
 
-    # Update graph nodes to include the single_building_reference attribute
-    for idx, row in chunk.iterrows():
-        G.nodes[idx][neighbours_id_column_name] = row[neighbours_id_column_name]
+    # Vectorized node-attribute assignment (replaces iterrows()).
+    idx_to_ref = dict(zip(chunk.index.tolist(), chunk[neighbours_id_column_name].tolist()))
 
-    # Create a dictionary to store related single_building_references
+    # Build the related-references map directly from G.adjacency() — one pass,
+    # set comprehensions, no Python-level per-row loops over the DataFrame.
     related_buildings_map = {}
-    for node in G.nodes:
-        single_building_reference = G.nodes[node][neighbours_id_column_name]
-        connected_references = {G.nodes[neighbor][neighbours_id_column_name] for neighbor in G.neighbors(node)}
+    for node, neighbours in G.adjacency():
+        ref = idx_to_ref.get(node)
+        if ref is None:
+            continue
+        bucket = related_buildings_map.setdefault(ref, {ref})
+        for nb in neighbours:
+            nb_ref = idx_to_ref.get(nb)
+            if nb_ref is not None:
+                bucket.add(nb_ref)
 
-        if single_building_reference not in related_buildings_map:
-            related_buildings_map[single_building_reference] = connected_references
-        else:
-            related_buildings_map[single_building_reference].update(connected_references)
-
-        # Ensure each single_building_reference includes itself in its related buildings
-        related_buildings_map[single_building_reference].add(single_building_reference)
-
-    # Convert sets to sorted comma-separated strings for display or further processing
+    # Keep only the rows the caller asked for (the un-buffered originals).
     chunk = chunk[chunk["buffered"]].copy()
     chunk[neighbours_column_name] = chunk[neighbours_id_column_name].map(
-        lambda x: ','.join(sorted(related_buildings_map[x])))
+        lambda x: ','.join(sorted(related_buildings_map.get(x, {x})))
+    )
 
     return chunk
 
@@ -646,29 +658,76 @@ def union_geoseries_with_tolerance(geometries, gap_tolerance=1e-6, resolution=16
     - unioned_geometry (Geometry): A single unified geometry after applying the tolerance.
     """
 
+    def _safe_unary_union(geoms):
+        # Some cadastral inputs trigger "TopologyException: unable to assign
+        # free hole to a shell" inside GEOS. Repair invalid geometries with
+        # make_valid() and retry; if that still fails, buffer(0) is a last
+        # resort that almost always produces a polygonal result GEOS accepts.
+        #
+        # `geoms` here can be either a GeoSeries/list (step 1) or already a
+        # single shapely Geometry (step 3) — handle both.
+        def _repair(g):
+            if g is None:
+                return None
+            if hasattr(g, "make_valid"):
+                try:
+                    return g.make_valid()
+                except GEOSException:
+                    pass
+            try:
+                return g.buffer(0)
+            except GEOSException:
+                return g
+
+        try:
+            return unary_union(geoms)
+        except GEOSException:
+            if isinstance(geoms, BaseGeometry):
+                repaired = _repair(geoms)
+            else:
+                repaired = [_repair(g) for g in geoms]
+            try:
+                return unary_union(repaired)
+            except GEOSException:
+                # Last-ditch: buffer(0) on whatever came back from the
+                # first repair pass.
+                if isinstance(repaired, BaseGeometry):
+                    return repaired.buffer(0)
+                return unary_union([
+                    (g.buffer(0) if g is not None else g) for g in repaired
+                ])
+
     # Step 1: Perform a unary union on all geometries
-    unioned_geometry = unary_union(geometries)
+    unioned_geometry = _safe_unary_union(geometries)
 
     # Step 2: Buffer by a small negative amount and then positive to fill gaps
-    unioned_geometry = unioned_geometry.buffer(gap_tolerance, resolution=resolution,
-                                               join_style=JOIN_STYLE.mitre).buffer(
-        -gap_tolerance, resolution=resolution, join_style=JOIN_STYLE.mitre)
+    try:
+        unioned_geometry = unioned_geometry.buffer(gap_tolerance, resolution=resolution,
+                                                   join_style=JOIN_STYLE.mitre).buffer(
+            -gap_tolerance, resolution=resolution, join_style=JOIN_STYLE.mitre)
+    except GEOSException:
+        # The buffer round-trip can itself blow up on degenerate output; fall
+        # back to a single buffer(0) which is enough to produce a valid result.
+        unioned_geometry = unioned_geometry.buffer(0)
 
     # Step 3: Perform the union again if needed
-    unioned_geometry = unary_union(unioned_geometry)
+    unioned_geometry = _safe_unary_union(unioned_geometry)
 
     return unioned_geometry
 
-def calculate_floor_footprints_chunk(chunk, gdf, group_by, only_exterior_geometry, min_hole_area, gap_tolerance,
+def calculate_floor_footprints_chunk(chunk_groups, only_exterior_geometry, min_hole_area, gap_tolerance,
                                      by_floors):
     """
     Process a chunk of groups to calculate the 2D footprint geometry for each floor level.
+
+    `chunk_groups` is a list of (group_label, group_gdf) tuples, already sliced
+    from the global gdf by the caller. This avoids the previous per-group full
+    scan `gdf[gdf[group_by] == group]` (which was O(N*G), the dominant cost on
+    Barcelona) and avoids pickling the full gdf to every joblib worker.
     """
     floor_footprints = []
 
-    for group in chunk:
-        # Filter the grouped buildings
-        gdf_ = gdf[gdf[group_by] == group] if group_by else gdf
+    for group, gdf_ in chunk_groups:
 
         if by_floors==True:
             # Unique levels of floors
@@ -779,37 +838,77 @@ def calculate_floor_footprints(gdf, group_by=None, geometry_name="geometry", onl
     Generate the 2D footprint geometry for each floor level by merging overlapping geometries.
     """
     gdf = gdf.set_geometry(geometry_name)
+    crs = gdf.crs
 
-    # Determine unique groups and create chunks
-    unique_groups = gdf[group_by].unique() if group_by else ['all']
-    chunks = np.array_split(unique_groups, len(unique_groups) // chunk_size + 1)
+    # Pre-group ONCE so per-group access is O(1) instead of O(N) per group.
+    # Also keep only the columns the chunk function needs, which dramatically
+    # reduces the per-worker memory footprint when joblib pickles the slices.
+    needed_cols = [geometry_name]
+    if by_floors:
+        for c in ("n_floors_above_ground", "n_floors_below_ground"):
+            if c in gdf.columns:
+                needed_cols.append(c)
+    else:
+        if "n_floors_above_ground" in gdf.columns:
+            needed_cols.append("n_floors_above_ground")
+    if group_by and group_by in gdf.columns and group_by not in needed_cols:
+        needed_cols.append(group_by)
+    gdf_slim = gdf[needed_cols].copy()
 
-    if len(chunks)>2 and (num_workers==-1 or num_workers>1):
-        # Parallel processing of each chunk
+    if group_by:
+        groups_dict = {name: sub for name, sub in gdf_slim.groupby(group_by, sort=False)}
+        unique_groups = list(groups_dict.keys())
+    else:
+        groups_dict = {"all": gdf_slim}
+        unique_groups = ["all"]
+
+    chunks_of_groups = np.array_split(unique_groups, len(unique_groups) // chunk_size + 1)
+    # Pre-materialize per-chunk lists of (label, sub_gdf) so the worker doesn't
+    # need a reference to the global gdf at all.
+    chunk_payloads = [
+        [(g, groups_dict[g]) for g in chunk_groups]
+        for chunk_groups in chunks_of_groups
+    ]
+
+    # Accumulate raw row dicts and build the GeoDataFrame once at the end.
+    # Avoids `gpd.GeoDataFrame([], crs=crs)` failing on empty input (no
+    # geometry column inferable), and avoids the dtype-upcast trap of seeding
+    # with an empty frame that promotes int `floor` values to float on concat
+    # — which then breaks downstream `range(.floor.max() + 1)` calls.
+    if len(chunk_payloads) > 2 and (num_workers == -1 or num_workers > 1):
         with tqdm_joblib(tqdm(desc="Processing floor above/below ground footprints...",
-                              total=len(chunks))):
+                              total=len(chunk_payloads))):
             results = Parallel(n_jobs=num_workers)(
-                delayed(calculate_floor_footprints_chunk)(chunk, gdf, group_by, only_exterior_geometry, min_hole_area,
+                delayed(calculate_floor_footprints_chunk)(payload, only_exterior_geometry, min_hole_area,
                                                           gap_tolerance, by_floors)
-                for chunk in chunks
+                for payload in chunk_payloads
             )
         get_reusable_executor().shutdown(wait=True)
 
-        # Flatten the list of results and create the final GeoDataFrame
         floor_footprints = [item for sublist in results for item in sublist]
-        floor_footprints_gdf = gpd.GeoDataFrame(floor_footprints, crs=gdf.crs)
     else:
-        floor_footprints_gdf = gpd.GeoDataFrame()
-        for i in range(len(chunks)):
-            chunk = chunks[i]
-            floor_footprints_gdf = pd.concat([
-                floor_footprints_gdf,
-                gpd.GeoDataFrame(
-                    calculate_floor_footprints_chunk(chunk, gdf, group_by, only_exterior_geometry,
-                                                     min_hole_area, gap_tolerance, by_floors),
-                crs=gdf.crs)])
+        floor_footprints = []
+        for payload in chunk_payloads:
+            floor_footprints.extend(
+                calculate_floor_footprints_chunk(
+                    payload, only_exterior_geometry, min_hole_area, gap_tolerance, by_floors
+                )
+            )
 
-    return floor_footprints_gdf
+    if not floor_footprints:
+        # "Ruins"-only group(s): no footprints produced. Return a typed
+        # empty GeoDataFrame so callers can `.empty`-check and skip.
+        empty_data = (
+            {"group": pd.Series([], dtype="object"),
+             "floor": pd.Series([], dtype="int64"),
+             "geometry": gpd.GeoSeries([], crs=crs)}
+            if by_floors else
+            {"group": pd.Series([], dtype="object"),
+             "geometry": gpd.GeoSeries([], crs=crs)}
+        )
+        return gpd.GeoDataFrame(empty_data, geometry="geometry", crs=crs)
+
+    return gpd.GeoDataFrame(floor_footprints, crs=crs)
 
 def get_all_patios(geoseries):
     interiors = []
@@ -1003,6 +1102,86 @@ def create_ray_from_centroid(centroid, angle, length=1000):
     y = centroid.y + length * math.cos(angle_rad)
     return LineString([centroid, Point(x, y)])
 
+
+def _coerce_scalar_float(value, default=0.0):
+    """Coerce `value` to a plain Python float, handling Series/array-like inputs.
+
+    Common offender: a DataFrame slice with duplicate column names returns a
+    Series rather than a scalar. Anywhere we need an unambiguous scalar (e.g.
+    feeding into comparisons inside ray-shading), call this first.
+    """
+    try:
+        if value is None:
+            return default
+        if hasattr(value, "iloc"):
+            # Series/DataFrame slice — take first; recurse in case it's still array-like
+            return _coerce_scalar_float(value.iloc[0], default)
+        if hasattr(value, "__len__") and not isinstance(value, (str, bytes)):
+            if len(value) == 0:
+                return default
+            return _coerce_scalar_float(value[0], default)
+        v = float(value)
+        if v != v:  # NaN
+            return default
+        return v
+    except (TypeError, ValueError, IndexError, KeyError):
+        return default
+
+
+def floor_base_elevation(ground_elevation, floor, ground_floor_height=5.0, floor_height=3.0):
+    """Absolute elevation (m) of the slab at the bottom of `floor`.
+
+    Floor 0 sits on the ground; floor 1's slab is above the (taller) ground
+    floor; subsequent floors stack at the regular upper-floor height.
+    Inputs are coerced to scalars defensively so that callers passing a Series
+    (e.g. due to a duplicate 'elevation' column upstream) don't poison the
+    downstream comparisons with Series-typed heights.
+    """
+    g = _coerce_scalar_float(ground_elevation, 0.0)
+    f = int(floor) if not isinstance(floor, int) else floor
+    if f <= 0:
+        return g + f * floor_height
+    return g + ground_floor_height + (f - 1) * floor_height
+
+
+# Per-process cache: opening the DEM raster is expensive and, under a fork
+# pool, opening it concurrently from many workers can deadlock on GDAL's
+# global state. Cache one open handle per (dir, crs) per process.
+_DEM_SAMPLER_CACHE = {}
+
+
+def make_dem_sampler(dem_raster_dir, source_crs):
+    """Return a callable that samples DEM elevations for points in `source_crs`.
+
+    The sampler is `f(xs, ys) -> list[float]`. Returns None if no DEM tif is
+    found, so callers can degrade gracefully. The opened rasterio dataset is
+    cached at module level so subsequent calls within the same process reuse
+    a single open handle (critical for multi-process pools where a leak per
+    zone would exhaust file descriptors and serialize on GDAL locks).
+    """
+    dem_path = os.path.join(dem_raster_dir, "DEM.tif")
+    if not os.path.exists(dem_path):
+        return None
+    cache_key = (os.path.abspath(dem_path), str(source_crs) if source_crs is not None else None)
+    cached = _DEM_SAMPLER_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    rds = rasterio.open(dem_path)
+    dem_crs = rds.crs
+    same_crs = (source_crs is None) or (str(source_crs) == str(dem_crs))
+
+    def sampler(xs, ys):
+        if not same_crs:
+            xs_d, ys_d = warp_transform(source_crs, dem_crs, list(xs), list(ys))
+        else:
+            xs_d, ys_d = list(xs), list(ys)
+        return [v[0] for v in rds.sample(zip(xs_d, ys_d))]
+
+    sampler.close = rds.close
+    _DEM_SAMPLER_CACHE[cache_key] = sampler
+    return sampler
+
 # Function to convert MultiPolygon to a list of Polygons, or leave a Polygon unchanged
 def convert_to_polygons(geometry):
     if isinstance(geometry, MultiPolygon):
@@ -1152,32 +1331,76 @@ def generate_random_interior_points_from_geometry(geometry, num_points, force_pr
 def distance_from_points_to_polygons_by_orientation(geom, other_polygons, num_points_per_geom_element=10,
                                                     orientation_interval=5, orientations_to_analyse=None,
                                                     force_one_orientation_per_geom_element=False,
-                                                    plots=False, pdf=None, max_distance=150):
+                                                    plots=False, pdf=None, max_distance=150,
+                                                    current_height=None, building_heights=None,
+                                                    reference_centroid=None, floor=None,
+                                                    aggregation="mean"):
+    """Cast rays from many random interior points of `geom` and measure, per
+    orientation, the distance from each point's exit through `geom` to the
+    first `other_polygons` hit along the ray. Aggregate across rays per
+    orientation.
+
+    Two modes share the same code:
+
+    Street-width mode (legacy, default — no `current_height`):
+        Returns ``(final_distances_by_orientation, representativity_by_orientation)``
+        — a 2-tuple, unchanged for existing callers (e.g. street widths).
+
+    Shadow mode (when `current_height` + `building_heights` are supplied):
+        Behaves like `distance_from_centroid_to_polygons_by_orientation` but
+        uses many interior points instead of a single centroid, which is
+        more representative for elongated / multi-wing buildings. The
+        per-polygon gate compares neighbour roof elevation to the supplied
+        eye level (`current_height`). Returns a dict:
+            {
+                "building_shadows":    {orient: aggregated_distance or inf},
+                "contour":             {orient: centroid-relative ring distance},
+                "vertical_distances":  {orient: aggregated vertical offset or inf},
+                "elevation_at_shadow": {orient: neighbour-roof elevation or nan},
+            }
+        `reference_centroid` is used only to compute the canonical `contour`
+        ring (so the downstream plot uses one consistent building outline);
+        falls back to the unary union of `geom`'s centroid if not given.
+
+    `aggregation` ∈ {"mean", "min"} controls how per-point distances collapse
+    to a single per-orientation value. "mean" matches the legacy behaviour
+    (typical visible distance); "min" gives the worst-case (closest blocker
+    visible from any interior point).
+    """
+    shadow_mode = current_height is not None and building_heights is not None
+
     if not isinstance(geom, list):
-        geom = [geom]
+        geom_list = [geom]
+    else:
+        geom_list = geom
     if orientations_to_analyse is not None:
         orientations = [int(float(i)) for i in orientations_to_analyse]
     else:
         orientations = list(range(0, 360, orientation_interval))
     aggregated_distances_by_orientation = {str(i): [] for i in orientations}
+    aggregated_vertical_by_orientation = {str(i): [] for i in orientations}
+    aggregated_elev_by_orientation = {str(i): [] for i in orientations}
     final_distances_by_orientation = {str(i): np.inf for i in orientations}
     representativity_by_orientation = {str(i): 0.0 for i in orientations}
     other_pol_intersection_points = {str(i): [] for i in orientations}
     further_point_geoms = {str(i): [] for i in orientations}
-    points = {str(i): [] for i in orientations}
+    points_log = {str(i): [] for i in orientations}
     elements = {str(i): 0 for i in orientations}
 
-    for geom_element in geom:
+    for geom_element in geom_list:
         orientations_element = orientations
         if force_one_orientation_per_geom_element:
             orientations_element = [calculate_wall_outdoor_normal_orientation(geom_element, orientation_interval=orientation_interval)]
-        random_points = generate_random_interior_points_from_geometry(geom_element, num_points_per_geom_element, force_projection=False)
+        random_points = generate_random_interior_points_from_geometry(
+            geom_element, num_points_per_geom_element, force_projection=False)
 
         for angle in orientations_element:
             elements[str(orientations_element[0])] = elements[str(orientations_element[0])] + 1
             for point in random_points:
 
                 distances_by_orientation = {str(i): np.inf for i in orientations_element}
+                vertical_for_this_ray = np.inf
+                elev_for_this_ray = np.nan
 
                 ray = create_ray_from_centroid(point, angle, length=max_distance)
                 further_point_geom = ray.intersection(geom_element)
@@ -1188,7 +1411,25 @@ def distance_from_points_to_polygons_by_orientation(geom, other_polygons, num_po
                 point_to_linearring_distance = point.distance(further_point_geom)
 
                 nearest_point_ = point
-                for other_polygon in other_polygons:
+
+                # Iterate preserving the original index labels when the caller
+                # passes a pandas/GeoSeries — the building_heights dict in
+                # shadow mode is keyed by those labels.
+                if hasattr(other_polygons, "items"):
+                    polygon_iter = other_polygons.items()
+                else:
+                    polygon_iter = enumerate(other_polygons)
+
+                for idx, other_polygon in polygon_iter:
+                    if shadow_mode:
+                        info = building_heights.get(idx, {})
+                        # Gate: neighbour roof must be above eye level.
+                        if info.get('relative_height', 0) <= 0:
+                            continue
+                        if (info.get('is_nearby', False)
+                                and info.get('relative_height', 0) < 3.0):
+                            continue
+
                     polygons = other_polygon.geoms if isinstance(other_polygon, MultiPolygon) else [other_polygon]
                     for polygon in polygons:
                         intersection = ray.intersection(polygon)
@@ -1200,30 +1441,49 @@ def distance_from_points_to_polygons_by_orientation(geom, other_polygons, num_po
                             if distance <= distances_by_orientation[str(angle)]:
                                 nearest_point_ = nearest_point
                                 distances_by_orientation[str(angle)] = distance
+                                if shadow_mode:
+                                    info = building_heights.get(idx, {})
+                                    vertical_for_this_ray = round(
+                                        info.get('relative_height', 0), 2)
+                                    elev_for_this_ray = round(
+                                        info.get('height', 0), 2)
                 other_pol_intersection_points[str(angle)].append(nearest_point_)
                 further_point_geoms[str(angle)].append(further_point_geom)
-                points[str(angle)].append(point)
+                points_log[str(angle)].append(point)
 
                 aggregated_distances_by_orientation[str(angle)].append(distances_by_orientation[str(angle)])
+                aggregated_vertical_by_orientation[str(angle)].append(vertical_for_this_ray)
+                aggregated_elev_by_orientation[str(angle)].append(elev_for_this_ray)
+
+    def _agg(values, op):
+        finite = [v for v in values if v != np.inf and not (isinstance(v, float) and np.isnan(v))]
+        if not finite:
+            return np.inf if op != "elev" else np.nan
+        if op == "min":
+            return round(float(np.min(finite)), 2)
+        if op == "max":
+            return round(float(np.max(finite)), 2)
+        if op == "elev":
+            # mean of finite elevations; nan if none observed
+            return round(float(np.mean(finite)), 2)
+        # default mean
+        return round(float(np.mean(finite)), 2)
 
     for angle in orientations:
-
-        # Aggregate the distances by orientation
-        final_distances_by_orientation[str(angle)] = (
-            round(np.mean([v for v in aggregated_distances_by_orientation[str(angle)] if v < np.inf]), 2)) if (
-            any(v < np.inf for v in aggregated_distances_by_orientation[str(angle)])) else np.inf
+        vals = aggregated_distances_by_orientation[str(angle)]
+        final_distances_by_orientation[str(angle)] = _agg(vals, aggregation)
         representativity_by_orientation[str(angle)] = (
-            len([v for v in aggregated_distances_by_orientation[str(angle)] if v < np.inf]) / (
-            elements[str(angle)]*num_points_per_geom_element if force_one_orientation_per_geom_element else
-            len(geom)*num_points_per_geom_element)
-        ) if (any(v < np.inf for v in aggregated_distances_by_orientation[str(angle)])) else 0.0
+            len([v for v in vals if v < np.inf]) / (
+            elements[str(angle)] * num_points_per_geom_element if force_one_orientation_per_geom_element else
+            len(geom_list) * num_points_per_geom_element)
+        ) if any(v < np.inf for v in vals) else 0.0
 
         mask = [not i.is_empty for i in other_pol_intersection_points[str(angle)]]
         further_point_geoms[str(angle)] = [
-            geom for geom, keep in zip(further_point_geoms[str(angle)], mask) if keep
+            g for g, keep in zip(further_point_geoms[str(angle)], mask) if keep
         ]
         other_pol_intersection_points[str(angle)] = [
-            geom for geom, keep in zip(other_pol_intersection_points[str(angle)], mask) if keep
+            g for g, keep in zip(other_pol_intersection_points[str(angle)], mask) if keep
         ]
         if plots and len(other_pol_intersection_points[str(angle)])>0 and pdf is not None:
             fig, ax = plt.subplots()
@@ -1231,26 +1491,90 @@ def distance_from_points_to_polygons_by_orientation(geom, other_polygons, num_po
                 geometries=list(other_polygons) + [
                     LineString([p1, p2]) for p1, p2 in zip(further_point_geoms[str(angle)],
                                                        other_pol_intersection_points[str(angle)])] + [
-                    points[str(angle)]],
-                contextual_geometry=Polygon(geom) if not isinstance(geom, list) else geom,
-                title=f"Orientation: {angle}º,mean distance: "
-                      f"{str(round(final_distances_by_orientation[str(angle)],2))}m\n, representativity: "
-                      f"{str(round(representativity_by_orientation[str(angle)] * 100, 2))}%",
-                ax=ax
+                    points_log[str(angle)]],
+                contextual_geometry=geom_list,
+                title=(f"{'Building shadows' if shadow_mode else 'Distance'}, "
+                       f"orientation: {angle}º"
+                       + (f", floor: {floor}" if floor is not None else "")
+                       + f"\nagg ({aggregation}) distance to blocker: "
+                       f"{str(round(final_distances_by_orientation[str(angle)],2))}m"),
+                ax=ax,
             )
             pdf.savefig(fig)
             plt.close(fig)
 
-    return final_distances_by_orientation, representativity_by_orientation
+    if not shadow_mode:
+        # Backwards-compatible return for street-width callers.
+        return final_distances_by_orientation, representativity_by_orientation
+
+    # Shadow mode: build the canonical contour ring from a single reference
+    # centroid (so downstream plots draw one building outline, not a fuzzy
+    # cloud of per-point contours). Falls back to the unary-union centroid.
+    if reference_centroid is None:
+        try:
+            reference_centroid = unary_union(geom_list).centroid
+        except Exception:
+            reference_centroid = geom_list[0].centroid
+    contour_by_orientation = {}
+    for angle in orientations:
+        ray = create_ray_from_centroid(reference_centroid, angle, length=max_distance)
+        exit_pts = []
+        for ge in geom_list:
+            exit_geom = ray.intersection(ge)
+            if isinstance(exit_geom, Point):
+                exit_pts.append(exit_geom)
+            elif not exit_geom.is_empty:
+                fp = get_furthest_point(exit_geom, reference_centroid)
+                if fp is not None:
+                    exit_pts.append(fp)
+        if exit_pts:
+            furthest = max(exit_pts, key=lambda p: reference_centroid.distance(p))
+            contour_by_orientation[str(angle)] = round(
+                reference_centroid.distance(furthest), 2)
+        else:
+            contour_by_orientation[str(angle)] = 0.0
+
+    vertical_distances = {
+        str(a): _agg(aggregated_vertical_by_orientation[str(a)], aggregation)
+        for a in orientations
+    }
+    elevation_at_shadow = {
+        str(a): _agg(aggregated_elev_by_orientation[str(a)], "elev")
+        for a in orientations
+    }
+
+    return {
+        "building_shadows": final_distances_by_orientation,
+        "contour": contour_by_orientation,
+        "vertical_distances": vertical_distances,
+        "elevation_at_shadow": elevation_at_shadow,
+        "representativity": representativity_by_orientation,
+    }
 
 def distance_from_centroid_to_polygons_by_orientation(geom, other_polygons, centroid, orientation_interval=5,
                                                     plots=False, pdf=None, floor=None, max_distance=150,
                                                     current_height=None, building_heights=None):
+    """Cast rays from `centroid` outward at `orientation_interval` steps and
+    measure, for each orientation, the distance from the building contour to
+    the nearest *building* obstruction.
+
+    Terrain (DEM) shading is intentionally NOT computed here: it is
+    observer-height-dependent only via a single threshold check, and we only
+    need it once per building (at the top floor's eye level), not per floor.
+    See `sample_terrain_profile_around_centroid` and the post-loop derivation
+    in `building_inference.process_zone` for that.
+
+    Returns a dict with keys:
+        "building_shadows"     {orientation_str: distance_to_first_taller_building or inf}
+        "contour"              {orientation_str: distance_from_centroid_to_building_edge}
+        "vertical_distances"   {orientation_str: roof_height_above_current_floor or inf}
+        "elevation_at_shadow"  {orientation_str: absolute_roof_elevation or nan}
+    """
     direction_angles = list(range(0, 360, orientation_interval))
     distances_by_orientation = {str(i): np.inf for i in direction_angles}
     contour_by_orientation = {str(i): np.inf for i in direction_angles}
-    vertical_distances_by_orientation = {str(i): np.inf for i in direction_angles}  # New: vertical distance when hitting building
-    elevation_at_shadow = {str(i): np.nan for i in direction_angles}  # New: elevation at closest neighbor building
+    vertical_distances_by_orientation = {str(i): np.inf for i in direction_angles}  # vertical distance when hitting building
+    elevation_at_shadow = {str(i): np.nan for i in direction_angles}  # elevation at closest neighbor building
 
     for angle in direction_angles:
 
@@ -1263,7 +1587,13 @@ def distance_from_centroid_to_polygons_by_orientation(geom, other_polygons, cent
         contour_by_orientation[str(angle)] = round(point_to_linearring_distance,2)
         other_pol_intersection_point = None
 
-        for idx, other_polygon in enumerate(other_polygons):
+        # Iterate preserving the original index labels (e.g. GeoSeries labels),
+        # since `building_heights` is keyed by those labels in the caller.
+        if hasattr(other_polygons, "items"):
+            polygon_iter = other_polygons.items()
+        else:
+            polygon_iter = enumerate(other_polygons)
+        for idx, other_polygon in polygon_iter:
             # Check if height information is available for shadow casting
             can_cast_shadow = True
             if building_heights is not None and current_height is not None:
@@ -1304,7 +1634,7 @@ def distance_from_centroid_to_polygons_by_orientation(geom, other_polygons, cent
                                 # Store elevation at the closest neighbor building
                                 elevation_at_shadow[str(angle)] = round(neighbor_absolute_height, 2)
 
-        if plots and other_pol_intersection_point is not None and pdf is not None and distance <= max_distance:
+        if plots and other_pol_intersection_point is not None and pdf is not None:
             fig, ax = plt.subplots()
             plot_shapely_geometries(
                 geometries=list(other_polygons) + [further_point_geom] + [
@@ -1319,11 +1649,348 @@ def distance_from_centroid_to_polygons_by_orientation(geom, other_polygons, cent
             plt.close(fig)
 
     return {
-        "shadows": distances_by_orientation, 
+        "building_shadows": distances_by_orientation,
         "contour": contour_by_orientation,
         "vertical_distances": vertical_distances_by_orientation,
-        "elevation_at_shadow": elevation_at_shadow
+        "elevation_at_shadow": elevation_at_shadow,
     }
+
+
+def sample_terrain_profile_around_centroid(centroid, dem_sampler, orientation_interval=5,
+                                           max_distance=150.0, sample_step=5.0):
+    """Sample the DEM along outgoing rays from `centroid`, returning the
+    observer-independent terrain elevation profile.
+
+    Returns (profile, sample_distances) where:
+        profile = {orientation_str: [elev_at_d1, elev_at_d2, ...]}
+        sample_distances = [d1, d2, ...]  (offsets from centroid, metres)
+
+    If `dem_sampler` is None or all samples fail, returns ({}, []).
+    """
+    if dem_sampler is None:
+        return {}, []
+    sample_distances = [float(d) for d in
+                        np.arange(sample_step, max_distance + 1e-6, sample_step)]
+    if not sample_distances:
+        return {}, []
+    direction_angles = list(range(0, 360, orientation_interval))
+    profile = {}
+    for angle in direction_angles:
+        angle_rad = math.radians(angle)
+        sin_a, cos_a = math.sin(angle_rad), math.cos(angle_rad)
+        xs = [centroid.x + d * sin_a for d in sample_distances]
+        ys = [centroid.y + d * cos_a for d in sample_distances]
+        try:
+            elevs = dem_sampler(xs, ys)
+        except Exception:
+            elevs = [None] * len(sample_distances)
+        coerced = []
+        for e in elevs:
+            try:
+                f = float(e)
+                coerced.append(round(f, 2) if np.isfinite(f) else np.nan)
+            except (TypeError, ValueError):
+                coerced.append(np.nan)
+        profile[str(angle)] = coerced
+    return profile, sample_distances
+
+
+def derive_terrain_shadow_from_profile(profile, sample_distances, contour_by_orientation,
+                                       observer_height, clearance=0.5):
+    """From a terrain elevation profile, compute per-orientation distance and
+    elevation of the first point where the ground rises above
+    `observer_height + clearance`.
+
+    Returns ({orientation: distance_from_contour}, {orientation: terrain_elev}).
+    Distances are inf and elevations NaN where the terrain never blocks.
+    """
+    shadow_dist = {}
+    shadow_elev = {}
+    if not profile or not sample_distances or observer_height is None:
+        for k in profile.keys():
+            shadow_dist[k] = np.inf
+            shadow_elev[k] = np.nan
+        return shadow_dist, shadow_elev
+    threshold = float(observer_height) + float(clearance)
+    for orientation_key, elevs in profile.items():
+        blocked = False
+        contour_d = contour_by_orientation.get(orientation_key, 0.0) if contour_by_orientation else 0.0
+        if contour_d is None or not np.isfinite(contour_d):
+            contour_d = 0.0
+        for d, e in zip(sample_distances, elevs):
+            if e is None or (isinstance(e, float) and np.isnan(e)):
+                continue
+            if e >= threshold:
+                block_dist = round(d - contour_d, 2)
+                if block_dist < 0:
+                    block_dist = 0.0
+                shadow_dist[orientation_key] = block_dist
+                shadow_elev[orientation_key] = round(float(e), 2)
+                blocked = True
+                break
+        if not blocked:
+            shadow_dist[orientation_key] = np.inf
+            shadow_elev[orientation_key] = np.nan
+    return shadow_dist, shadow_elev
+
+
+def sample_dem_grid_around_geometry(geometry, dem_sampler, cell_size=30.0, margin=150.0):
+    """Sample the DEM on a regular grid covering `geometry`'s bbox + `margin`.
+
+    Returns a dict ready to be pickled/serialised:
+
+        {
+            "x_min": float, "y_min": float,
+            "cell_size": float,
+            "nx": int, "ny": int,
+            "elev": [[...], ...]   # row-major, rows in increasing y, cols in increasing x
+        }
+
+    The plot layer reads the dict back and reconstructs the meshgrid for a
+    `contour` / `contourf` call. We deliberately store the grid in metric
+    offsets rather than coordinates so a downstream consumer doesn't need to
+    know the CRS to use it; absolute coordinates can be recovered by adding
+    `x_min` / `y_min`.
+
+    Returns an empty dict if `dem_sampler` is None or every sample fails.
+    """
+    if dem_sampler is None or geometry is None or geometry.is_empty:
+        return {}
+    minx, miny, maxx, maxy = geometry.bounds
+    x_min = float(minx) - float(margin)
+    y_min = float(miny) - float(margin)
+    x_max = float(maxx) + float(margin)
+    y_max = float(maxy) + float(margin)
+    nx = max(2, int(math.ceil((x_max - x_min) / cell_size)) + 1)
+    ny = max(2, int(math.ceil((y_max - y_min) / cell_size)) + 1)
+    xs = [x_min + i * cell_size for i in range(nx)]
+    ys = [y_min + j * cell_size for j in range(ny)]
+
+    # Sample the DEM row by row so a single sampler call processes one full
+    # row of points; cheaper than per-point calls.
+    elev = []
+    any_finite = False
+    for y in ys:
+        try:
+            row_vals = dem_sampler(xs, [y] * nx)
+        except Exception:
+            row_vals = [None] * nx
+        row = []
+        for v in row_vals:
+            try:
+                f = float(v)
+                if not np.isfinite(f):
+                    f = float("nan")
+                else:
+                    any_finite = True
+                row.append(round(f, 2))
+            except (TypeError, ValueError):
+                row.append(float("nan"))
+        elev.append(row)
+    if not any_finite:
+        return {}
+    return {
+        "x_min": round(x_min, 3),
+        "y_min": round(y_min, 3),
+        "cell_size": float(cell_size),
+        "nx": nx,
+        "ny": ny,
+        "elev": elev,
+    }
+
+
+def compute_floor_shadow_region(building_geom, nearby_buildings,
+                                dem_sampler, eye_level,
+                                ground_floor_height=5.0, floor_height=3.0,
+                                max_distance=150.0, clearance=0.5,
+                                orientation_interval=5, sample_step=2.5,
+                                terrain_profile=None,
+                                terrain_profile_distances=None,
+                                centroid=None, buffer_disk=None):
+    """Return a single (Multi)Polygon representing the area blocked from the
+    floor's eye level, in plan view, within `max_distance` of the building.
+
+    The returned region is the union of:
+      - the terrain-shadow region: everything inside the `max_distance`
+        buffer of the building that is *behind* a terrain rise above
+        `eye_level + clearance` along the line of sight from the centroid;
+      - the building-shadow region: nearby building footprints whose
+        portions ABOVE the eye level intersect the visibility polygon
+        (so buildings *behind* a closer terrain rise are skipped — they
+        can't be seen anyway). For each nearby building, only the floors
+        whose top exceeds the eye level contribute; their per-floor
+        footprints are unioned and used as the blocker shape, so stepped
+        buildings (wider podium + narrow tower) correctly project only
+        the tower at high analyzed floors.
+
+    The analyzed building's own footprint is subtracted so the result reads
+    as "what's blocked outside this building".
+
+    Parameters
+    ----------
+    building_geom : shapely Polygon or MultiPolygon
+        The analyzed building's footprint.
+    nearby_buildings : list[dict]
+        One dict per nearby building, with keys:
+            'elev'   : float — ground elevation (m AMSL).
+            'floors' : dict[int, shapely geom] — per-floor footprint of the
+                       neighbour. Floor 0 is the ground floor; floor k's
+                       slab top elevation is `elev + g + k*h`.
+        We pick the lowest floor `k_min` whose top elevation > eye_level
+        and union the footprints of floors ≥ k_min as the blocker shape.
+    dem_sampler : callable
+        Function (xs, ys) → list of elevations (m). If None, no terrain
+        shadow is computed and the return is purely building-driven.
+    eye_level : float
+        Mid-floor eye-level elevation (m AMSL).
+    ground_floor_height : float
+        Ground-floor height (m) used to compute per-floor neighbour-top
+        elevations. Must match the convention used in `floor_base_elevation`.
+    floor_height : float
+        Upper-floor height (m), same convention.
+    max_distance : float
+        Radius of the disk we consider around the building (m).
+    clearance : float
+        Terrain must exceed `eye_level + clearance` to count as a blocker.
+    orientation_interval : int
+        Ray sweep step (degrees) for the terrain visibility polygon.
+    sample_step : float
+        DEM sampling step along each ray (m). Smaller = smoother visibility
+        polygon at higher cost.
+
+    Returns
+    -------
+    shapely Polygon / MultiPolygon (possibly empty).
+    """
+    centroid = building_geom.centroid
+    # Bound the analysis to a disk of radius `max_distance` around the
+    # CENTROID (not the building edge). Building.buffer(max_distance) would
+    # extend `max_distance` beyond every edge, giving a region that reaches
+    # ~`max_distance + building_radius` from the centroid in some
+    # directions — and since the visibility polygon is built from rays of
+    # length `max_distance` from the centroid, the difference of the two
+    # produces a spurious "shadow" annulus at the outer rim.
+    buffer_disk = centroid.buffer(max_distance, resolution=64)
+
+    # --- Visibility polygon: star-shaped, bounded by per-direction terrain
+    # blocker distance.
+    if dem_sampler is not None:
+        n_angles = max(8, int(round(360.0 / max(1, orientation_interval))))
+        angles = [2.0 * math.pi * i / n_angles for i in range(n_angles)]
+        sample_distances = [float(d) for d in
+                            np.arange(sample_step, max_distance + 1e-6, sample_step)]
+        boundary_pts = []
+        for theta in angles:
+            sin_a, cos_a = math.sin(theta), math.cos(theta)
+            # Batch DEM sampling along the ray.
+            xs = [centroid.x + d * sin_a for d in sample_distances]
+            ys = [centroid.y + d * cos_a for d in sample_distances]
+            try:
+                elevs = dem_sampler(xs, ys)
+            except Exception:
+                elevs = [None] * len(sample_distances)
+            block_d = max_distance
+            threshold = eye_level + clearance
+            for d, e in zip(sample_distances, elevs):
+                try:
+                    fe = float(e)
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(fe) and fe > threshold:
+                    block_d = d
+                    break
+            boundary_pts.append((centroid.x + block_d * sin_a,
+                                 centroid.y + block_d * cos_a))
+        try:
+            visibility_polygon = Polygon(boundary_pts).buffer(0)
+            if visibility_polygon.is_empty:
+                visibility_polygon = buffer_disk
+        except Exception:
+            visibility_polygon = buffer_disk
+    else:
+        visibility_polygon = buffer_disk
+
+    # --- Terrain shadow region: buffer disk minus visibility polygon.
+    try:
+        terrain_shadow = buffer_disk.difference(visibility_polygon)
+    except Exception:
+        terrain_shadow = Polygon()
+
+    # --- Building shadow region: per-neighbour, find the lowest floor
+    # `k_min` whose top elevation exceeds the eye level, then union the
+    # neighbour's footprints at floors ≥ k_min as the blocker shape (so
+    # stepped buildings only project their above-eye-level portion). Clip
+    # the result to the visibility polygon (buildings behind a closer
+    # terrain rise drop out).
+    building_pieces = []
+    for nb in nearby_buildings:
+        if not isinstance(nb, dict):
+            continue
+        floors = nb.get('floors') or {}
+        if not floors:
+            continue
+        try:
+            nb_elev = float(nb.get('elev', 0.0))
+        except (TypeError, ValueError):
+            nb_elev = 0.0
+
+        # Top of floor k is at nb_elev + g + k*h. We want the smallest k
+        # with that > eye_level. Solve for k > (eye_level − nb_elev − g)/h.
+        # The smallest such integer is ceil(threshold), then clamp to >= 0.
+        threshold = (eye_level - nb_elev - ground_floor_height) / floor_height
+        # Tiny epsilon to avoid floating-point edge cases at exact equality.
+        k_min = max(0, int(math.ceil(threshold + 1e-9)))
+
+        relevant_floors = [k for k in sorted(floors.keys()) if k >= k_min]
+        if not relevant_floors:
+            continue
+
+        try:
+            blocker = unary_union([
+                floors[k] for k in relevant_floors
+                if floors[k] is not None and not floors[k].is_empty
+            ])
+        except Exception:
+            continue
+        if blocker is None or blocker.is_empty:
+            continue
+        try:
+            clipped = blocker.intersection(visibility_polygon)
+        except Exception:
+            continue
+        if clipped is None or clipped.is_empty:
+            continue
+        building_pieces.append(clipped)
+
+    if building_pieces:
+        try:
+            building_shadow = unary_union(building_pieces)
+        except Exception:
+            building_shadow = Polygon()
+    else:
+        building_shadow = Polygon()
+
+    # --- Combine and subtract the analyzed building's own footprint.
+    try:
+        combined = unary_union([terrain_shadow, building_shadow])
+    except Exception:
+        combined = terrain_shadow
+    try:
+        combined = combined.difference(building_geom)
+    except Exception:
+        pass
+
+    if combined is None or combined.is_empty:
+        return Polygon()
+    if isinstance(combined, Polygon):
+        return combined
+    if isinstance(combined, MultiPolygon):
+        return combined
+    # Fallback: keep only polygonal pieces.
+    polys = [g for g in getattr(combined, 'geoms', []) if isinstance(g, (Polygon, MultiPolygon))]
+    if not polys:
+        return Polygon()
+    return unary_union(polys)
 
 
 def get_streets_open_street_maps(open_street_dir, ine_code=None, cadaster_code=None, query_location=None,
@@ -1335,9 +2002,14 @@ def get_streets_open_street_maps(open_street_dir, ine_code=None, cadaster_code=N
                 ine_code = cadaster_to_ine_codes([cadaster_code])[0]
             else:
                 raise("One of these should be defined: ine_code, cadaster_code or query_location.")
-            mun = municipality_name(ine_code)
-            query_location=f"{mun}, Spain"
-    
+        mun = municipality_name(ine_code)
+        if isinstance(mun, list):
+            if not mun:
+                raise ValueError(f"No municipality name found for INE code {ine_code}")
+            mun = mun[0]
+        query_location = f"{mun}, Spain"
+
+    os.makedirs(open_street_dir, exist_ok=True)
     fn = f"{open_street_dir}/{query_location}.gpkg"
 
     if not os.path.exists(fn):
@@ -1815,6 +2487,9 @@ def get_pois_open_street_maps(
     # 2️⃣ ITERATE SUBGROUPS
     # ------------------------------------------------------------
     results = {}
+    total_subgroups = sum(len(v) for v in OSM_TAGS_STRUCTURED.values())
+    bar = tqdm(total=total_subgroups, desc="Loading POI subgroups",
+               mininterval=1.0, leave=True, ncols=80)
 
     for main_key, subgroups in OSM_TAGS_STRUCTURED.items():
 
@@ -1823,8 +2498,6 @@ def get_pois_open_street_maps(
             subgroup_name = f"{main_key}.{sub_key}" if sub_key != "all" else main_key
             fn = f"{open_street_dir}/POIS_{query_location}/{subgroup_name}.gpkg"
 
-            print(f"[INFO] Processing {subgroup_name}")
-
             # ----------------------------------------------------
             # LOAD CACHE
             # ----------------------------------------------------
@@ -1832,7 +2505,7 @@ def get_pois_open_street_maps(
                 try:
                     gdf = gpd.read_file(fn)
                     results[subgroup_name] = gdf
-                    print(f"[CACHE] {subgroup_name} → {len(gdf)}")
+                    bar.update(1)
                     continue
                 except Exception:
                     pass
@@ -1846,7 +2519,7 @@ def get_pois_open_street_maps(
                 gdf = ox.features_from_polygon(polygon_wgs, tags=tags)
 
                 if gdf.empty:
-                    print(f"[EMPTY] {subgroup_name}")
+                    bar.update(1)
                     continue
 
                 gdf = gdf.reset_index()
@@ -1864,10 +2537,14 @@ def get_pois_open_street_maps(
 
                 results[subgroup_name] = gdf
 
-                print(f"[OK] {subgroup_name} → {len(gdf)}")
-
             except Exception as e:
-                print(f"[FAIL] {subgroup_name}: {e}")
+                # Surface genuine failures to stderr — they're rare and signal
+                # a real problem (network, tag config, etc.).
+                sys.stderr.write(f"[POI FAIL] {subgroup_name}: {e}\n")
+            finally:
+                bar.update(1)
+
+    bar.close()
 
 
     results = clean_pois(results)
@@ -1911,11 +2588,6 @@ def get_pois_open_street_maps(
             no_parcel_mask = poi_with_parcels["building_reference"].isna()
 
             if no_parcel_mask.any():
-                print(
-                    f"[INFO] {no_parcel_mask.sum()} POIs in {subgroup_name} "
-                    f"not within parcels, using nearest neighbor"
-                )
-
                 pois_no_parcel = poi_with_parcels[no_parcel_mask].copy()
 
                 parcel_centroids = parcels_gdf.copy()
@@ -1939,13 +2611,6 @@ def get_pois_open_street_maps(
 
             poi_with_parcels = poi_with_parcels.drop(
                 columns=["index_right"], errors="ignore"
-            )
-
-            assigned = (~poi_with_parcels["building_reference"].isna()).sum()
-
-            print(
-                f"[GEOLOCATE] {subgroup_name} → "
-                f"{assigned} POIs assigned to building_reference"
             )
 
             return poi_with_parcels
@@ -2636,574 +3301,717 @@ def plot_building_shadows_analysis(gdf, building_reference, output_path=None, in
     if floor_height is None:
         floor_height = _detect_floor_height_from_data(building_row)
     
-    if interactive:
-        return _create_interactive_shadow_plot(building_row, building_reference, output_path, 
-                                             include_elevation, floor_height)
-    else:
+    # If the user asked for a raster/vector still (.png/.pdf/.svg/.jpg/.jpeg),
+    # always go through matplotlib — plotly's fig.write_image() depends on
+    # kaleido, which SIGABRTs on Linux when the bundled Chromium can't start.
+    # Plotly is reserved for .html output or interactive display (output_path=None).
+    static_exts = ('.png', '.pdf', '.svg', '.jpg', '.jpeg')
+    if isinstance(output_path, str) and output_path.lower().endswith(static_exts):
         return _create_static_shadow_plot(building_row, building_reference, output_path,
-                                        include_elevation, floor_height)
+                                          include_elevation, floor_height)
+
+    if interactive:
+        return _create_interactive_shadow_plot(building_row, building_reference, output_path,
+                                               include_elevation, floor_height)
+    return _create_static_shadow_plot(building_row, building_reference, output_path,
+                                      include_elevation, floor_height)
 
 
-def _create_interactive_shadow_plot(building_row, building_reference, output_path, 
-                                   include_elevation, floor_height):
-    """Create interactive shadow visualization using plotly."""
+
+
+def _floor_eye_levels(shadow_data, floor_height, ground_floor_height=5.0):
+    """Absolute eye-level elevations (m) for each floor of the analyzed building.
+
+    floor 0 sits at ground+ground_floor_height/2; subsequent floors at
+    ground+ground_floor_height+(i-1)*floor_height + floor_height/2. This
+    matches `floor_base_elevation` semantics used by the inference side.
+    """
+    ground = float(shadow_data.get('elevation', 0.0) or 0.0)
+    n = int(shadow_data.get('max_neighbor_floors', shadow_data.get('building_n_floors', 1)) or 1)
+    levels = []
+    for i in range(n):
+        if i == 0:
+            levels.append(ground + ground_floor_height / 2.0)
+        else:
+            levels.append(ground + ground_floor_height + (i - 1) * floor_height + floor_height / 2.0)
+    return levels
+
+
+def _pick_worst_orientation(shadow_data):
+    """Return the orientation key whose top-floor shadow distance is smallest
+    (finite). Falls back to '180' (south) if no finite shadow exists.
+    """
+    bs = shadow_data.get('building_shadows')
+    if not bs:
+        return '180'
+    best_key = None
+    best_d = float('inf')
+    for k, lst in bs.items():
+        if not isinstance(lst, list) or not lst:
+            continue
+        v = lst[-1]
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(v) and v < best_d:
+            best_d = v
+            best_key = k
+    return best_key or '180'
+
+
+def _create_interactive_shadow_plot(building_row, building_reference, output_path,
+                                    include_elevation, floor_height):
+    """Interactive 3-panel shadow + terrain visualization using plotly.
+
+    Panels:
+        (1) polar  — per-floor combined shadow distance (building roof OR
+                     rising terrain), measured from the building contour.
+        (2) xy     — same per-floor shadow distances vs orientation, linear axis.
+        (3) heatmap — DEM contour map from the 5 m grid sample around the
+                     building.
+    """
     try:
         import plotly.graph_objects as go
         from plotly.subplots import make_subplots
-        import plotly.express as px
-        import numpy as np
     except ImportError:
         print("Plotly not available. Install with: pip install plotly")
         return _create_static_shadow_plot(building_row, building_reference, output_path,
-                                        include_elevation, floor_height)
-    
-    # Extract shadow data
+                                          include_elevation, floor_height)
+
     shadow_data = _extract_shadow_data(building_row)
     if not shadow_data:
         print(f"No shadow data found for building {building_reference}")
         return None
-    
-    # Create subplot layout
+
+    orientations = shadow_data['orientations']
+    orient_keys = [str(int(o)) for o in orientations]
+    contour = shadow_data.get('contour_distances') or [0.0] * len(orientations)
+    sh = shadow_data.get('shadows', {})
+    max_floors = int(shadow_data.get('max_neighbor_floors', 1) or 1)
+    bldg_floors = int(shadow_data.get('building_n_floors', max_floors) or max_floors)
+    cmap = _floor_colors(max_floors)
+
     fig = make_subplots(
         rows=2, cols=2,
         subplot_titles=(
-            'Shadow Distances by Orientation (Polar)',
-            'Building Contour vs Shadows',
-            'Multi-Floor Shadow Comparison',
-            'Elevation Profile Effects'
+            'Per-floor shadow distance (polar)',
+            'Per-floor shadow distance vs orientation',
+            'DEM contour map (5 m grid)',
+            None,
         ),
         specs=[[{"type": "polar"}, {"type": "xy"}],
-               [{"type": "xy"}, {"type": "xy"}]],
-        vertical_spacing=0.08,
-        horizontal_spacing=0.1
+               [{"type": "heatmap"}, None]],
+        vertical_spacing=0.10,
+        horizontal_spacing=0.10,
     )
-    
-    # 1. Polar plot of shadow distances
-    orientations = list(shadow_data['orientations'])
-    shadow_distances = list(shadow_data['shadow_distances'])
-    contour_distances = list(shadow_data['contour_distances'])
-    
-    # Convert orientations to radians
-    orientations_rad = [np.radians(float(o)) for o in orientations]
-    
-    # Add building contour (from centroid to building edge)
-    fig.add_trace(
-        go.Scatterpolar(
-            r=contour_distances,
-            theta=orientations,
-            mode='lines',
-            name='Building Contour',
-            line=dict(color='blue', width=2),
-            fill='toself',
-            fillcolor='rgba(0, 0, 255, 0.1)',
-            hovertemplate='Orientation: %{theta}°<br>Building Edge Distance: %{r:.1f}m<extra></extra>'
-        ),
-        row=1, col=1
-    )
-    
-    # Add total distance to neighbors (contour + shadow)
-    if 'total_distances_to_neighbors' in shadow_data:
-        total_distances = shadow_data['total_distances_to_neighbors']
-        fig.add_trace(
-            go.Scatterpolar(
-                r=total_distances,
-                theta=orientations,
-                mode='lines+markers',
-                name='Distance to Neighbors',
-                line=dict(color='red', width=2),
-                hovertemplate='Orientation: %{theta}°<br>Total Distance to Neighbor: %{r:.1f}m<extra></extra>'
-            ),
-            row=1, col=1
-        )
-    
-    # Add shadow distances only (from building edge to neighbor)
-    fig.add_trace(
-        go.Scatterpolar(
-            r=shadow_distances,
-            theta=orientations,
+
+    # ----- Panel 1: building contour + per-floor shadow distances (polar) -----
+    fig.add_trace(go.Scatterpolar(
+        r=contour + [contour[0]],
+        theta=orient_keys + [orient_keys[0]],
+        mode='lines', name='Building contour',
+        line=dict(color='black', width=2),
+        fill='toself', fillcolor='rgba(0,0,0,0.05)',
+        hovertemplate='Orientation %{theta}°<br>Contour radius %{r:.1f} m<extra></extra>',
+    ), row=1, col=1)
+
+    for floor_idx in range(max_floors):
+        r_total = []
+        for o_idx, key in enumerate(orient_keys):
+            shadow_list = sh.get(key, [])
+            if floor_idx < len(shadow_list) and np.isfinite(shadow_list[floor_idx]):
+                r_total.append(float(contour[o_idx]) + float(shadow_list[floor_idx]))
+            else:
+                r_total.append(None)
+        is_neighbor_extra = floor_idx >= bldg_floors
+        fig.add_trace(go.Scatterpolar(
+            r=r_total + [r_total[0]],
+            theta=orient_keys + [orient_keys[0]],
             mode='lines+markers',
-            name='Shadow Distance Only',
-            line=dict(color='orange', width=1, dash='dot'),
-            hovertemplate='Orientation: %{theta}°<br>Shadow Distance: %{r:.1f}m<extra></extra>'
-        ),
-        row=1, col=1
-    )
-    
-    # 2. Linear comparison plot
-    fig.add_trace(
-        go.Scatter(
-            x=orientations,
-            y=contour_distances,
-            mode='lines+markers',
-            name='Building Contour',
-            line=dict(color='blue', width=2),
-            hovertemplate='Orientation: %{x}°<br>Building Edge: %{y:.1f}m<extra></extra>'
-        ),
-        row=1, col=2
-    )
-    
-    fig.add_trace(
-        go.Scatter(
-            x=orientations,
-            y=shadow_distances,
-            mode='lines+markers',
-            name='Shadow Distance',
-            line=dict(color='orange', width=2),
-            hovertemplate='Orientation: %{x}°<br>Shadow Distance: %{y:.1f}m<extra></extra>'
-        ),
-        row=1, col=2
-    )
-    
-    # Add total distance to neighbors
-    if 'total_distances_to_neighbors' in shadow_data:
-        total_distances = shadow_data['total_distances_to_neighbors']
-        fig.add_trace(
-            go.Scatter(
-                x=orientations,
-                y=total_distances,
-                mode='lines+markers',
-                name='Total to Neighbors',
-                line=dict(color='red', width=2),
-                hovertemplate='Orientation: %{x}°<br>Total Distance: %{y:.1f}m<extra></extra>'
-            ),
-            row=1, col=2
-        )
-    
-    # 3. Multi-floor shadow comparison (showing neighbor collision at different heights)
-    if 'multi_floor_data' in shadow_data:
-        # Reorganize multi-floor data by floor instead of orientation
-        floors_data = {}
-        max_floors = shadow_data.get('max_neighbor_floors', 1)
-        
-        for orientation_key, floor_shadows in shadow_data['multi_floor_data'].items():
-            if isinstance(floor_shadows, list):
-                for floor_idx, shadow_dist in enumerate(floor_shadows):
-                    # Calculate actual height for this floor
-                    # Floor 0 = floor_height/2, Floor 1 = 1 + floor_height/2, etc.
-                    actual_height = (floor_idx + 0.5) * floor_height if floor_idx == 0 else floor_idx + (floor_height / 2)
-                    
-                    if floor_idx not in floors_data:
-                        floors_data[floor_idx] = {
-                            'orientations': [], 
-                            'shadows': [], 
-                            'height': actual_height,
-                            'valid_shadows': []  # Track non-infinite shadows
-                        }
-                    floors_data[floor_idx]['orientations'].append(float(orientation_key))
-                    
-                    # Handle infinite values
-                    import math
-                    if math.isinf(shadow_dist) or shadow_dist > 10000:  # Very large distance = no collision
-                        floors_data[floor_idx]['shadows'].append(None)
-                        floors_data[floor_idx]['valid_shadows'].append(False)
-                    else:
-                        floors_data[floor_idx]['shadows'].append(shadow_dist)
-                        floors_data[floor_idx]['valid_shadows'].append(True)
-        
-        # Sort orientations for each floor and add traces (limit to reasonable number of floors)
-        max_display_floors = min(8, max_floors)  # Limit display to avoid clutter
-        
-        for floor_idx in range(max_display_floors):
-            if floor_idx in floors_data:
-                floor_data = floors_data[floor_idx]
-                
-                # Sort by orientation and filter out None values
-                valid_data = [(o, s) for o, s, valid in zip(floor_data['orientations'], 
-                                                          floor_data['shadows'], 
-                                                          floor_data['valid_shadows']) 
-                             if valid and s is not None]
-                
-                if valid_data:  # Only add trace if there's valid data
-                    sorted_orientations, sorted_shadows = zip(*sorted(valid_data))
-                    
-                    fig.add_trace(
-                        go.Scatter(
-                            x=sorted_orientations,
-                            y=sorted_shadows,
-                            mode='lines+markers',
-                            name=f'Height {floor_data["height"]:.1f}m',
-                            hovertemplate=f'Height {floor_data["height"]:.1f}m<br>Orientation: %{{x}}°<br>Distance: %{{y:.1f}}m<extra></extra>',
-                            connectgaps=False  # Don't connect across gaps in data
-                        ),
-                        row=2, col=1
-                    )
-    
-    # 4. Elevation effects
-    if include_elevation and 'elevation' in building_row.index:
-        elevation = building_row['elevation']
-        # Create elevation profile visualization
-        effective_heights = [elevation + (i * floor_height) for i in range(5)]  # Show 5 floors
-        
-        fig.add_trace(
-            go.Scatter(
-                x=list(range(5)),
-                y=effective_heights,
-                mode='lines+markers',
-                name='Building Height Profile',
-                line=dict(color='green', width=3),
-                hovertemplate='Floor: %{x}<br>Total Height: %{y:.1f}m<extra></extra>'
-            ),
-            row=2, col=2
-        )
-        
-        # Add ground elevation reference as annotation instead of hline
-        fig.add_annotation(
-            x=2, y=elevation, 
-            text=f"Ground: {elevation:.1f}m",
-            showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=2, arrowcolor="brown",
-            bgcolor="white", bordercolor="brown", borderwidth=1,
-            row=2, col=2
-        )
-    
-    # Update layout
+            name=f'Floor {floor_idx}' + (' (neighbor only)' if is_neighbor_extra else ''),
+            line=dict(color=cmap[floor_idx], width=1.5,
+                      dash='dot' if is_neighbor_extra else 'solid'),
+            marker=dict(size=4),
+            hovertemplate=(f'Floor {floor_idx}<br>Orientation %{{theta}}°'
+                           '<br>Blocker at %{r:.1f} m<extra></extra>'),
+        ), row=1, col=1)
+
+    # ----- Panel 2: same on a linear axis ------------------------------------
+    for floor_idx in range(max_floors):
+        ys = []
+        for key in orient_keys:
+            shadow_list = sh.get(key, [])
+            if floor_idx < len(shadow_list) and np.isfinite(shadow_list[floor_idx]):
+                ys.append(float(shadow_list[floor_idx]))
+            else:
+                ys.append(None)
+        is_neighbor_extra = floor_idx >= bldg_floors
+        fig.add_trace(go.Scatter(
+            x=orientations, y=ys, mode='lines+markers',
+            name=f'Floor {floor_idx}'
+                 + (' (neighbor only)' if is_neighbor_extra else ''),
+            line=dict(color=cmap[floor_idx], width=1.5,
+                      dash='dot' if is_neighbor_extra else 'solid'),
+            showlegend=False,
+            hovertemplate=(f'Floor {floor_idx}<br>Orientation %{{x}}°'
+                           '<br>Shadow distance %{y:.1f} m<extra></extra>'),
+        ), row=1, col=2)
+
+    # ----- Panel 3: DEM contour map from the 5 m grid -------------------------
+    grid = shadow_data.get('terrain_grid')
+    if grid and grid.get('elev'):
+        cell = float(grid['cell_size'])
+        nx = int(grid['nx']); ny = int(grid['ny'])
+        elev = np.array(grid['elev'], dtype=float)
+        cx_off = (nx - 1) * cell / 2.0
+        cy_off = (ny - 1) * cell / 2.0
+        gx = np.arange(nx) * cell - cx_off
+        gy = np.arange(ny) * cell - cy_off
+        fig.add_trace(go.Contour(
+            x=gx, y=gy, z=elev,
+            colorscale='Earth',
+            contours=dict(showlines=True, coloring='heatmap'),
+            colorbar=dict(title='Elev (m)', x=0.46, len=0.4, y=0.22),
+            hovertemplate='x=%{x:.0f} m<br>y=%{y:.0f} m<br>elev=%{z:.1f} m<extra></extra>',
+        ), row=2, col=1)
+    fig.update_xaxes(title_text='East offset (m)', row=2, col=1, scaleanchor='y2', scaleratio=1)
+    fig.update_yaxes(title_text='North offset (m)', row=2, col=1)
+
     fig.update_layout(
-        title=f'Shadow Analysis for Building {building_reference}',
-        height=800,
-        showlegend=True,
-        template='plotly_white'
+        title=(f'Shadow & terrain analysis for {building_reference}'
+               f'  (building floors: {bldg_floors}, max floor seen: {max_floors})'),
+        height=900, width=1200, showlegend=True,
+        legend=dict(orientation='v', x=1.02, y=1.0),
     )
-    
-    # Update polar subplot
-    max_distance = max(max(shadow_distances), max(contour_distances))
-    if 'total_distances_to_neighbors' in shadow_data:
-        max_distance = max(max_distance, max(shadow_data['total_distances_to_neighbors']))
-    
-    fig.update_polars(
-        radialaxis=dict(title="Distance (m)", range=[0, max_distance * 1.1]),
-        angularaxis=dict(direction="clockwise", rotation=90)  # 0° = North
-    )
-    
-    # Update linear subplots
-    fig.update_xaxes(title_text="Orientation (degrees)", row=1, col=2)
-    fig.update_yaxes(title_text="Distance (m)", row=1, col=2)
-    
-    fig.update_xaxes(title_text="Orientation (degrees)", row=2, col=1)
-    fig.update_yaxes(title_text="Shadow Distance (m)", row=2, col=1)
-    
-    fig.update_xaxes(title_text="Floor Level", row=2, col=2)
-    fig.update_yaxes(title_text="Height (m)", row=2, col=2)
-    
-    # Save or display
+    fig.update_xaxes(title_text='Orientation (°)', row=1, col=2)
+    fig.update_yaxes(title_text='Shadow distance (m)', row=1, col=2)
+
     if output_path:
         if output_path.endswith('.html'):
             fig.write_html(output_path)
-            print(f"Interactive shadow analysis saved to {output_path}")
         else:
-            fig.write_image(output_path, width=1200, height=800)
-            print(f"Shadow analysis saved to {output_path}")
-    else:
-        fig.show()
+            try:
+                fig.write_image(output_path)
+            except Exception as e:
+                print(f"Could not write {output_path} ({e}); falling back to HTML")
+                fig.write_html(output_path.rsplit('.', 1)[0] + '.html')
+        print(f"Shadow analysis saved to {output_path}")
         return fig
+    fig.show()
+    return fig
+
+
+def _floor_colors(n):
+    """Return n distinct colors interpolated through a viridis-like ramp."""
+    try:
+        import matplotlib.cm as cm
+        import matplotlib.colors as mcolors
+        cmap = cm.get_cmap('viridis')
+        if n <= 1:
+            return [mcolors.to_hex(cmap(0.5))]
+        return [mcolors.to_hex(cmap(i / max(1, n - 1))) for i in range(n)]
+    except Exception:
+        # Reasonable fallback gradient if matplotlib not available
+        base = ['#440154', '#3b528b', '#21918c', '#5ec962', '#fde725']
+        if n <= len(base):
+            return base[:n]
+        return [base[i * (len(base) - 1) // max(1, n - 1)] for i in range(n)]
+
+
+def _draw_polygon_cartesian(ax, geom, cx, cy, *, facecolor, edgecolor,
+                             alpha, linewidth=0.5, hatch=None):
+    """Render a (Multi)Polygon onto a cartesian axis, recentred on (cx, cy).
+    Uses PathPatch so holes render correctly. No-op for empty geometry.
+    """
+    if geom is None or (hasattr(geom, 'is_empty') and geom.is_empty):
+        return
+    from matplotlib.patches import PathPatch
+    from matplotlib.path import Path
+
+    def _poly_to_path(p):
+        ex = [(x - cx, y - cy) for x, y in p.exterior.coords]
+        ints = [[(x - cx, y - cy) for x, y in r.coords] for r in p.interiors]
+        verts = list(ex)
+        codes = [Path.MOVETO] + [Path.LINETO] * (len(ex) - 2) + [Path.CLOSEPOLY]
+        for ring in ints:
+            verts.extend(ring)
+            codes.extend([Path.MOVETO] + [Path.LINETO] * (len(ring) - 2) + [Path.CLOSEPOLY])
+        return Path(verts, codes)
+
+    polys = geom.geoms if hasattr(geom, "geoms") else [geom]
+    for p in polys:
+        if not hasattr(p, "exterior") or len(p.exterior.coords) < 3:
+            continue
+        path = _poly_to_path(p)
+        patch = PathPatch(path, facecolor=facecolor, edgecolor=edgecolor,
+                          linewidth=linewidth, alpha=alpha, hatch=hatch)
+        ax.add_patch(patch)
+
+
+def _draw_polygon_polar(ax, geom, centroid_xy, *, facecolor, edgecolor,
+                         alpha, linewidth=0.5, hatch=None):
+    """Render a (Multi)Polygon onto a polar axis. Each vertex (x, y) is
+    converted to (theta, r) relative to `centroid_xy`. theta uses the
+    set_theta_zero_location('N') + set_theta_direction(-1) convention
+    already on the axis (0 = north, increasing east) → theta = atan2(dx, dy).
+    """
+    if geom is None or (hasattr(geom, 'is_empty') and geom.is_empty):
+        return
+    from matplotlib.patches import PathPatch
+    from matplotlib.path import Path
+
+    cx, cy = centroid_xy
+
+    def _poly_to_path(p):
+        def _ring_to_polar(coords):
+            pts = []
+            for x, y in coords:
+                dx = x - cx
+                dy = y - cy
+                pts.append((math.atan2(dx, dy), math.hypot(dx, dy)))
+            return pts
+
+        ex = _ring_to_polar(p.exterior.coords)
+        verts = list(ex)
+        codes = [Path.MOVETO] + [Path.LINETO] * (len(ex) - 2) + [Path.CLOSEPOLY]
+        for r in p.interiors:
+            ring = _ring_to_polar(r.coords)
+            verts.extend(ring)
+            codes.extend([Path.MOVETO] + [Path.LINETO] * (len(ring) - 2) + [Path.CLOSEPOLY])
+        return Path(verts, codes)
+
+    polys = geom.geoms if hasattr(geom, "geoms") else [geom]
+    for p in polys:
+        if not hasattr(p, "exterior") or len(p.exterior.coords) < 3:
+            continue
+        path = _poly_to_path(p)
+        patch = PathPatch(path, facecolor=facecolor, edgecolor=edgecolor,
+                          linewidth=linewidth, alpha=alpha, hatch=hatch)
+        ax.add_patch(patch)
+
+
+def _render_dem_panel(ax, terrain_grid, building_footprint_general, centroid_xy):
+    """Render the DEM contour map (bilinear-upsampled 5 m grid) on `ax`.
+    The general building footprint is overlaid (recentred on the centroid).
+    Returns True if anything was drawn.
+    """
+    import matplotlib.pyplot as plt
+    if not (terrain_grid and terrain_grid.get('elev')):
+        return False
+    try:
+        cell = float(terrain_grid['cell_size'])
+        nx = int(terrain_grid['nx']); ny = int(terrain_grid['ny'])
+        elev = np.array(terrain_grid['elev'], dtype=float)
+        cx_off = (nx - 1) * cell / 2.0
+        cy_off = (ny - 1) * cell / 2.0
+        gx = np.arange(nx) * cell - cx_off
+        gy = np.arange(ny) * cell - cy_off
+
+        grid_x_fine, grid_y_fine, elev_fine = gx, gy, elev
+        try:
+            from scipy.interpolate import RegularGridInterpolator
+            from scipy.ndimage import gaussian_filter
+            up = 5
+            grid_x_fine = np.linspace(gx[0], gx[-1], (nx - 1) * up + 1)
+            grid_y_fine = np.linspace(gy[0], gy[-1], (ny - 1) * up + 1)
+            interp = RegularGridInterpolator(
+                (gy, gx), elev, method='linear', bounds_error=False,
+                fill_value=np.nan,
+            )
+            FY, FX = np.meshgrid(grid_y_fine, grid_x_fine, indexing='ij')
+            elev_fine = interp((FY, FX))
+            elev_fine = gaussian_filter(elev_fine, sigma=up * 0.6)
+        except ImportError:
+            pass
+
+        cf = ax.contourf(grid_x_fine, grid_y_fine, elev_fine,
+                         levels=12, cmap='terrain', alpha=0.85)
+        ax.contour(grid_x_fine, grid_y_fine, elev_fine, levels=12,
+                   colors='saddlebrown', linewidths=0.5, alpha=0.7)
+        plt.colorbar(cf, ax=ax, fraction=0.04, pad=0.02, label='Elev (m)')
+
+        # General building footprint (recentred).
+        _draw_polygon_cartesian(
+            ax, building_footprint_general,
+            centroid_xy[0], centroid_xy[1],
+            facecolor='none', edgecolor='black', alpha=1.0, linewidth=1.4,
+        )
+
+        ax.set_xlim(gx[0], gx[-1])
+        ax.set_ylim(gy[0], gy[-1])
+        ax.set_aspect('equal')
+        ax.set_xlabel('East offset (m)')
+        ax.set_ylabel('North offset (m)')
+        ax.set_title(
+            f'DEM contour map ({cell:.0f} m grid, ±{nx * cell / 2:.0f} m, bilinear interp)'
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _build_polar_shadow_page(shadow_data, building_reference, floor_height):
+    """One figure: per-floor polar plots with blocked-horizon shading
+    (driven by the distance-per-orientation legacy schema) + DEM panel.
+    """
+    import math
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
+
+    orientations = shadow_data['orientations']
+    orient_keys = [str(int(o)) for o in orientations]
+    contour = shadow_data.get('contour_distances') or [0.0] * len(orientations)
+    sh = shadow_data.get('shadows', {})
+    max_floors = int(shadow_data.get('max_neighbor_floors', 1) or 1)
+    bldg_floors = int(shadow_data.get('building_n_floors', max_floors) or max_floors)
+    footprint_by_floor = shadow_data.get('footprint_by_floor') or {}
+    general_footprint = shadow_data.get('building_footprint')
+
+    n_floors_plot = max(1, max_floors)
+    theta_rad = np.radians(orientations)
+    theta_closed = np.append(theta_rad, theta_rad[0])
+
+    # Common outer radius for comparability.
+    finite_radii = []
+    for vals in sh.values():
+        for v in vals[:n_floors_plot]:
+            if isinstance(v, (int, float)) and np.isfinite(v):
+                finite_radii.append(float(v))
+    max_contour = max((float(c) for c in contour if np.isfinite(c)), default=10.0)
+    outer_r = max(max_contour * 1.5, max(finite_radii, default=20.0) + max_contour)
+    outer_r = float(min(150.0, max(outer_r, 30.0)))
+
+    # Centroid used by polar-coord conversion for per-floor footprints.
+    cx, cy = (general_footprint.centroid.x, general_footprint.centroid.y) \
+        if general_footprint is not None else (0.0, 0.0)
+
+    n_cols = 4
+    n_rows_polars = math.ceil(n_floors_plot / n_cols)
+    fig = plt.figure(figsize=(4.0 * n_cols, 3.6 * n_rows_polars + 6.5))
+    gs = GridSpec(n_rows_polars + 1, n_cols,
+                  height_ratios=[1.0] * n_rows_polars + [1.6],
+                  hspace=0.5, wspace=0.45)
+
+    for f in range(n_floors_plot):
+        r_idx, c_idx = divmod(f, n_cols)
+        ax = fig.add_subplot(gs[r_idx, c_idx], projection='polar')
+        ax.set_theta_zero_location('N')
+        ax.set_theta_direction(-1)
+        ax.set_ylim(0, outer_r)
+
+        # Per-orientation blocker radius from centroid.
+        blocker_r = []
+        for o_idx, key in enumerate(orient_keys):
+            vals = sh.get(key, [])
+            if f < len(vals) and isinstance(vals[f], (int, float)) and np.isfinite(vals[f]):
+                blocker_r.append(float(contour[o_idx]) + float(vals[f]))
+            else:
+                blocker_r.append(outer_r)
+        blocker_arr = np.array(blocker_r + [blocker_r[0]], dtype=float)
+        inner = np.minimum(blocker_arr, outer_r)
+        ax.fill_between(theta_closed, inner, outer_r,
+                        color='#202020', alpha=0.55, linewidth=0)
+
+        # Per-floor building footprint (disappears if this floor doesn't exist).
+        floor_geom = footprint_by_floor.get(f)
+        is_neighbor_only = f >= bldg_floors
+        if floor_geom is not None:
+            if is_neighbor_only:
+                _draw_polygon_polar(ax, floor_geom, (cx, cy),
+                                    facecolor='none', edgecolor='black',
+                                    alpha=0.9, linewidth=1.0, hatch='//')
+            else:
+                _draw_polygon_polar(ax, floor_geom, (cx, cy),
+                                    facecolor='#bbbbbb', edgecolor='black',
+                                    alpha=0.7, linewidth=1.0)
+
+        suffix = ' (nbr-only)' if is_neighbor_only else ''
+        ax.set_title(f'Floor {f}{suffix}', fontsize=10, pad=8)
+        ax.tick_params(labelsize=7)
+        rticks = [outer_r * q for q in (0.25, 0.5, 0.75, 1.0)]
+        ax.set_rticks(rticks)
+        ax.set_yticklabels([f'{int(t)}' for t in rticks], fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    for f in range(n_floors_plot, n_rows_polars * n_cols):
+        r_idx, c_idx = divmod(f, n_cols)
+        ax_blank = fig.add_subplot(gs[r_idx, c_idx])
+        ax_blank.set_visible(False)
+
+    ax_dem = fig.add_subplot(gs[-1, :])
+    if not _render_dem_panel(ax_dem, shadow_data.get('terrain_grid'),
+                             general_footprint, (cx, cy)):
+        ax_dem.set_visible(False)
+
+    fig.suptitle(
+        f'Per-floor shadow horizon (polar / by orientation) — {building_reference}'
+        f'  (building floors: {bldg_floors}, max floor seen: {max_floors})',
+        fontsize=12,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    return fig
+
+
+def _build_multipoly_shadow_page(shadow_data, building_reference, floor_height):
+    """One figure: per-floor cartesian plots of the shadow multipolygon
+    (terrain shadow + nearby building shadow) + DEM panel.
+    """
+    import math
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
+    from matplotlib.patches import Circle
+
+    max_floors = int(shadow_data.get('max_neighbor_floors', 1) or 1)
+    bldg_floors = int(shadow_data.get('building_n_floors', max_floors) or max_floors)
+    shadows_geom = shadow_data.get('shadows_geom') or {}
+    footprint_by_floor = shadow_data.get('footprint_by_floor') or {}
+    general_footprint = shadow_data.get('building_footprint')
+
+    floor_keys_sorted = sorted(shadows_geom.keys()) if shadows_geom else list(range(max_floors))
+    n_floors_plot = max(1, len(floor_keys_sorted))
+
+    cx, cy = (general_footprint.centroid.x, general_footprint.centroid.y) \
+        if general_footprint is not None else (0.0, 0.0)
+    extent_r = 150.0
+
+    n_cols = 4
+    n_rows_polars = math.ceil(n_floors_plot / n_cols)
+    fig = plt.figure(figsize=(4.0 * n_cols, 3.6 * n_rows_polars + 6.5))
+    gs = GridSpec(n_rows_polars + 1, n_cols,
+                  height_ratios=[1.0] * n_rows_polars + [1.6],
+                  hspace=0.4, wspace=0.35)
+
+    for i, f in enumerate(floor_keys_sorted):
+        r_idx, c_idx = divmod(i, n_cols)
+        ax = fig.add_subplot(gs[r_idx, c_idx])
+        ax.set_xlim(-extent_r, extent_r)
+        ax.set_ylim(-extent_r, extent_r)
+        ax.set_aspect('equal')
+        ax.add_patch(Circle((0, 0), extent_r, fill=False,
+                            edgecolor='#cccccc', linewidth=0.8, linestyle=':'))
+
+        _draw_polygon_cartesian(ax, shadows_geom.get(f), cx, cy,
+                                facecolor='#1a1a1a', edgecolor='#000000',
+                                alpha=0.55, linewidth=0.3)
+
+        floor_geom = footprint_by_floor.get(f)
+        is_neighbor_only = f >= bldg_floors
+        if floor_geom is not None:
+            if is_neighbor_only:
+                _draw_polygon_cartesian(ax, floor_geom, cx, cy,
+                                        facecolor='none', edgecolor='black',
+                                        alpha=0.9, linewidth=1.0, hatch='//')
+            else:
+                _draw_polygon_cartesian(ax, floor_geom, cx, cy,
+                                        facecolor='#bbbbbb', edgecolor='black',
+                                        alpha=0.8, linewidth=1.0)
+
+        suffix = ' (nbr-only)' if is_neighbor_only else ''
+        ax.set_title(f'Floor {f}{suffix}', fontsize=10, pad=6)
+        ax.tick_params(labelsize=7)
+        ax.grid(True, alpha=0.2, linestyle=':')
+
+    for i in range(n_floors_plot, n_rows_polars * n_cols):
+        r_idx, c_idx = divmod(i, n_cols)
+        ax_blank = fig.add_subplot(gs[r_idx, c_idx])
+        ax_blank.set_visible(False)
+
+    ax_dem = fig.add_subplot(gs[-1, :])
+    if not _render_dem_panel(ax_dem, shadow_data.get('terrain_grid'),
+                             general_footprint, (cx, cy)):
+        ax_dem.set_visible(False)
+
+    fig.suptitle(
+        f'Per-floor blocked-region multipolygon — {building_reference}'
+        f'  (building floors: {bldg_floors}, max floor seen: {max_floors})',
+        fontsize=12,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    return fig
 
 
 def _create_static_shadow_plot(building_row, building_reference, output_path,
-                              include_elevation, floor_height):
-    """Create static shadow visualization using matplotlib."""
+                               include_elevation, floor_height):
+    """Static per-floor shadow + DEM visualization using matplotlib.
+
+    Emits TWO pages:
+        Page 1 — polar plots driven by `br__shadows_at_distance` /
+                 `br__building_contour_at_distance` (legacy per-orientation
+                 schema), with the blocked horizon shaded.
+        Page 2 — cartesian plots driven by `br__shadows` (per-floor
+                 blocked-region multipolygon).
+
+    Both pages include a DEM contour panel at the bottom and overlay the
+    per-floor building footprint (which disappears at floors above the
+    building's own roof).
+
+    Output handling:
+        - `.pdf` → both pages in one PDF.
+        - `.png`/`.jpg`/`.svg`/etc. → two files written next to the
+          requested path with `_polar` and `_multipoly` suffixes.
+    """
     try:
+        import os
         import matplotlib.pyplot as plt
         from matplotlib.backends.backend_pdf import PdfPages
-        import numpy as np
     except ImportError:
-        print("Matplotlib not available. Please install matplotlib.")
+        print("matplotlib not available")
         return None
-    
-    # Extract shadow data
+
     shadow_data = _extract_shadow_data(building_row)
     if not shadow_data:
         print(f"No shadow data found for building {building_reference}")
         return None
-    
-    # Create figure with subplots
-    fig = plt.figure(figsize=(16, 12))
-    
-    # 1. Polar plot
-    ax1 = plt.subplot(2, 2, 1, projection='polar')
-    orientations_rad = [np.radians(float(o)) for o in shadow_data['orientations']]
-    orientations_deg = [float(o) for o in shadow_data['orientations']]
-    
-    # Building contour (centroid to building edge)
-    ax1.fill(orientations_rad, shadow_data['contour_distances'], 'blue', alpha=0.2, label='Building Footprint')
-    ax1.plot(orientations_rad, shadow_data['contour_distances'], 'b-', linewidth=2, label='Building Edge')
-    
-    # Total distance to neighbors
-    if 'total_distances_to_neighbors' in shadow_data:
-        ax1.plot(orientations_rad, shadow_data['total_distances_to_neighbors'], 'r-o', 
-                linewidth=2, markersize=4, label='Distance to Neighbors')
-    
-    # Shadow distances only
-    ax1.plot(orientations_rad, shadow_data['shadow_distances'], color='orange', linestyle=':', 
-            linewidth=2, marker='x', markersize=4, label='Shadow Distance Only')
-    
-    ax1.set_theta_direction(-1)  # Clockwise
-    ax1.set_theta_zero_location('N')
-    ax1.set_title('Building Shadow Analysis\n0°=N, 90°=E, 180°=S, 270°=W')
-    ax1.legend(bbox_to_anchor=(1.2, 1.0))
-    ax1.grid(True)
-    
-    # 2. Linear comparison
-    ax2 = plt.subplot(2, 2, 2)
-    
-    ax2.plot(orientations_deg, shadow_data['contour_distances'], 'b-', linewidth=2,
-             label='Building Edge (centroid to edge)')
-    ax2.plot(orientations_deg, shadow_data['shadow_distances'], color='orange', linestyle=':', 
-             linewidth=2, marker='x', markersize=4, label='Shadow Distance (edge to neighbor)')
-    
-    if 'total_distances_to_neighbors' in shadow_data:
-        ax2.plot(orientations_deg, shadow_data['total_distances_to_neighbors'], 'r-o', linewidth=2,
-                 markersize=4, label='Total Distance (centroid to neighbor)')
-    
-    ax2.set_xlabel('Orientation (degrees)')
-    ax2.set_ylabel('Distance (m)')
-    ax2.set_xlim(0, 360)
-    ax2.set_xticks([0, 90, 180, 270, 360])
-    ax2.set_xticklabels(['N', 'E', 'S', 'W', 'N'])
-    ax2.set_title('Distance Analysis by Orientation')
-    ax2.legend()
-    ax2.grid(True)
-    
-    # 3. Multi-floor comparison (showing neighbor collision at different heights)
-    ax3 = plt.subplot(2, 2, 3)
-    if 'multi_floor_data' in shadow_data:
-        # Reorganize multi-floor data by floor instead of orientation
-        floors_data = {}
-        max_floors = shadow_data.get('max_neighbor_floors', 1)
-        
-        for orientation_key, floor_shadows in shadow_data['multi_floor_data'].items():
-            if isinstance(floor_shadows, list):
-                for floor_idx, shadow_dist in enumerate(floor_shadows):
-                    # Calculate actual height for this floor
-                    actual_height = (floor_idx + 0.5) * floor_height if floor_idx == 0 else floor_idx + (floor_height / 2)
-                    
-                    if floor_idx not in floors_data:
-                        floors_data[floor_idx] = {
-                            'orientations': [], 
-                            'shadows': [], 
-                            'height': actual_height,
-                            'valid_shadows': []
-                        }
-                    floors_data[floor_idx]['orientations'].append(float(orientation_key))
-                    
-                    # Handle infinite values
-                    import math
-                    if math.isinf(shadow_dist) or shadow_dist > 10000:
-                        floors_data[floor_idx]['shadows'].append(np.nan)  # Use NaN for matplotlib
-                        floors_data[floor_idx]['valid_shadows'].append(False)
-                    else:
-                        floors_data[floor_idx]['shadows'].append(shadow_dist)
-                        floors_data[floor_idx]['valid_shadows'].append(True)
-        
-        # Sort orientations for each floor and plot (limit to reasonable number)
-        max_display_floors = min(8, max_floors)
-        
-        for floor_idx in range(max_display_floors):
-            if floor_idx in floors_data:
-                floor_data = floors_data[floor_idx]
-                
-                # Sort by orientation
-                sorted_pairs = sorted(zip(floor_data['orientations'], floor_data['shadows']))
-                sorted_orientations, sorted_shadows = zip(*sorted_pairs)
-                
-                # Only plot if there are valid (non-NaN) values
-                valid_shadows = [s for s in sorted_shadows if not (math.isnan(s) if isinstance(s, float) else False)]
-                if valid_shadows:
-                    ax3.plot(sorted_orientations, sorted_shadows, 
-                            linewidth=2, label=f'Height {floor_data["height"]:.1f}m', 
-                            marker='o', markersize=3)
-                            
-    ax3.set_xlabel('Orientation (degrees)')
-    ax3.set_ylabel('Distance to Neighbor (m)')
-    ax3.set_xlim(0, 360)
-    ax3.set_xticks([0, 90, 180, 270, 360])
-    ax3.set_xticklabels(['N', 'E', 'S', 'W', 'N'])
-    ax3.set_title('Shadow Distances at Different Heights')
-    ax3.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    ax3.grid(True)
-    
-    # 4. Elevation profile
-    ax4 = plt.subplot(2, 2, 4)
-    if include_elevation and 'elevation' in building_row.index:
-        elevation = building_row['elevation']
-        floors = list(range(5))
-        heights = [elevation + (i * floor_height) for i in floors]
-        
-        ax4.plot(floors, heights, 'g-o', linewidth=3, markersize=8, label='Building Height')
-        ax4.axhline(y=elevation, color='brown', linestyle='--', 
-                   label=f'Ground Elevation ({elevation:.1f}m)')
-        
-        ax4.set_xlabel('Floor Level')
-        ax4.set_ylabel('Height (m)')
-        ax4.set_title('Building Height Profile')
-        ax4.legend()
-        ax4.grid(True)
-    
-    plt.suptitle(f'Shadow Analysis for Building {building_reference}', fontsize=16)
-    plt.tight_layout()
-    
-    # Save or display
+
+    fig_polar = _build_polar_shadow_page(shadow_data, building_reference, floor_height)
+    fig_multi = _build_multipoly_shadow_page(shadow_data, building_reference, floor_height)
+
     if output_path:
-        if output_path.endswith('.pdf'):
+        if output_path.lower().endswith('.pdf'):
             with PdfPages(output_path) as pdf:
-                pdf.savefig(fig, bbox_inches='tight')
+                pdf.savefig(fig_polar, bbox_inches='tight')
+                pdf.savefig(fig_multi, bbox_inches='tight')
+            print(f"Shadow analysis saved to {output_path} (2 pages)")
         else:
-            plt.savefig(output_path, bbox_inches='tight', dpi=300)
-        print(f"Shadow analysis saved to {output_path}")
-        plt.close()
+            base, ext = os.path.splitext(output_path)
+            path_polar = f"{base}_polar{ext}"
+            path_multi = f"{base}_multipoly{ext}"
+            fig_polar.savefig(path_polar, bbox_inches='tight', dpi=300)
+            fig_multi.savefig(path_multi, bbox_inches='tight', dpi=300)
+            print(f"Shadow analysis saved to {path_polar} and {path_multi}")
+        plt.close(fig_polar); plt.close(fig_multi)
     else:
         plt.show()
-        return fig
+    return [fig_polar, fig_multi]
 
 
 def _detect_floor_height_from_data(building_row):
+    """Best-effort floor height (m). The previous heuristic read per-floor
+    vertical-distance spacing from `br__vertical_distances_at_collision`,
+    which no longer exists in the schema. Fall back to a sensible default;
+    callers can override via the `floor_height` argument of the plot.
     """
-    Automatically detect floor height from building shadow data.
-    
-    The floor height can be inferred from:
-    1. Vertical distance data between floors
-    2. Multi-floor shadow pattern analysis
-    3. Default to 3.0m if detection fails
-    
-    Parameters:
-    -----------
-    building_row : pandas.Series
-        Building data row containing shadow analysis results
-        
-    Returns:
-    --------
-    float
-        Detected floor height in meters
-    """
-    detected_height = 3.0  # Default fallback
-    
-    # Method 1: Try to extract from vertical distance data
-    if 'br__vertical_distances_at_collision' in building_row.index:
-        vertical_data = building_row['br__vertical_distances_at_collision']
-        if isinstance(vertical_data, dict):
-            # Look for consistent vertical spacing between floors
-            for orientation_key, distances in vertical_data.items():
-                if isinstance(distances, list) and len(distances) >= 3:
-                    # Calculate differences between consecutive floors
-                    valid_distances = [d for d in distances if not (isinstance(d, float) and (d == float('inf') or pd.isna(d)))]
-                    if len(valid_distances) >= 3:
-                        height_diffs = [valid_distances[i+1] - valid_distances[i] for i in range(len(valid_distances)-1)]
-                        # Check if differences are consistent (indicating regular floor height)
-                        if height_diffs and max(height_diffs) - min(height_diffs) < 0.5:  # Within 0.5m tolerance
-                            detected_height = sum(height_diffs) / len(height_diffs)
-                            break
-    
-    # Method 2: Try to infer from shadow data pattern (if Method 1 fails)
-    if detected_height == 3.0 and 'br__shadows_at_distance' in building_row.index:
-        shadows = building_row['br__shadows_at_distance']
-        if isinstance(shadows, dict):
-            for orientation_key, shadow_list in shadows.items():
-                if isinstance(shadow_list, list) and len(shadow_list) >= 3:
-                    # Look for patterns in shadow growth that suggest floor height
-                    # Ground floor (index 0) = floor_height/2
-                    # Floor 1 (index 1) = 1 + floor_height/2  
-                    # Floor 2 (index 2) = 2 + floor_height/2
-                    # This means: floor1_height - floor0_height ≈ 1 + floor_height/2 - floor_height/2 = 1
-                    # And: floor2_height - floor1_height ≈ 1
-                    # But this is complex with shadows, so we use a heuristic
-                    
-                    # If we have exactly the right pattern, floor height ≈ 3.0 is reasonable
-                    if len(shadow_list) == 12:  # Common pattern from your example
-                        detected_height = 3.0
-                        break
-    
-    # Ensure reasonable bounds (1-6 meters typical for residential/commercial)
-    detected_height = max(1.0, min(6.0, detected_height))
-    
-    return detected_height
+    return 3.0
 
 
 def _extract_shadow_data(building_row):
-    """
-    Extract and parse shadow data from building row.
-    
-    Data interpretation:
-    - br__building_contour_at_distance: Distance from building centroid to outer building geometry
-    - br__shadows_at_distance: Distance from outer building geometry to closest neighboring building
-    - Each floor in shadows_at_distance represents potential collision with neighbors at that height
-    - Floor heights: floor 0 = floor_height/2, floor 1 = 1 + floor_height/2, etc.
-    - Orientations: 0-360 degrees (0=North, 90=East, 180=South, 270=West)
+    """Extract shadow / terrain data from a building_row in the current schema.
+    Returns None if no usable shadow data is present.
+
+    Output dict keys (all optional except `orientations`):
+
+        orientations              [float]                — sorted 0..359 in degrees
+        contour_distances         [float]                — centroid → building edge per orientation
+        shadows                   dict orientation→list  — combined per-floor blocker distance
+                                                           (building roof OR terrain rise above eye level)
+        max_neighbor_floors       int                    — longest shadows list across orientations
+        building_n_floors         int                    — analyzed building's own floor count
+        terrain_grid              dict — 5 m DEM grid for contour rendering
+                                       {x_min, y_min, cell_size, nx, ny, elev[ny][nx]}
+        elevation                 float                  — building's ground elevation
     """
     shadow_data = {}
-    
-    # Try to extract shadow distances (br__shadows_at_distance)
-    if 'br__shadows_at_distance' in building_row.index:
-        shadows = building_row['br__shadows_at_distance']
-        if isinstance(shadows, dict):
-            # Extract orientations and corresponding shadow distances (0-360 degrees)
-            orientations = sorted([float(k) for k in shadows.keys() if k.replace('.','').isdigit()])
-            
-            # For each orientation, get the shadow distance (handle list format for multiple floors)
-            shadow_distances = []
-            multi_floor_data = {}
-            max_floors = 0
-            
-            for orientation in orientations:
-                orientation_key = str(int(orientation))
-                if orientation_key in shadows:
-                    shadow_values = shadows[orientation_key]
-                    if isinstance(shadow_values, list) and len(shadow_values) > 0:
-                        # Take the ground floor's shadow distance for main plot (floor 0)
-                        shadow_distances.append(shadow_values[0])
-                        # Store all floor data - this represents shadows to neighbors at different heights
-                        multi_floor_data[orientation_key] = shadow_values
-                        max_floors = max(max_floors, len(shadow_values))
-                    elif isinstance(shadow_values, (int, float)):
-                        # Single value
-                        shadow_distances.append(shadow_values)
-                        multi_floor_data[orientation_key] = [shadow_values]
-                    else:
-                        shadow_distances.append(0)
-                        multi_floor_data[orientation_key] = [0]
-                else:
-                    shadow_distances.append(0)
-                    multi_floor_data[orientation_key] = [0]
-            
-            shadow_data['orientations'] = orientations
-            shadow_data['shadow_distances'] = shadow_distances
-            shadow_data['multi_floor_data'] = multi_floor_data
-            shadow_data['max_neighbor_floors'] = max_floors
-    
-    # Try to extract building contour distances (br__building_contour_at_distance)
-    if 'br__building_contour_at_distance' in building_row.index:
-        contours = building_row['br__building_contour_at_distance']
-        if isinstance(contours, dict):
-            # Match orientations with contour data (0-360 degrees)
-            orientations = shadow_data.get('orientations', sorted([float(k) for k in contours.keys() if k.replace('.','').isdigit()]))
-            contour_distances = []
-            
-            for orientation in orientations:
-                orientation_key = str(int(orientation))
-                if orientation_key in contours:
-                    contour_value = contours[orientation_key]
-                    if isinstance(contour_value, (int, float)):
-                        contour_distances.append(contour_value)
-                    else:
-                        contour_distances.append(0)
-                else:
-                    contour_distances.append(0)
-            
-            shadow_data['orientations'] = orientations
-            shadow_data['contour_distances'] = contour_distances
-    
-    # Calculate total distances from centroid to neighboring buildings for ground floor
-    if 'orientations' in shadow_data and 'shadow_distances' in shadow_data and 'contour_distances' in shadow_data:
-        # Total distance = building contour + shadow distance
-        total_distances = [contour + shadow for contour, shadow in zip(shadow_data['contour_distances'], shadow_data['shadow_distances'])]
-        shadow_data['total_distances_to_neighbors'] = total_distances
-    
-    # Try to extract elevation data
+
+    def _to_dict(col):
+        v = building_row[col] if col in building_row.index else None
+        return v if isinstance(v, dict) else None
+
+    def _sorted_orientations(d):
+        return sorted(float(k) for k in d.keys() if str(k).replace('.', '').isdigit())
+
+    shadows = _to_dict('br__shadows_at_distance')
+    contours = _to_dict('br__building_contour_at_distance')
+
+    orientations = None
+    for d in (shadows, contours):
+        if d:
+            orientations = _sorted_orientations(d)
+            if orientations:
+                break
+    if not orientations:
+        return None
+    shadow_data['orientations'] = orientations
+
+    if contours:
+        shadow_data['contour_distances'] = [
+            float(contours.get(str(int(o)), 0.0) or 0.0) for o in orientations
+        ]
+
+    if shadows:
+        max_floors = 0
+        normalized = {}
+        for o in orientations:
+            key = str(int(o))
+            vals = shadows.get(key)
+            if isinstance(vals, list):
+                normalized[key] = list(vals)
+                max_floors = max(max_floors, len(vals))
+            elif isinstance(vals, (int, float)):
+                normalized[key] = [float(vals)]
+                max_floors = max(max_floors, 1)
+            else:
+                normalized[key] = []
+        shadow_data['shadows'] = normalized
+        shadow_data['max_neighbor_floors'] = max_floors
+
+    if 'br__terrain_grid' in building_row.index:
+        grid = building_row['br__terrain_grid']
+        if isinstance(grid, dict) and grid.get("elev"):
+            shadow_data['terrain_grid'] = grid
+
+    # New: per-floor blocked-region multipolygon.
+    # {floor_int: Polygon/MultiPolygon}
+    if 'br__shadows' in building_row.index:
+        sh_geom = building_row['br__shadows']
+        if isinstance(sh_geom, dict) and sh_geom:
+            shadow_data['shadows_geom'] = sh_geom
+
+    if 'br__building_footprint_geometry' in building_row.index:
+        bfg = building_row['br__building_footprint_geometry']
+        if bfg is not None and not (hasattr(bfg, 'is_empty') and bfg.is_empty):
+            shadow_data['building_footprint'] = bfg
+
+    # Per-floor footprint: list of [sbr_ref, floor_index, geometry] triplets,
+    # one row per (sbr, floor). Reduce to {floor: unioned_geometry} across
+    # SBRs of this building so the plot can show the actual outline at each
+    # floor (which shrinks as the building steps back at upper floors).
+    if 'br__building_footprint_by_floor' in building_row.index:
+        bfbf = building_row['br__building_footprint_by_floor']
+        if isinstance(bfbf, list) and bfbf:
+            per_floor = {}
+            for triplet in bfbf:
+                if not (isinstance(triplet, (list, tuple)) and len(triplet) >= 3):
+                    continue
+                _, fnum, geom = triplet[0], triplet[1], triplet[2]
+                if geom is None or (hasattr(geom, 'is_empty') and geom.is_empty):
+                    continue
+                try:
+                    fi = int(fnum)
+                except (TypeError, ValueError):
+                    continue
+                per_floor.setdefault(fi, []).append(geom)
+            if per_floor:
+                from shapely.ops import unary_union as _uu
+                shadow_data['footprint_by_floor'] = {
+                    fi: (_uu(geoms) if len(geoms) > 1 else geoms[0])
+                    for fi, geoms in per_floor.items()
+                }
+
     if 'elevation' in building_row.index:
-        shadow_data['elevation'] = building_row['elevation']
-        
-    # Try to extract floor count or height data
-    if 'br__number_of_floors' in building_row.index:
-        shadow_data['floors'] = building_row['br__number_of_floors']
-    elif 'numberOfFloors' in building_row.index:
-        shadow_data['floors'] = building_row['numberOfFloors']
-    
+        try:
+            shadow_data['elevation'] = float(building_row['elevation'])
+        except (TypeError, ValueError):
+            pass
+
+    for col in ('br__floors_above_ground', 'br__number_of_floors', 'numberOfFloors'):
+        if col in building_row.index:
+            try:
+                shadow_data['building_n_floors'] = int(building_row[col])
+                break
+            except (TypeError, ValueError):
+                pass
+
     return shadow_data if shadow_data else None
 
 

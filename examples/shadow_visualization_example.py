@@ -26,7 +26,7 @@ def main():
         'year_of_construction': '1995',
         'elevation': 45.2,
         'br__number_of_floors': 3,
-        'br__shadows_at_distance': {
+        'br__building_shadows_at_distance': {
             # Distance from building edge to closest neighboring building
             # 0° = North, 90° = East, 180° = South, 270° = West
             '0': [25.5, 52.3, 79.1],     # North - moderate shadows
@@ -109,7 +109,7 @@ def main():
     # Example 3: Analyze shadow patterns
     print("\n3. Analyzing shadow patterns...")
     
-    shadow_data = building_gdf.iloc[0]['br__shadows_at_distance']
+    shadow_data = building_gdf.iloc[0]['br__building_shadows_at_distance']
     
     # Find orientation with longest shadows (first floor)
     max_shadow_orientation = None
