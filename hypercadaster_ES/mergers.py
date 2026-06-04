@@ -553,7 +553,8 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
                            plot_zones_ratio=0.01, building_parts_inference=False,
                            building_parts_inference_using_CAT_files=False, open_data_layers=False,
                            open_data_layers_dir=None, CAT_files_dir=None,
-                           floor_height=3.0, ground_floor_height=5.0, num_workers=-1):
+                           floor_height=3.0, ground_floor_height=5.0, num_workers=-1,
+                           force_update=False, cleanup_shards=True):
 
     sys.stderr.write(f"\nJoining the buildings description for {len(cadaster_codes)} municipalities\n")
 
@@ -751,36 +752,19 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
             # 8️⃣ Elevation
             # ------------------------------------------------------------
             try:
-                # Ensure correct active geometry BEFORE anything
                 building_part_gdf_ = building_part_gdf_.set_geometry("building_part_geometry")
-
-                # Create centroids
-                building_part_gdf_["centroid_for_elevation"] = (
-                    building_part_gdf_["building_part_geometry"].centroid
-                )
-
-                # Store geometry column NAME (not object)
-                original_geom_col = building_part_gdf_.geometry.name
-
-                # Switch to centroid geometry
-                building_part_gdf_ = building_part_gdf_.set_geometry("centroid_for_elevation")
-
                 dem_files = glob.glob(f"{DEM_raster_dir}/*.tif")
-
                 if dem_files:
+                    # join_DEM_raster computes centroids per chunk; no need
+                    # to materialise a centroid_for_elevation column (which
+                    # is 50M shapely Points / ~10 GB on Barcelona-sized input).
                     building_part_gdf_ = join_DEM_raster(
                         building_part_gdf_,
-                        DEM_raster_dir
+                        DEM_raster_dir,
+                        geometry_column="building_part_geometry",
                     )
                 else:
                     building_part_gdf_["elevation"] = 0.0
-
-                # Restore original geometry
-                building_part_gdf_ = building_part_gdf_.set_geometry(original_geom_col)
-
-                # Cleanup
-                building_part_gdf_ = building_part_gdf_.drop(columns=["centroid_for_elevation"])
-
             except Exception:
                 building_part_gdf_['elevation'] = 0.0
 
@@ -791,123 +775,174 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
                 open_street_dir=open_street_dir, plots=building_parts_plots, plot_zones_ratio=plot_zones_ratio,
                 floor_height=floor_height, ground_floor_height=ground_floor_height,
                 DEM_raster_dir=DEM_raster_dir, nearby_buildings_buffer=nearby_buildings_buffer,
-                num_workers=num_workers)
+                num_workers=num_workers,
+                force_update=force_update, cleanup_shards=cleanup_shards)
 
-            # Unpack the results: (sbr_results, br_results)
-            sbr_results, br_results = building_part_gdf_
+            # process_building_parts now returns a ResultsHandle pointing
+            # to the central DuckDB.  We consume it via SQL so we never
+            # materialise the full sbr/br DataFrames in-process.
+            inference_handle = building_part_gdf_
 
-            # Check if results are valid
-            if br_results is not None and len(br_results) > 0:
-                # Join Building geodataframe with br_results
-                building_gdf_ = (building_gdf_[['gml_id', 'building_status', 'building_reference', 'building_use',
-                                              'building_geometry','year_of_construction', 'zone_reference', 'zone_type']].
-                                merge(br_results, left_on="building_reference",
-                                      right_on="building_reference", how="left"))
+            from hypercadaster_ES import _db as _db_mod
 
-                # Also merge SBR results directly (they already have sbr__ column prefixes)
-                if sbr_results is not None and len(sbr_results) > 0:
+            # Open a read-write connection to the central DB so we can
+            # create the merged `buildings` table.
+            central_con = _db_mod.open_db(results_dir)
+            code = cadaster_codes[0]  # single-municipality for inference
 
-                    sbr_cols = [col for col in sbr_results.columns if col.startswith("sbr__")]
+            # Quick check: does the handle have any rows?
+            has_data = inference_handle.br_count() > 0
 
-                    # ------------------------------------------------------------
-                    # 1️⃣ Count SBR per building
-                    # ------------------------------------------------------------
-                    sbr_counts = (
-                        sbr_results.groupby("building_reference")["single_building_reference"]
-                        .nunique()
-                        .rename("n_sbr")
-                        .reset_index()
+            if has_data:
+                # Register the slim building_gdf_ as a temp relation so we
+                # can LEFT JOIN it against br_results in DuckDB.
+                slim_cols = ['gml_id', 'building_status', 'building_reference',
+                             'building_use', 'building_geometry',
+                             'year_of_construction', 'zone_reference',
+                             'zone_type']
+                _slim = building_gdf_[slim_cols].copy(deep=False)
+
+                # Convert geometry column to WKB for DuckDB ingest
+                if 'building_geometry' in _slim.columns:
+                    _slim = pd.DataFrame(_slim)
+                    _slim['building_geometry'] = (
+                        building_gdf_['building_geometry'].to_wkb()
                     )
 
-                    sbr_results = sbr_results.merge(sbr_counts, on="building_reference", how="left")
+                central_con.register("_building_slim", _slim)
+                try:
+                    # --- BR merge: one SQL statement ---
+                    central_con.execute("""
+                        CREATE OR REPLACE TABLE _br_merged AS
+                        SELECT b."gml_id",
+                               b."building_status",
+                               b."building_reference",
+                               b."building_use",
+                               ST_GeomFromWKB(b."building_geometry") AS "building_geometry",
+                               b."year_of_construction",
+                               b."zone_reference",
+                               b."zone_type",
+                               r.* EXCLUDE ("building_reference", "cadaster_code",
+                                            "zone_reference")
+                        FROM _building_slim b
+                        LEFT JOIN "main"."br_results" r
+                                  ON r."building_reference" = b."building_reference"
+                         AND r."cadaster_code" = ?
+                    """, [code])
+                finally:
+                    central_con.unregister("_building_slim")
 
-                    # ------------------------------------------------------------
-                    # 2️⃣ MULTI SBR → dict
-                    # ------------------------------------------------------------
-                    multi_sbr = sbr_results[sbr_results["n_sbr"] > 1].copy()
+                # --- SBR aggregation: count + dict construction in SQL ---
+                sbr_cols_row = central_con.execute(r"""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_name = 'sbr_results'
+                      AND column_name LIKE 'sbr\__%'
+                    ORDER BY column_name
+                """).fetchall()
+                sbr_cols = [r[0] for r in sbr_cols_row]
 
-                    if not multi_sbr.empty:
-                        # Vectorised replacement for the previous
-                        # `groupby.apply(aggregate_sbr)` which did
-                        # per-row .iterrows() × per-column work — the
-                        # dominant tail cost on Barcelona-scale runs.
-                        #
-                        # Approach: sort once by building_reference, find
-                        # group boundaries via np.unique, then for each
-                        # sbr_col slice that column's numpy array per group
-                        # and build a `{sbr_id: val}` dict, dropping invalid
-                        # values. Same output schema as before
-                        # (one row per building_reference, each sbr_col is
-                        # a dict or None).
-                        _ms = multi_sbr.sort_values("building_reference", kind="stable")
-                        _br_vals = _ms["building_reference"].to_numpy()
-                        _sbr_ids = _ms["single_building_reference"].to_numpy()
-                        _unique_refs, _start = np.unique(_br_vals, return_index=True)
-                        # np.unique returns sorted order; _start indices are
-                        # ascending because _ms was sorted by the same key.
-                        _end = np.r_[_start[1:], len(_br_vals)]
+                if sbr_cols:
+                    # Count SBRs per building
+                    central_con.execute("""
+                        CREATE OR REPLACE TABLE _sbr_counts AS
+                        SELECT "building_reference",
+                               count(DISTINCT "single_building_reference") AS "n_sbr"
+                        FROM "main"."sbr_results"
+                        WHERE "cadaster_code" = ?
+                        GROUP BY "building_reference"
+                    """, [code])
 
-                        _is_valid = utils.is_valid_value
-                        _cols_out = {"building_reference": _unique_refs}
-                        for _col in sbr_cols:
-                            _col_arr = _ms[_col].to_numpy()
-                            _per_group = [None] * len(_unique_refs)
-                            for _gi, (_s, _e) in enumerate(zip(_start, _end)):
-                                _d = {
-                                    _sbr_ids[i]: _col_arr[i]
-                                    for i in range(_s, _e)
-                                    if _is_valid(_col_arr[i])
-                                }
-                                if _d:
-                                    _per_group[_gi] = _d
-                            _cols_out[_col] = _per_group
-                        sbr_multi = pd.DataFrame(_cols_out)
-                        del _ms, _br_vals, _sbr_ids, _cols_out
+                    # Split into multi-SBR and single-SBR buildings.
+                    # Multi-SBR: build {sbr_id: value} JSON objects per column
+                    # via GROUP BY + json_group_object.
+                    # Single-SBR: output NULL for all sbr columns.
 
-                    else:
-                        sbr_multi = pd.DataFrame(columns=["building_reference"] + sbr_cols)
+                    # Multi-SBR aggregation
+                    json_agg_parts = []
+                    for col in sbr_cols:
+                        json_agg_parts.append(f'''
+                            json_group_object(
+                                "single_building_reference", "{col}"
+                            ) AS "{col}"
+                        ''')
 
-                    # ------------------------------------------------------------
-                    # 3️⃣ SINGLE SBR → force None
-                    # ------------------------------------------------------------
-                    single_refs = sbr_results.loc[sbr_results["n_sbr"] == 1, "building_reference"].unique()
+                    central_con.execute(f"""
+                        CREATE OR REPLACE TABLE _sbr_multi AS
+                        SELECT "building_reference",
+                               {', '.join(json_agg_parts)}
+                        FROM "main"."sbr_results"
+                        WHERE "cadaster_code" = ?
+                          AND "building_reference" IN (
+                              SELECT "building_reference" FROM _sbr_counts WHERE "n_sbr" > 1
+                          )
+                        GROUP BY "building_reference"
+                    """, [code])
 
-                    if len(single_refs) > 0:
-                        sbr_single = pd.DataFrame({
-                            "building_reference": single_refs
-                        })
-
-                        for col in sbr_cols:
-                            sbr_single[col] = None
-                    else:
-                        sbr_single = pd.DataFrame(columns=["building_reference"] + sbr_cols)
-
-                    # ------------------------------------------------------------
-                    # 4️⃣ Combine
-                    # ------------------------------------------------------------
-                    sbr_final = pd.concat([sbr_multi, sbr_single], ignore_index=True)
-
-                    # ------------------------------------------------------------
-                    # 5️⃣ Merge into building_gdf_
-                    # ------------------------------------------------------------
-                    building_gdf_ = building_gdf_.merge(
-                        sbr_final,
-                        on="building_reference",
-                        how="left"
+                    # Single-SBR: NULL for all sbr columns
+                    single_null_cols = ', '.join(
+                        f'NULL AS "{col}"' for col in sbr_cols
                     )
+                    central_con.execute(f"""
+                        CREATE OR REPLACE TABLE _sbr_single AS
+                        SELECT "building_reference",
+                               {single_null_cols}
+                        FROM _sbr_counts
+                        WHERE "n_sbr" = 1
+                    """)
 
-                if "building_part_gdf" in locals():
-                    building_part_gdf = pd.concat([building_part_gdf, br_results], ignore_index=True)
-                else:
-                    building_part_gdf = br_results
+                    # Union multi + single
+                    all_cols = ', '.join(f'"{c}"' for c in sbr_cols)
+                    central_con.execute(f"""
+                        CREATE OR REPLACE TABLE _sbr_agg AS
+                        SELECT "building_reference", {all_cols} FROM _sbr_multi
+                        UNION ALL
+                        SELECT "building_reference", {all_cols} FROM _sbr_single
+                    """)
+
+                    # Merge SBR aggregation into br_merged
+                    set_clauses = ', '.join(
+                        f'"{c}" = s."{c}"' for c in sbr_cols
+                    )
+                    central_con.execute(f"""
+                        UPDATE _br_merged
+                        SET {set_clauses}
+                        FROM _sbr_agg s
+                        WHERE _br_merged."building_reference" = s."building_reference"
+                    """)
+
+                    # Also add n_sbr count
+                    central_con.execute("""
+                        UPDATE _br_merged
+                        SET "n_sbr" = c."n_sbr"
+                        FROM _sbr_counts c
+                        WHERE _br_merged."building_reference" = c."building_reference"
+                    """)
+
+                # Read the merged result back as a GeoDataFrame
+                building_gdf_ = _db_mod.read_gdf(
+                    central_con, "_br_merged", geom_col="building_geometry"
+                )
+
+                # Also keep br_results for building_part_gdf downstream
+                building_part_gdf = inference_handle.br_to_pandas()
             else:
                 sys.stderr.write("Warning: Building parts inference returned no results\n")
+                building_gdf_ = building_gdf_[['gml_id', 'building_status', 'building_reference', 'building_use',
+                                              'building_geometry', 'year_of_construction', 'zone_reference', 'zone_type']]
+
+            central_con.close()
 
         if buildings_CAT is not None:
             #['n_building_units', 'n_dwellings', 'n_floors_above_ground', 'building_area']
             if not building_parts_inference:
                 building_gdf_ = building_gdf_[['gml_id', 'building_status', 'building_reference', 'building_use',
                                              'building_geometry', 'year_of_construction', 'zone_reference', 'zone_type']]
+                # CAT yields the full br__* per-building aggregates (building_spaces_*,
+                # area_with_communals, economic_value, ...) without any geometric
+                # inference — fold them in so this path matches the inference path
+                # for all CAT-derived columns.
+                br_cat = building_inference.br_attributes_from_CAT(buildings_CAT)
+                building_gdf_ = building_gdf_.merge(br_cat, on="building_reference", how="left")
 
             use_types = buildings_CAT["building_space_inferred_use_type"].unique().to_list()
 
@@ -1042,7 +1077,8 @@ def join_adm_div_naming(gdf, cadaster_dir, cadaster_codes):
 def join_cadaster_data(cadaster_dir, census_tracts_dir, DEM_raster_dir, cadaster_codes, results_dir, open_street_dir,
                        building_parts_plots=False, building_parts_inference=False, plot_zones_ratio=0.01,
                        use_CAT_files=False, open_data_layers=False, open_data_layers_dir=None, CAT_files_dir = None,
-                       floor_height=3.0, ground_floor_height=5.0, num_workers=-1):
+                       floor_height=3.0, ground_floor_height=5.0, num_workers=-1,
+                       force_update=False, cleanup_shards=True):
 
     # Address
     gdf = get_cadaster_address(
@@ -1069,7 +1105,8 @@ def join_cadaster_data(cadaster_dir, census_tracts_dir, DEM_raster_dir, cadaster
                                  open_data_layers=open_data_layers, open_data_layers_dir=open_data_layers_dir,
                                  CAT_files_dir = CAT_files_dir,
                                  floor_height=floor_height, ground_floor_height=ground_floor_height,
-                                 num_workers=num_workers)
+                                 num_workers=num_workers,
+                                 force_update=force_update, cleanup_shards=cleanup_shards)
     # Administrative layers naming
     gdf = join_adm_div_naming(gdf=gdf, cadaster_dir=cadaster_dir, cadaster_codes=cadaster_codes)
 
@@ -1087,19 +1124,59 @@ def join_cadaster_data(cadaster_dir, census_tracts_dir, DEM_raster_dir, cadaster
     return gdf
 
 
-def join_DEM_raster(gdf, raster_dir):
+def join_DEM_raster(gdf, raster_dir, geometry_column=None, chunk_size=100_000):
+    """Sample DEM elevation at each row's geometry centroid.
 
-    sys.stderr.write(f"\nJoining the Digital Elevation Model information\n")
+    Chunked so peak RAM is O(chunk_size), not O(len(gdf)). Critically,
+    centroids are computed *per chunk* and never materialised as a
+    column: a 50M-row gdf would otherwise spawn 50M shapely Point
+    objects (~10 GB) just to be sampled and thrown away.
 
-    with rasterio.open(f"{raster_dir}/DEM.tif", 'r+') as rds:
-        ini_crs = gdf.crs
-        gdf = gdf.to_crs(epsg=4326)
-        gdf_ = gdf[~gdf.geometry.isna()]
-        gdf_.loc[:,"elevation"] = [x[0] for x in rds.sample(
-            [(x, y) for x, y in zip(gdf_.geometry.x, gdf_.geometry.y)])]
-        gdf = pd.concat([gdf_,gdf[gdf.geometry.isna()]], axis=0)
-        gdf = gdf.to_crs(ini_crs)
+    Caller does NOT need to add a centroid column or change the active
+    geometry; pass `geometry_column` if the column to centroid is not
+    the default `gdf.geometry`.
 
+    Returns the same gdf with an added `elevation` column. The gdf's
+    geometry column and CRS are untouched.
+    """
+    import numpy as np
+    import pyproj
+
+    sys.stderr.write("\nJoining the Digital Elevation Model information\n")
+
+    geom = gdf[geometry_column] if geometry_column is not None else gdf.geometry
+    # GeoSeries set on a non-active column inherits the gdf's CRS.
+    src_crs = getattr(geom, "crs", None) or gdf.crs
+
+    n = len(gdf)
+    elev = np.full(n, np.nan, dtype=np.float64)
+
+    transformer = pyproj.Transformer.from_crs(
+        src_crs, "EPSG:4326", always_xy=True,
+    )
+    with rasterio.open(f"{raster_dir}/DEM.tif", "r") as rds:
+        for start in range(0, n, chunk_size):
+            end = min(start + chunk_size, n)
+            chunk_geom = geom.iloc[start:end]
+            # Drop nulls within the chunk; positions are relative to the chunk.
+            chunk_valid_pos = np.flatnonzero(~chunk_geom.isna().to_numpy())
+            if chunk_valid_pos.size == 0:
+                continue
+            valid_geom = chunk_geom.iloc[chunk_valid_pos]
+            # Centroids are computed for the chunk only and discarded
+            # before the next iteration. shapely 2.x vectorises this.
+            centroids = valid_geom.centroid
+            xs = centroids.x.to_numpy()
+            ys = centroids.y.to_numpy()
+            del centroids, valid_geom, chunk_geom
+            lons, lats = transformer.transform(xs, ys)
+            del xs, ys
+            # rds.sample is a generator; iterate to avoid a list of N samples.
+            for j, sample in enumerate(rds.sample(zip(lons, lats))):
+                elev[start + chunk_valid_pos[j]] = sample[0]
+
+    gdf = gdf.copy(deep=False)
+    gdf["elevation"] = elev
     return gdf
 
 def join_by_census_tracts(gdf, census_tract_dir, columns=None, geometry_column = "census_geometry", year = 2022):

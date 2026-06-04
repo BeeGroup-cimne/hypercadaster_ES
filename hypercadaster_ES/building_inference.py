@@ -24,7 +24,6 @@ import os
 import sys
 import math
 import multiprocessing
-import pickle as pickle_module
 import re
 import warnings
 from datetime import date
@@ -69,21 +68,68 @@ NEARBY_ZONE_PREFIX = "_nb_"
 NEARBY_GRID_SIZE_M = 200
 
 
-def _read_compressed_pickle(path):
-    """Read a pickle whose compression we may not know.
+def _force_reset_code(results_dir, code, _db_mod):
+    """Drop all central-DB rows + cache shards belonging to `code`.
 
-    We migrated the municipality result pickles from gzip to zstd for speed,
-    but older runs left gzip files on disk. Detect from the magic bytes and
-    pick the matching pandas decoder so both keep working.
+    Used by `process_building_parts(force_update=True)`. Multi-municipality
+    safe: other codes' rows in the central DB are untouched.
     """
-    with open(path, "rb") as fh:
-        head = fh.read(4)
-    if head.startswith(b"\x1f\x8b"):
-        return pd.read_pickle(path, compression="gzip")
-    if head.startswith(b"\x28\xb5\x2f\xfd"):
-        return pd.read_pickle(path, compression="zstd")
-    # Plain pickle or anything else — let pandas infer.
-    return pd.read_pickle(path)
+    import glob as _glob_mod
+    dbp = _db_mod.db_path(results_dir)
+    cache_dir = f"{results_dir}/cache"
+
+    deleted_shards = 0
+    if os.path.isdir(cache_dir):
+        # Building references begin with the 5-digit cadaster code, and
+        # zone_reference = building_reference[0:5] + building_reference[7:14],
+        # so every real shard for this code has a filename starting with
+        # `{code}`. Pseudo-zones (NEARBY_ZONE_PREFIX) don't produce shards.
+        for sp in _glob_mod.glob(f"{cache_dir}/{code}*.duckdb"):
+            try:
+                os.remove(sp); deleted_shards += 1
+            except OSError:
+                pass
+
+    if os.path.exists(dbp):
+        con = _db_mod.open_db(results_dir)
+        try:
+            # Also collect any zones in zone_status that don't match the
+            # filename heuristic above, and remove their shard files too.
+            try:
+                extras = [r[0] for r in con.execute(
+                    "SELECT zone_reference FROM zone_status WHERE cadaster_code = ?",
+                    [code],
+                ).fetchall()]
+                for zr in extras:
+                    sp = f"{cache_dir}/{zr}.duckdb"
+                    if os.path.exists(sp):
+                        try:
+                            os.remove(sp); deleted_shards += 1
+                        except OSError:
+                            pass
+            except Exception:
+                pass
+            for tbl in ("sbr_results", "br_results",
+                        "aux_building_parts", "aux_footprints"):
+                try:
+                    con.execute(
+                        f'DELETE FROM "main"."{tbl}" WHERE cadaster_code = ?',
+                        [code],
+                    )
+                except Exception:
+                    pass
+            try:
+                con.execute(
+                    "DELETE FROM zone_status WHERE cadaster_code = ?", [code]
+                )
+            except Exception:
+                pass
+        finally:
+            con.close()
+    sys.stderr.write(
+        f"[force_update] cleared central DB rows and {deleted_shards} cache "
+        f"shards for cadaster_code={code}\n"
+    )
 
 
 def _safe_nanmean(values):
@@ -372,7 +418,8 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
                            open_street_dir=None, plots=False, plot_zones_ratio=0.01,
                            orientation_discrete_interval_in_degrees=5, floor_height=3.0,
                            ground_floor_height=5.0, DEM_raster_dir=None,
-                           num_workers=-1, nearby_buildings_buffer=80):#max(1, math.ceil(multiprocessing.cpu_count()/3))):
+                           num_workers=-1, nearby_buildings_buffer=80,
+                           force_update=False, cleanup_shards=True):
     """
     Main function to process building parts and perform comprehensive building analysis.
     
@@ -410,45 +457,32 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
         
     Returns:
     --------
-    tuple
-        (processed_gdf, analysis_results) containing processed building data
-        and comprehensive analysis results
+    ResultsHandle
+        Lightweight handle pointing to the central DuckDB with sbr_results
+        and br_results tables for the given cadaster_code. Use
+        ``handle.br_to_pandas()`` or ``handle.sbr_to_pandas()`` to
+        materialise, or pass the handle directly to the merger which
+        consumes it via SQL.
     """
 
-    # Try to reuse the municipality-level cache. A previous run may have been
-    # killed (OOM) mid-write, leaving truncated pickles whose existence check
-    # passes but whose pd.read_pickle raises EOFError. Attempt the load up
-    # front; on any read failure, fall through to the recompute branch (which
-    # will overwrite the broken files at the end).
-    sbr_path = f"{results_dir}/{code}_sbr_results.pkl"
-    br_path = f"{results_dir}/{code}_br_results.pkl"
+    from hypercadaster_ES import _db as _db_mod_early
 
-    def _municipality_cache_present():
-        for p in (sbr_path, br_path):
-            if not os.path.exists(p):
-                return False
-            try:
-                if os.path.getsize(p) == 0:
-                    return False
-            except OSError:
-                return False
-        return True
+    # `force_update=True`: wipe everything for THIS code so the run is a
+    # clean recompute. Other municipalities in the same central DB are
+    # untouched (all our tables are keyed by cadaster_code).
+    if force_update:
+        _force_reset_code(results_dir, code, _db_mod_early)
 
-    cache_loaded = False
-    if _municipality_cache_present():
-        try:
-            sbr_results = _read_compressed_pickle(sbr_path)
-            br_results = _read_compressed_pickle(br_path)
-            sbr_results = _strip_per_space_leak_columns(sbr_results)
-            br_results = _strip_per_space_leak_columns(br_results)
-            br_results = _dedup_br_building_spaces_lists(br_results)
-            cache_loaded = True
-        except (EOFError, pickle_module.UnpicklingError, OSError) as e:
-            sys.stderr.write(
-                f"Municipality cache for '{code}' unreadable ({e}); recomputing\n"
-            )
+    # The pipeline below always runs. Each stage short-circuits internally
+    # where it can: aux loads from DB if present, workers skip zones
+    # already in zone_status, Phase A is a no-op when zone_status is
+    # complete, Phase B reads from central. A fully-cached re-run only
+    # pays aux-load + zone-grouping + Phase B read. The old "if rows
+    # exist for this code, return them as-is" early-return is gone
+    # because it prevented multi-municipality runs from filling in
+    # newly-added zones.
 
-    if not cache_loaded:
+    if True:
 
         os.makedirs(f"{results_dir}/cache", exist_ok=True)
         if plots:
@@ -456,54 +490,111 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
                 results_dir = "results"
             os.makedirs(f"{results_dir}/plots", exist_ok=True)
 
-        if (not os.path.exists(f"{results_dir}/cache/{code}_aux1.pkl")):
-            # Neighbouring-municipality buildings (added for shadow-casting context)
-            # have no valid zone_reference in the analyzed municipality, so they
-            # all collapse into one giant chunk under "unknown"/"unassigned".
-            # That single chunk's buffered convex hull then sweeps across the
-            # entire metropolitan area and proximity detection becomes O(N²).
-            # Tag those rows with a deterministic 200 m spatial grid pseudo-zone
-            # so detect_close_buildings_parallel produces many small bounded chunks.
-            building_part_gdf_ = _spatially_bin_nearby_zones(
-                building_part_gdf_, grid_size_m=NEARBY_GRID_SIZE_M,
-                zone_prefix=NEARBY_ZONE_PREFIX,
-            )
+        # Aux frames are scratch state for one municipality at a time.
+        # Stored in the central DuckDB, keyed by cadaster_code so the same
+        # results_dir can serve multiple municipalities. Replaces the
+        # legacy {code}_aux{1,2}.pkl files.
+        from hypercadaster_ES import _db as _db_mod_aux
+        _aux_con = _db_mod_aux.open_db(results_dir)
+        try:
+            def _aux_present(tbl):
+                try:
+                    return _aux_con.execute(
+                        f'SELECT 1 FROM "main"."{tbl}" '
+                        f'WHERE cadaster_code = ? LIMIT 1', [code],
+                    ).fetchone() is not None
+                except Exception:
+                    return False
 
-            gdf_global = utils.detect_close_buildings_parallel(gdf_building_parts=building_part_gdf_,
-                                                         buffer_neighbours=nearby_buildings_buffer,
-                                                         neighbours_column_name="nearby_buildings",
-                                                         neighbours_id_column_name="building_reference",
-                                                         num_workers=num_workers,
-                                                         column_name_to_split="zone_reference")
-            parcels_gdf["zone_reference"] = (
-                parcels_gdf["building_reference"].str[0:5] + parcels_gdf["building_reference"].str[7:14])
-            gdf_parcels_global = utils.detect_close_parcels_parallel(gdf_parcels=parcels_gdf,
-                                                             buffer_neighbours=nearby_buildings_buffer*2,
-                                                             neighbours_column_name="nearby_parcels",
+            def _aux_write(tbl, frame):
+                df_w = frame.copy(deep=False)
+                if "cadaster_code" in df_w.columns:
+                    # Upstream (mergers.py) may already attach this column
+                    # to the gdf. Overwrite in place so the value is
+                    # authoritative and there's no duplicate column.
+                    df_w["cadaster_code"] = code
+                else:
+                    df_w.insert(0, "cadaster_code", code)
+                crs = getattr(frame, "crs", None)
+                try:
+                    _aux_con.execute(f'DESCRIBE "main"."{tbl}"').fetchall()
+                    _aux_con.execute(
+                        f'DELETE FROM "main"."{tbl}" WHERE cadaster_code = ?',
+                        [code],
+                    )
+                    try:
+                        _db_mod_aux.write_df_safe(_aux_con, tbl, df_w,
+                                                   if_exists="append", crs=crs)
+                    except Exception:
+                        # Schema drift vs. an earlier write: nuke + recreate.
+                        _aux_con.execute(f'DROP TABLE "main"."{tbl}"')
+                        _db_mod_aux.write_df_safe(_aux_con, tbl, df_w,
+                                                   if_exists="replace", crs=crs)
+                except Exception:
+                    _db_mod_aux.write_df_safe(_aux_con, tbl, df_w,
+                                               if_exists="replace", crs=crs)
+
+            def _aux_read(tbl, geom_col):
+                df_r = _db_mod_aux.read_df_safe(
+                    _aux_con, tbl,
+                    where="cadaster_code = ?", params=[code],
+                ).drop(columns=["cadaster_code"], errors="ignore")
+                if geom_col in df_r.columns:
+                    crs = _db_mod_aux.get_table_crs(
+                        _aux_con, f"{tbl}.{geom_col}"
+                    )
+                    df_r = gpd.GeoDataFrame(df_r, geometry=geom_col, crs=crs)
+                return df_r
+
+            if not _aux_present("aux_building_parts"):
+                # Neighbouring-municipality buildings (added for shadow-casting
+                # context) have no valid zone_reference in the analyzed
+                # municipality, so they all collapse into one giant chunk under
+                # "unknown"/"unassigned". Tag those rows with a deterministic
+                # 200 m spatial grid pseudo-zone so detect_close_buildings_parallel
+                # produces many small bounded chunks.
+                building_part_gdf_ = _spatially_bin_nearby_zones(
+                    building_part_gdf_, grid_size_m=NEARBY_GRID_SIZE_M,
+                    zone_prefix=NEARBY_ZONE_PREFIX,
+                )
+
+                gdf_global = utils.detect_close_buildings_parallel(gdf_building_parts=building_part_gdf_,
+                                                             buffer_neighbours=nearby_buildings_buffer,
+                                                             neighbours_column_name="nearby_buildings",
                                                              neighbours_id_column_name="building_reference",
                                                              num_workers=num_workers,
                                                              column_name_to_split="zone_reference")
-            gdf_global = gdf_global.merge(
-                gdf_parcels_global[["building_reference","nearby_parcels"]],
-                on="building_reference", how="left")
-            gdf_global = gdf_global.set_geometry("building_part_geometry")
-            gdf_global.to_pickle(f"{results_dir}/cache/{code}_aux1.pkl")
-        else:
-            gdf_global = pd.read_pickle(f"{results_dir}/cache/{code}_aux1.pkl")
+                parcels_gdf["zone_reference"] = (
+                    parcels_gdf["building_reference"].str[0:5] + parcels_gdf["building_reference"].str[7:14])
+                gdf_parcels_global = utils.detect_close_parcels_parallel(gdf_parcels=parcels_gdf,
+                                                                 buffer_neighbours=nearby_buildings_buffer*2,
+                                                                 neighbours_column_name="nearby_parcels",
+                                                                 neighbours_id_column_name="building_reference",
+                                                                 num_workers=num_workers,
+                                                                 column_name_to_split="zone_reference")
+                gdf_global = gdf_global.merge(
+                    gdf_parcels_global[["building_reference","nearby_parcels"]],
+                    on="building_reference", how="left")
+                gdf_global = gdf_global.set_geometry("building_part_geometry")
+                _aux_write("aux_building_parts", gdf_global)
+            else:
+                gdf_global = _aux_read("aux_building_parts", "building_part_geometry")
 
-        if (not os.path.exists(f"{results_dir}/cache/{code}_aux2.pkl")):
-            gdf_footprints_global = utils.calculate_floor_footprints(
-                gdf=gdf_global,
-                group_by="building_reference",
-                geometry_name="building_part_geometry",
-                only_exterior_geometry=True,
-                min_hole_area=0.5,
-                gap_tolerance=0.05,
-                chunk_size=500,
-                num_workers=num_workers)
-            gdf_footprints_global.to_pickle(f"{results_dir}/cache/{code}_aux2.pkl")
-        else:
-            gdf_footprints_global = pd.read_pickle(f"{results_dir}/cache/{code}_aux2.pkl")
+            if not _aux_present("aux_footprints"):
+                gdf_footprints_global = utils.calculate_floor_footprints(
+                    gdf=gdf_global,
+                    group_by="building_reference",
+                    geometry_name="building_part_geometry",
+                    only_exterior_geometry=True,
+                    min_hole_area=0.5,
+                    gap_tolerance=0.05,
+                    chunk_size=500,
+                    num_workers=num_workers)
+                _aux_write("aux_footprints", gdf_footprints_global)
+            else:
+                gdf_footprints_global = _aux_read("aux_footprints", "geometry")
+        finally:
+            _aux_con.close()
 
         # Carry the per-building ground elevation into the global footprints
         # frame. The shadow gate in `process_zone` needs each neighbour's
@@ -537,6 +628,31 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
                 f"Skipping {n_skipped_pseudo} neighbour-pseudo-zones from result emission; "
                 f"{len(zone_references)} real zones will be processed\n"
             )
+
+        # Skip zones whose results are already in the central DB. This
+        # avoids re-computing zones that were aggregated and then had
+        # their cache shards cleaned up (cleanup_shards=True). On resume,
+        # we trust the central DB as the source of truth; only zones
+        # missing from `zone_status` need fresh inference.
+        try:
+            from hypercadaster_ES import _db as _db_mod_pre
+            _pre_con = _db_mod_pre.open_db(results_dir)
+            try:
+                already_in_central = _db_mod_pre.completed_zones(_pre_con, code)
+            finally:
+                _pre_con.close()
+        except Exception:
+            already_in_central = set()
+        if already_in_central:
+            before = len(zone_references)
+            zone_references = [z for z in zone_references
+                               if z not in already_in_central]
+            skipped = before - len(zone_references)
+            if skipped:
+                sys.stderr.write(
+                    f"Skipping {skipped} zones already aggregated in central DB; "
+                    f"{len(zone_references)} zones will be (re)inferred\n"
+                )
 
         # Random zone selection for plots when building_parts_plots is True
         if plots:
@@ -616,6 +732,14 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
             effective_workers = num_workers
         effective_workers = min(effective_workers, len(zone_references)) or 1
 
+        # Pre-warm the DuckDB spatial extension in the parent BEFORE forking
+        # workers. `INSTALL spatial` is a one-time download per machine; if
+        # workers race on the first install we can get spurious failures.
+        # After this call the extension is cached in ~/.duckdb/extensions/
+        # and worker `LOAD spatial` calls are local-only.
+        from hypercadaster_ES import _db as _db_mod
+        _db_mod.open_db(results_dir).close()
+
         progress_bar = tqdm(total=len(zone_references), desc="Inferring building KPIs",
                             mininterval=1.0, leave=True, ncols=80)
 
@@ -673,96 +797,180 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
         import gc as _gc
         _gc.collect()
 
-        # Read per-zone caches back from disk in batches and concatenate.
-        # Batching avoids the quadratic-ish blowup of one giant pd.concat over
-        # tens of thousands of small DataFrames, and lets intermediate slices
-        # be freed between batches.
-        def _downcast_floats(df):
-            if df is None or df.empty:
-                return df
-            f64 = df.select_dtypes(include=["float64"]).columns
-            if len(f64):
-                df[f64] = df[f64].astype("float32")
-            return df
-
-        BATCH = 200
-        sbr_parts, br_parts = [], []
         cache_dir = f"{results_dir}/cache"
 
-        # Apply strip + dedup per-batch (not on the final giant concat). Leak
-        # columns therefore never propagate into the final frame, and the
-        # dedup's row-wise df.apply runs on small chunks instead of doubling
-        # memory of the full br_results. Row-independence makes per-batch
-        # dedup equivalent to a single pass at the end.
-        def _flush_batch(buf_sbr, buf_br):
-            if buf_sbr:
-                merged = pd.concat(buf_sbr, ignore_index=True, copy=False)
-                merged = _strip_per_space_leak_columns(merged)
-                sbr_parts.append(merged)
-                buf_sbr.clear()
-            if buf_br:
-                merged = pd.concat(buf_br, ignore_index=True, copy=False)
-                merged = _strip_per_space_leak_columns(merged)
-                merged = _dedup_br_building_spaces_lists(merged)
-                br_parts.append(merged)
-                buf_br.clear()
+        # ----------------------------------------------------------------
+        # Phase A: drain per-zone shards into the central DB.
+        # ATTACH/INSERT/DETACH per shard keeps the catalog small and avoids
+        # holding all shard file handles open simultaneously. The central
+        # DB ends up with two tables, sbr_results and br_results, with two
+        # bookkeeping columns added (cadaster_code, zone_reference) on top
+        # of whatever schema the shards carry.
+        # ----------------------------------------------------------------
+        from hypercadaster_ES import _db as _db_mod
+        central_con = _db_mod.open_db(results_dir)
+        try:
+            # Clean up any orphan rows left by a previous run that died
+            # between an INSERT and the mark_zone for the same zone (no
+            # transaction boundary covered that gap in earlier versions).
+            # We use zone_status as the source of truth: any rows in the
+            # result tables whose (cadaster_code, zone_reference) isn't
+            # marked 'ok' are partial state and must be discarded so the
+            # re-ingest of that zone doesn't duplicate rows.
+            for _tbl in ("sbr_results", "br_results"):
+                try:
+                    central_con.execute(
+                        f'DELETE FROM "{_tbl}" '
+                        f'WHERE cadaster_code = ? '
+                        f'AND zone_reference NOT IN ('
+                        f'    SELECT zone_reference FROM zone_status '
+                        f'    WHERE cadaster_code = ? AND state = \'ok\''
+                        f')',
+                        [code, code],
+                    )
+                except Exception:
+                    pass  # table may not exist yet on the very first run
 
-        buf_sbr, buf_br = [], []
-        agg_bar = tqdm(total=len(ok_zone_refs), desc="Aggregating zone results",
-                       mininterval=1.0, leave=True, ncols=80)
-        for zr in ok_zone_refs:
-            try:
-                sbr_z = pd.read_pickle(f"{cache_dir}/{zr}_sbr_results.pkl")
-                br_z = pd.read_pickle(f"{cache_dir}/{zr}_br_results.pkl")
-            except (FileNotFoundError, EOFError, pickle_module.UnpicklingError, OSError) as e:
-                # Worker said ok but the file is missing/corrupt at read time.
-                # Don't let one zone block the whole aggregation.
-                agg_bar.write(f"Unreadable cache for zone '{zr}' ({e}); skipping")
-                agg_bar.update(1)
-                continue
-            buf_sbr.append(_downcast_floats(sbr_z))
-            buf_br.append(_downcast_floats(br_z))
-            if len(buf_sbr) >= BATCH:
-                _flush_batch(buf_sbr, buf_br)
-            agg_bar.update(1)
-        _flush_batch(buf_sbr, buf_br)
-        agg_bar.close()
+            # Phase A short-circuit. If a previous run already aggregated
+            # every expected zone (zone_status marks them all 'ok' and the
+            # tables exist), skip straight to Phase B. Avoids redoing the
+            # ~33 min ATTACH loop after a Phase B crash on Barcelona.
+            def _phase_a_can_skip():
+                try:
+                    have_tables = {
+                        r[0] for r in central_con.execute(
+                            "SELECT table_name FROM information_schema.tables "
+                            "WHERE table_schema = 'main'"
+                        ).fetchall()
+                    }
+                    if not {"sbr_results", "br_results"} <= have_tables:
+                        return False
+                    done = _db_mod.completed_zones(central_con, code)
+                    return set(ok_zone_refs).issubset(done)
+                except Exception:
+                    return False
 
-        # Serialize sbr and br so they're never both fully materialised at
-        # the same time. Write sbr, drop it, then build br; re-read sbr from
-        # disk at the very end. The peak shrinks from "sbr_parts + sbr_results
-        # + br_parts + br_results" (~4 frames) to ~3 frames at the worst point
-        # (sbr concat while br_parts is still pending).
-        # zstd at level 1 is dramatically faster than gzip on large pandas
-        # pickles (often 5-10× write speed) while compressing better. The
-        # serial gzip write was a multi-minute tail on Barcelona-scale outputs.
-        if sbr_parts:
-            sbr_results = pd.concat(sbr_parts, ignore_index=True, copy=False)
-            del sbr_parts
-            _gc.collect()
-            sbr_results.to_pickle(sbr_path,
-                                  compression={'method': 'zstd', 'level': 1})
-            del sbr_results
-            _gc.collect()
+            if _phase_a_can_skip():
+                sys.stderr.write(
+                    f"Phase A: all {len(ok_zone_refs)} zones already aggregated "
+                    f"into central DB; skipping ATTACH loop\n"
+                )
+                n_aggregated = len(ok_zone_refs)
+            else:
+                # Incremental: skip zones already marked 'ok', and lazily
+                # extend the central schema as new shards introduce new
+                # CAT-derived columns. Per-zone schemas vary in this
+                # codebase (process_zone's merges with CAT data produce
+                # different column sets per zone), so the central table
+                # is the union of every shard's columns rather than any
+                # single shard's schema.
+                done_zones = _db_mod.completed_zones(central_con, code)
+                already_done = sum(1 for zr in ok_zone_refs if zr in done_zones)
+                if already_done:
+                    sys.stderr.write(
+                        f"Phase A: resuming with {already_done}/{len(ok_zone_refs)} "
+                        f"zones already aggregated\n"
+                    )
 
-            br_results = pd.concat(br_parts, ignore_index=True, copy=False)
-            del br_parts
-            _gc.collect()
-            br_results.to_pickle(br_path,
-                                 compression={'method': 'zstd', 'level': 1})
+                agg_bar = tqdm(total=len(ok_zone_refs), desc="Aggregating zone shards",
+                               mininterval=1.0, leave=True, ncols=80)
+                agg_bar.update(already_done)
+                n_aggregated = already_done
 
-            # Re-read sbr now that the heavy br work is done.
-            sbr_results = _read_compressed_pickle(sbr_path)
-        else:
-            sys.stderr.write("Warning: No valid results from any cadastral zones\n")
-            sbr_results = pd.DataFrame()
-            br_results = pd.DataFrame()
-            sbr_results.to_pickle(sbr_path,
-                                  compression={'method': 'zstd', 'level': 1})
-            br_results.to_pickle(br_path,
-                                 compression={'method': 'zstd', 'level': 1})
+                for zr in ok_zone_refs:
+                    if zr in done_zones:
+                        continue
+                    sp = f"{cache_dir}/{zr}.duckdb"
+                    if not os.path.exists(sp):
+                        agg_bar.write(f"Missing shard for zone '{zr}'; skipping")
+                        agg_bar.update(1)
+                        continue
+                    try:
+                        central_con.execute(f"ATTACH '{sp}' AS shard (READ_ONLY)")
+                        try:
+                            # Transactional: either both result tables get
+                            # this zone's rows AND mark_zone fires, or none
+                            # does. No half-state for the next run to trip on.
+                            central_con.execute("BEGIN TRANSACTION")
+                            try:
+                                bk = {"cadaster_code": code, "zone_reference": zr}
+                                _db_mod.ingest_shard_table(
+                                    central_con,
+                                    shard_alias="shard",
+                                    shard_table="sbr_results",
+                                    central_table="sbr_results",
+                                    bookkeeping=bk,
+                                )
+                                _db_mod.ingest_shard_table(
+                                    central_con,
+                                    shard_alias="shard",
+                                    shard_table="br_results",
+                                    central_table="br_results",
+                                    bookkeeping=bk,
+                                )
+                                _db_mod.mark_zone(central_con, code, zr, "ok")
+                                central_con.execute("COMMIT")
+                                n_aggregated += 1
+                            except Exception:
+                                central_con.execute("ROLLBACK")
+                                raise
+                        finally:
+                            central_con.execute("DETACH shard")
+                    except Exception as _agg_err:
+                        agg_bar.write(
+                            f"Shard aggregation failed for '{zr}' "
+                            f"({type(_agg_err).__name__}: {_agg_err}); skipping"
+                        )
+                    agg_bar.update(1)
+                    # Periodic CHECKPOINT flushes DuckDB's WAL and releases
+                    # transient memory so the parent's heap stays flat
+                    # across thousands of shards instead of growing
+                    # linearly until OOM.
+                    if (n_aggregated and n_aggregated % 200 == 0):
+                        _db_mod.maybe_checkpoint(central_con)
+                agg_bar.close()
+                _db_mod.maybe_checkpoint(central_con)
 
-    return sbr_results, br_results
+            # Post-Phase-A cleanup: drop cache shards whose data is now
+            # safely in the central DB. The worker-skip filter (above)
+            # ensures future runs don't re-compute these zones. Failure
+            # of an individual unlink is logged but not fatal.
+            if cleanup_shards:
+                try:
+                    has_central_data = central_con.execute(
+                        'SELECT 1 FROM "main"."sbr_results" '
+                        'WHERE cadaster_code = ? LIMIT 1', [code],
+                    ).fetchone() is not None
+                except Exception:
+                    has_central_data = False
+
+                if has_central_data:
+                    done_now = _db_mod.completed_zones(central_con, code)
+                    deleted = 0
+                    for zr in done_now:
+                        sp = f"{cache_dir}/{zr}.duckdb"
+                        if os.path.exists(sp):
+                            try:
+                                os.remove(sp); deleted += 1
+                            except OSError as _e:
+                                sys.stderr.write(
+                                    f"[cleanup_shards] could not remove {sp}: {_e}\n"
+                                )
+                    if deleted:
+                        sys.stderr.write(
+                            f"[cleanup_shards] removed {deleted} aggregated shards "
+                            f"from cache for cadaster_code={code}\n"
+                        )
+        finally:
+            central_con.close()
+
+    # Phase B materialisation is gone — the central DB IS the artifact.
+    # Return a lightweight handle; the caller (mergers.py) consumes it
+    # via SQL instead of materialising full DataFrames.
+    from hypercadaster_ES import _db as _db_mod_handle
+    return _db_mod_handle.ResultsHandle(
+        _db_mod_handle.db_path(results_dir), code
+    )
 
 
 # ==========================================
@@ -808,12 +1016,13 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
     """
 
     try:
-        sbr_cache_path = f"{results_dir}/cache/{zone_reference}_sbr_results.pkl"
-        br_cache_path = f"{results_dir}/cache/{zone_reference}_br_results.pkl"
+        shard_path = f"{results_dir}/cache/{zone_reference}.duckdb"
 
-        # A previous run may have been killed (OOM) mid-write, leaving zero-byte
-        # or truncated pickles on disk. Treat any unreadable cache pair as
-        # "missing" and recompute, so we don't propagate EOFError up the stack.
+        # A previous run may have been killed (OOM) mid-write, leaving a
+        # zero-byte / truncated shard on disk. Treat any unreadable shard as
+        # "missing" and recompute, so we don't propagate corruption up the
+        # stack. (Atomic .tmp → rename below makes new writes either
+        # complete or absent.)
         def _cache_is_usable(path):
             if not os.path.exists(path):
                 return False
@@ -824,7 +1033,7 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                 return False
             return True
 
-        cache_present = _cache_is_usable(sbr_cache_path) and _cache_is_usable(br_cache_path)
+        cache_present = _cache_is_usable(shard_path)
 
         if not cache_present:
 
@@ -1135,17 +1344,34 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                 patios_area = {}
                 patios_n = {}
                 perimeter = {}
-                air_contact_wall = {}
+                # Five-bucket wall classification (replaces the old
+                # patios|adiabatic|air_contact scheme):
+                #   main_facade_wall  — exterior wall facing open air (was air_contact_wall);
+                #                       dict[orientation_str, length_per_floor]
+                #   party_wall        — wall on a parcel boundary; per-orientation
+                #   adiabatic_wall    — shared wall with a tall-enough neighbour (height-aware)
+                #   terrain_contact_wall — wall against terrain (underground OR below DEM)
+                #   patios_wall       — wall onto an interior patio
+                main_facade_wall = {}
+                party_wall = {}
+                adiabatic_wall = {}
+                terrain_contact_wall = {}
+                patios_wall = {}
                 shadows_at_distance = {}
                 # Stay-empty defaults: terrain grid is the only terrain-related
                 # field surfaced now. The combined per-floor `shadows_at_distance`
                 # is populated inside the per-floor block below.
                 terrain_grid = {}
                 parcel_at_distance = {}
-                adiabatic_wall = {}
-                patios_wall = {}
-                significant_orientations = []
-                significant_orientations_by_floor = {}
+                main_facade_significant_orientations = []
+                main_facade_significant_orientations_by_floor = {}
+                party_wall_significant_orientations = []
+                party_wall_significant_orientations_by_floor = {}
+                # Per-sbr list of {geometry, type, floor, orientation_degrees,
+                # length_m} for energy-simulation interop. Stored as opaque
+                # list-of-dict; routed through HEAVY_BLOB_COLS so the bulk gdf
+                # stays small.
+                wall_segments_sbr = []
                 n_floors = gdf_aux_footprint_building.floor.max() if gdf_aux_footprint_building.floor.max() >= 0 else np.nan
                 n_underground_floors = -gdf_aux_footprint_building.floor.min() if gdf_aux_footprint_building.floor.min() < 0 else 0
                 n_buildings = len(
@@ -1153,6 +1379,39 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                             gdf_zone["building_reference"] == building_gdf_item.iloc[0]["building_reference"]
                         ]["single_building_reference"].unique()
                 )
+
+                # Hoisted from the (later) shadow block so the wall classifier
+                # can tell whether each segment sits below DEM (terrain_contact)
+                # or behind a tall-enough adjacent neighbour (adiabatic).
+                if 'elevation' in building_gdf_item.columns:
+                    current_building_elevation = utils._coerce_scalar_float(
+                        building_gdf_item['elevation'], 0.0)
+                else:
+                    current_building_elevation = 0.0
+
+                # Per-adjacent-sbr roof elevation. `gdf_aux_footprints_` was
+                # filtered above to the buildings touching ours; elevation
+                # lives on `gdf_zone` rows keyed by single_building_reference.
+                # Falls back to the analysed building's elevation when missing
+                # (adjacent buildings are very close — better than 0 m).
+                adjacent_elev_by_sbr = {}
+                if "elevation" in gdf_zone.columns and len(adjacent_buildings) > 0:
+                    adjacent_elev_by_sbr = dict(
+                        gdf_zone[gdf_zone["single_building_reference"].isin(adjacent_buildings)]
+                        .groupby("single_building_reference")["elevation"]
+                        .first()
+                    )
+                adjacent_roof_elev = {}
+                if len(gdf_aux_footprints_) > 0:
+                    _max_floor_per_adj = gdf_aux_footprints_.groupby("group")["floor"].max()
+                    for _adj_sbr, _adj_max_f in _max_floor_per_adj.items():
+                        adjacent_roof_elev[_adj_sbr] = utils.floor_base_elevation(
+                            utils._coerce_scalar_float(
+                                adjacent_elev_by_sbr.get(_adj_sbr, current_building_elevation),
+                                0.0,
+                            ),
+                            int(_adj_max_f) + 1, ground_floor_height, floor_height,
+                        )
 
                 if n_underground_floors > 0:
 
@@ -1196,21 +1455,63 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                             walls = list(walls)
 
                         # Initialize the lengths for each type of wall contact and for each orientation
-                        air_contact_wall[floor] = {direction: 0.0 for direction in [str(i) for i in
+                        main_facade_wall[floor] = {direction: 0.0 for direction in [str(i) for i in
                                                                                     list(range(0, 360, orientation_discrete_interval_in_degrees))]}
+                        party_wall[floor] = {direction: 0.0 for direction in [str(i) for i in
+                                                                              list(range(0, 360, orientation_discrete_interval_in_degrees))]}
                         adiabatic_wall[floor] = 0.0
+                        terrain_contact_wall[floor] = 0.0
                         patios_wall[floor] = 0.0
                         perimeter[floor] = round(sum([peri.exterior.length for peri in walls]), 2)
 
+                        # Per-floor elevation thresholds.
+                        # - eye_level_floor: mid-floor observer height, matches
+                        #   the shadow block's `eye_level` exactly.
+                        # - floor_top_elev: top-of-slab elevation, used by the
+                        #   terrain_contact below-DEM test.
+                        if floor == 0:
+                            eye_level_floor = current_building_elevation + ground_floor_height / 2.0
+                            floor_top_elev = current_building_elevation + ground_floor_height
+                        else:
+                            eye_level_floor = (current_building_elevation + ground_floor_height
+                                               + (floor - 0.5) * floor_height)
+                            floor_top_elev = (current_building_elevation + ground_floor_height
+                                              + floor * floor_height)
+
+                        # Precompute adjacent footprints at this floor (sbr-id, geom)
+                        # so the adiabatic test can look up the neighbour's roof
+                        # elevation via `adjacent_roof_elev[sbr_id]`.
+                        adj_at_floor = [
+                            (row.group, row.geometry)
+                            for row in gdf_aux_footprints_[
+                                gdf_aux_footprints_.floor == floor
+                            ].itertuples(index=False)
+                        ]
+
                         for geom in walls:
 
-                            # Indoor patios
+                            # Indoor patios — interior rings count as patios_wall
+                            # length AND emit per-segment patio records so the
+                            # wall_segments view stays comprehensive.
                             patios_wall[floor] += sum([item.length for item in list(geom.interiors)])
+                            for ring in geom.interiors:
+                                ring_coords = list(ring.coords)
+                                for j in range(len(ring_coords) - 1):
+                                    ring_seg = LineString([ring_coords[j], ring_coords[j + 1]])
+                                    if ring_seg.length < 0.001:
+                                        continue
+                                    wall_segments_sbr.append({
+                                        "geometry": ring_seg,
+                                        "type": "patios",
+                                        "floor": floor,
+                                        "orientation_degrees": None,
+                                        "length_m": round(ring_seg.length, 2),
+                                    })
 
                             # Break down the exterior into segments
                             exterior_coords = list(orient(geom, sign=-1.0).exterior.coords)
                             for i in range(len(exterior_coords) - 1):
-                                segment_assigned = False
+                                segment_assigned = None
                                 segment = LineString([exterior_coords[i], exterior_coords[i + 1]])
                                 if segment.length < 0.001:
                                     continue
@@ -1220,7 +1521,7 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                                     segment,
                                     orientation_interval=orientation_discrete_interval_in_degrees))
 
-                                # Check if the segment is in contact with patios
+                                # 1. PATIOS — segment intersects an interior courtyard polygon.
                                 for patio in patios:
                                     if utils.segment_intersects_with_tolerance(
                                             segment, patio,
@@ -1234,22 +1535,63 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                                                 geometries = [geom] + [segment],
                                                 title = f"Wall ID:{i}, floor: {floor},\n"
                                                         f"orientation: {segment_orientation},"
-                                                        f"type: patio",
+                                                        f"type: patios",
                                                 ax = ax,
                                                 contextual_geometry = building_geom)
                                             pdf.savefig(fig)
                                             plt.close(fig)
-                                        segment_assigned = True
+                                        segment_assigned = "patios"
                                         break
 
-                                # Check if the segment is in contact with nearby buildings
-                                if not segment_assigned:
-                                    for aux_geom in gdf_aux_footprints_[gdf_aux_footprints_.floor == floor].geometry:
-                                        if utils.segment_intersects_with_tolerance(
-                                                segment, aux_geom,
+                                # 2. TERRAIN_CONTACT — basement (floor<0, dead under
+                                # current above-ground loop scope) OR midpoint sits
+                                # below the floor's top-of-slab elevation per DEM.
+                                if segment_assigned is None:
+                                    is_terrain = False
+                                    if floor < 0:
+                                        is_terrain = True
+                                    elif dem_sampler is not None:
+                                        mid = segment.interpolate(0.5, normalized=True)
+                                        try:
+                                            terrain_elev = float(
+                                                dem_sampler([mid.x], [mid.y])[0]
+                                            )
+                                        except (TypeError, ValueError, Exception):
+                                            terrain_elev = None
+                                        if (terrain_elev is not None
+                                                and not math.isnan(terrain_elev)
+                                                and terrain_elev > floor_top_elev):
+                                            is_terrain = True
+                                    if is_terrain:
+                                        terrain_contact_wall[floor] += round(segment.length, 2)
+                                        if plots:
+                                            fig, ax = plt.subplots()
+                                            utils.plot_shapely_geometries(
+                                                geometries = [geom] + [segment],
+                                                title = f"Wall ID:{i}, floor: {floor},\n"
+                                                        f"orientation: {segment_orientation},"
+                                                        f"type: terrain_contact",
+                                                ax = ax,
+                                                contextual_geometry = building_geom)
+                                            pdf.savefig(fig)
+                                            plt.close(fig)
+                                        segment_assigned = "terrain_contact"
+
+                                # 3. ADIABATIC — touches an adjacent neighbour's
+                                # footprint AT this floor AND the neighbour's roof
+                                # rises at least 0.5 m above our eye level (so a
+                                # low neighbour doesn't shadow a tall wall).
+                                if segment_assigned is None:
+                                    for adj_sbr, adj_geom in adj_at_floor:
+                                        if not utils.segment_intersects_with_tolerance(
+                                                segment, adj_geom,
                                                 buffer_distance=0.1,
                                                 area_percentage_threshold=15
                                         ):
+                                            continue
+                                        adj_top = adjacent_roof_elev.get(
+                                            adj_sbr, float("-inf"))
+                                        if adj_top >= eye_level_floor + 0.5:
                                             adiabatic_wall[floor] += round(segment.length, 2)
                                             if plots:
                                                 fig, ax = plt.subplots()
@@ -1262,36 +1604,80 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                                                     contextual_geometry = building_geom)
                                                 pdf.savefig(fig)
                                                 plt.close(fig)
-                                            segment_assigned = True
+                                            segment_assigned = "adiabatic"
                                             break
 
-                                # Check if the segment is in contact with outdoor (air contact)
-                                if not segment_assigned:
-                                    air_contact_wall[floor][segment_orientation] += round(segment.length, 2)
+                                # 4. PARTY_WALL — segment lies on any related parcel
+                                # boundary (per-orientation; treats the boundary like
+                                # an exterior wall without windows).
+                                if segment_assigned is None and len(related_parcels_geom) > 0:
+                                    for related_parcel in related_parcels_geom:
+                                        if utils.segment_intersects_with_tolerance(
+                                                segment, related_parcel,
+                                                buffer_distance=0.1,
+                                                area_percentage_threshold=15
+                                        ):
+                                            party_wall[floor][segment_orientation] += round(segment.length, 2)
+                                            if plots:
+                                                fig, ax = plt.subplots()
+                                                utils.plot_shapely_geometries(
+                                                    geometries = [geom] + [segment],
+                                                    title = f"Wall ID: {i}, floor: {floor},\n"
+                                                            f"orientation: {segment_orientation}, "
+                                                            f"type: party_wall",
+                                                    ax = ax,
+                                                    contextual_geometry = building_geom)
+                                                pdf.savefig(fig)
+                                                plt.close(fig)
+                                            segment_assigned = "party_wall"
+                                            break
+
+                                # 5. MAIN_FACADE — true exterior wall facing open air.
+                                if segment_assigned is None:
+                                    main_facade_wall[floor][segment_orientation] += round(segment.length, 2)
                                     if plots:
                                         fig, ax = plt.subplots()
                                         utils.plot_shapely_geometries(
                                             geometries = [geom] + [segment],
                                             title = f"Wall ID: {i}, floor: {floor},\n"
                                                     f"orientation: {segment_orientation}, "
-                                                    f"type: air contact",
+                                                    f"type: main_facade",
                                             ax = ax,
                                             contextual_geometry = building_geom)
                                         pdf.savefig(fig)
                                         plt.close(fig)
-                    for floor, air_contact_walls in air_contact_wall.items():
-                        significant_orientations_ = []
-                        significant_threshold = 0.1 * perimeter[floor]
+                                    segment_assigned = "main_facade"
 
-                        for orientation, wall_length in air_contact_walls.items():
-                            if wall_length > significant_threshold:
-                                significant_orientations_.append(int(orientation))
+                                # Per-segment record (energy-simulation interop).
+                                wall_segments_sbr.append({
+                                    "geometry": segment,
+                                    "type": segment_assigned,
+                                    "floor": floor,
+                                    "orientation_degrees": (
+                                        float(segment_orientation)
+                                        if segment_assigned in ("party_wall", "main_facade")
+                                        else None
+                                    ),
+                                    "length_m": round(segment.length, 2),
+                                })
 
-                        # Sort the significant orientations in ascending order for better readability
-                        significant_orientations_ = sorted(list(set(significant_orientations_)))
-                        significant_orientations.extend(significant_orientations_)
-                        significant_orientations_by_floor[floor] = significant_orientations_
-                    significant_orientations = list(set(significant_orientations))
+                    # Significant-orientation summaries: any direction where the
+                    # per-floor wall length crosses 10 % of the floor perimeter.
+                    # Same logic as the old air_contact pass, now applied to BOTH
+                    # main_facade_wall and party_wall.
+                    for floor, mf_walls in main_facade_wall.items():
+                        threshold = 0.1 * perimeter[floor]
+                        flagged = sorted({int(o) for o, l in mf_walls.items() if l > threshold})
+                        main_facade_significant_orientations.extend(flagged)
+                        main_facade_significant_orientations_by_floor[floor] = flagged
+                    main_facade_significant_orientations = list(set(main_facade_significant_orientations))
+
+                    for floor, pw_walls in party_wall.items():
+                        threshold = 0.1 * perimeter[floor]
+                        flagged = sorted({int(o) for o, l in pw_walls.items() if l > threshold})
+                        party_wall_significant_orientations.extend(flagged)
+                        party_wall_significant_orientations_by_floor[floor] = flagged
+                    party_wall_significant_orientations = list(set(party_wall_significant_orientations))
 
                     # Close the PDF file for the current building
                     if plots:
@@ -1327,11 +1713,8 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                     else:
                         pdf = None
 
-                    if 'elevation' in building_gdf_item.columns:
-                        current_building_elevation = utils._coerce_scalar_float(
-                            building_gdf_item['elevation'], 0.0)
-                    else:
-                        current_building_elevation = 0.0
+                    # `current_building_elevation` is hoisted above the wall
+                    # loop so the wall classifier can see it; reused here.
 
                     # Pre-compute neighbour roof elevations (one per nearby
                     # building, not per-row). n_floors_above_ground per
@@ -1601,16 +1984,28 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                     'sbr__walls_between_slabs': np.sum([perimeter[floor] for floor in
                                                          range(n_floors + 1)] if perimeter != {} else []),
                     'sbr__building_perimeter_by_floor': [perimeter[floor] for floor in range(n_floors + 1)] if perimeter != {} else [],
-                    'sbr__air_contact_wall_by_floor': {key: [air_contact_wall[d][key] for d in air_contact_wall] for key in
-                                         air_contact_wall[0]} if air_contact_wall != {} else {},
-                    'sbr__air_contact_wall':  {key: np.sum([air_contact_wall[d][key] for d in air_contact_wall]) for key in
-                                         air_contact_wall[0]} if air_contact_wall != {} else {},
-                    'sbr__air_contact_wall_significant_orientations': significant_orientations,
-                    'sbr__air_contact_wall_significant_orientations_by_floor': significant_orientations_by_floor,
+                    'sbr__main_facade_wall_by_floor': {key: [main_facade_wall[d][key] for d in main_facade_wall] for key in
+                                         main_facade_wall[0]} if main_facade_wall != {} else {},
+                    'sbr__main_facade_wall':  {key: np.sum([main_facade_wall[d][key] for d in main_facade_wall]) for key in
+                                         main_facade_wall[0]} if main_facade_wall != {} else {},
+                    'sbr__main_facade_wall_significant_orientations': main_facade_significant_orientations,
+                    'sbr__main_facade_wall_significant_orientations_by_floor': main_facade_significant_orientations_by_floor,
+                    'sbr__party_wall_by_floor': {key: [party_wall[d][key] for d in party_wall] for key in
+                                         party_wall[0]} if party_wall != {} else {},
+                    'sbr__party_wall': {key: np.sum([party_wall[d][key] for d in party_wall]) for key in
+                                         party_wall[0]} if party_wall != {} else {},
+                    'sbr__party_wall_significant_orientations': party_wall_significant_orientations,
+                    'sbr__party_wall_significant_orientations_by_floor': party_wall_significant_orientations_by_floor,
                     'sbr__adiabatic_wall_by_floor': [adiabatic_wall[floor] for floor in range(n_floors + 1)] if adiabatic_wall != {} else [],
                     'sbr__adiabatic_wall': np.sum([adiabatic_wall[floor] for floor in range(n_floors + 1)]) if adiabatic_wall != {} else 0.0,
+                    'sbr__terrain_contact_wall_by_floor': [terrain_contact_wall[floor] for floor in range(n_floors + 1)] if terrain_contact_wall != {} else [],
+                    'sbr__terrain_contact_wall': np.sum([terrain_contact_wall[floor] for floor in range(n_floors + 1)]) if terrain_contact_wall != {} else 0.0,
                     'sbr__patios_wall_by_floor': [patios_wall[floor] for floor in range(n_floors + 1)] if patios_wall != {} else [],
                     'sbr__patios_wall_total': np.sum([patios_wall[floor] for floor in range(n_floors + 1)]) if patios_wall != {} else 0.0,
+                    # Per-segment wall records (energy-simulation interop).
+                    # Heavy column — excluded from the bulk read path; fetch
+                    # on-demand via `utils.get_heavy_columns_for_building`.
+                    'sbr__wall_segments': wall_segments_sbr,
                     # Combined per-floor shadows (building + terrain blocker at
                     # mid-floor eye level). Shape: {orient: [floor0, floor1, ...]}.
                     'sbr__shadows_at_distance': {key: [shadows_at_distance[d]['shadows'][key] for d in shadows_at_distance] for key in
@@ -1673,7 +2068,7 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                         'br__walls_between_slabs': [sum(sbr_results['sbr__walls_between_slabs'])],
                         'br__building_perimeter_by_floor': [[sum(values) for values in zip_longest(
                             *sbr_results['sbr__building_perimeter_by_floor'], fillvalue=0)]],
-                        'br__air_contact_wall_by_floor': [dict(sorted({
+                        'br__main_facade_wall_by_floor': [dict(sorted({
                             k: [
                                 sum(x)
                                 for x in zip_longest(
@@ -1683,55 +2078,55 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                                             [0] * (
                                                 max(
                                                     (len(v) for v in d.values() if isinstance(v, list)),
-                                                    default=1,  # Default to 1 if no valid lists are found
+                                                    default=1,
                                                 )
                                             )
                                         )
-                                        for d in sbr_results["sbr__air_contact_wall_by_floor"]
+                                        for d in sbr_results["sbr__main_facade_wall_by_floor"]
                                     ),
                                     fillvalue=0,
                                 )
                             ]
                             for k in set(
                                 chain.from_iterable(
-                                    d.keys() for d in sbr_results["sbr__air_contact_wall_by_floor"]
+                                    d.keys() for d in sbr_results["sbr__main_facade_wall_by_floor"]
                                 )
                             )
                         }.items(), key=lambda item: int(item[0])))],
-                        'br__air_contact_wall': [dict(sorted({
+                        'br__main_facade_wall': [dict(sorted({
                             k: sum(
-                                d.get(k, 0)  # Get scalar value or default to 0
-                                for d in sbr_results["sbr__air_contact_wall"]
+                                d.get(k, 0)
+                                for d in sbr_results["sbr__main_facade_wall"]
                             )
                             for k in set(
                                 chain.from_iterable(
-                                    d.keys() for d in sbr_results["sbr__air_contact_wall"]
+                                    d.keys() for d in sbr_results["sbr__main_facade_wall"]
                                 )
                             )
-                        }.items(),key=lambda item: int(item[0])))],
-                        'br__air_contact_wall_significant_orientations': [
+                        }.items(), key=lambda item: int(item[0])))],
+                        'br__main_facade_wall_significant_orientations': [
                             dict(sorted({
                                 k: sum(
                                     d.get(k, 0)
-                                    for d in sbr_results["sbr__air_contact_wall_significant_orientations"]
+                                    for d in sbr_results["sbr__main_facade_wall_significant_orientations"]
                                     if isinstance(d, dict)
                                 )
                                 for k in set(
                                     chain.from_iterable(
                                         d.keys()
-                                        for d in sbr_results["sbr__air_contact_wall_significant_orientations"]
+                                        for d in sbr_results["sbr__main_facade_wall_significant_orientations"]
                                         if isinstance(d, dict)
                                     )
                                 )
                             }.items(), key=lambda item: int(item[0])))
                         ],
-                        'br__air_contact_wall_significant_orientations_by_floor': [
+                        'br__main_facade_wall_significant_orientations_by_floor': [
                             dict(sorted({
                                 k: [
                                     sum(floor_vals)
                                     for floor_vals in zip_longest(
                                         *[
-                                            d.get(k, []) for d in sbr_results["sbr__air_contact_wall_significant_orientations_by_floor"]
+                                            d.get(k, []) for d in sbr_results["sbr__main_facade_wall_significant_orientations_by_floor"]
                                             if isinstance(d, dict)
                                         ],
                                         fillvalue=0
@@ -1740,7 +2135,80 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                                 for k in set(
                                     chain.from_iterable(
                                         d.keys()
-                                        for d in sbr_results["sbr__air_contact_wall_significant_orientations_by_floor"]
+                                        for d in sbr_results["sbr__main_facade_wall_significant_orientations_by_floor"]
+                                        if isinstance(d, dict)
+                                    )
+                                )
+                            }.items(), key=lambda item: int(item[0])))
+                        ],
+                        'br__party_wall_by_floor': [dict(sorted({
+                            k: [
+                                sum(x)
+                                for x in zip_longest(
+                                    *(
+                                        d.get(
+                                            k,
+                                            [0] * (
+                                                max(
+                                                    (len(v) for v in d.values() if isinstance(v, list)),
+                                                    default=1,
+                                                )
+                                            )
+                                        )
+                                        for d in sbr_results["sbr__party_wall_by_floor"]
+                                    ),
+                                    fillvalue=0,
+                                )
+                            ]
+                            for k in set(
+                                chain.from_iterable(
+                                    d.keys() for d in sbr_results["sbr__party_wall_by_floor"]
+                                )
+                            )
+                        }.items(), key=lambda item: int(item[0])))],
+                        'br__party_wall': [dict(sorted({
+                            k: sum(
+                                d.get(k, 0)
+                                for d in sbr_results["sbr__party_wall"]
+                            )
+                            for k in set(
+                                chain.from_iterable(
+                                    d.keys() for d in sbr_results["sbr__party_wall"]
+                                )
+                            )
+                        }.items(), key=lambda item: int(item[0])))],
+                        'br__party_wall_significant_orientations': [
+                            dict(sorted({
+                                k: sum(
+                                    d.get(k, 0)
+                                    for d in sbr_results["sbr__party_wall_significant_orientations"]
+                                    if isinstance(d, dict)
+                                )
+                                for k in set(
+                                    chain.from_iterable(
+                                        d.keys()
+                                        for d in sbr_results["sbr__party_wall_significant_orientations"]
+                                        if isinstance(d, dict)
+                                    )
+                                )
+                            }.items(), key=lambda item: int(item[0])))
+                        ],
+                        'br__party_wall_significant_orientations_by_floor': [
+                            dict(sorted({
+                                k: [
+                                    sum(floor_vals)
+                                    for floor_vals in zip_longest(
+                                        *[
+                                            d.get(k, []) for d in sbr_results["sbr__party_wall_significant_orientations_by_floor"]
+                                            if isinstance(d, dict)
+                                        ],
+                                        fillvalue=0
+                                    )
+                                ]
+                                for k in set(
+                                    chain.from_iterable(
+                                        d.keys()
+                                        for d in sbr_results["sbr__party_wall_significant_orientations_by_floor"]
                                         if isinstance(d, dict)
                                     )
                                 )
@@ -1749,9 +2217,15 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                         'br__adiabatic_wall_by_floor': [[sum(values) for values in zip_longest(
                             *sbr_results['sbr__adiabatic_wall_by_floor'], fillvalue=0)]],
                         'br__adiabatic_wall': [sum(sbr_results['sbr__adiabatic_wall'])],
+                        'br__terrain_contact_wall_by_floor': [[sum(values) for values in zip_longest(
+                            *sbr_results['sbr__terrain_contact_wall_by_floor'], fillvalue=0)]],
+                        'br__terrain_contact_wall': [sum(sbr_results['sbr__terrain_contact_wall'])],
                         'br__patios_wall_by_floor': [[sum(values) for values in zip_longest(
                             *sbr_results['sbr__patios_wall_by_floor'], fillvalue=0)]],
                         'br__patios_wall_total': [sum(sbr_results['sbr__patios_wall_total'])],
+                        # Per-segment wall records concatenated across sbrs.
+                        # Heavy column — same fetch model as br__shadows.
+                        'br__wall_segments': [sum(sbr_results['sbr__wall_segments'].tolist(), start=[])],
                         # Combined per-floor shadows (building + terrain blocker
                         # at mid-floor eye level). Per-orientation lists are
                         # averaged element-wise across sbrs (missing floors
@@ -1930,109 +2404,44 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                                 .reset_index()
                             )
 
-                            # Reduce agg_CAT["by_floors"] to each building reference
-                            def process_variable(df, variable, summarise_ops=None, multiplier=1, divider=1):
-                                return {
-                                    f"br__{variable}_by_floor": utils.agg_op(
-                                        df,
-                                        funcs=summarise_ops,
-                                        grouping=["use_type","floor_number"],
-                                        variable=f"br__{variable}_by_floor",
-                                        multiplier=multiplier,
-                                        divider=divider
-                                    )
-                                }
-
-                            agg_list = [("building_spaces", [lambda x: round(x, 2)], 1, 1),
-                                        ("area_with_communals", [lambda x: round(x, 2)], 1, 1),
-                                        ("area_without_communals", [lambda x: round(x, 2)], 1, 1),
-                                        ("communal_area", [lambda x: round(x, 2)], 1, 1),
-                                        ("economic_value", [lambda x: round(x, 2)], 1, 1),
-                                        ("mean_building_space_area_with_communals", [lambda x: round(x, 2)], 1, 1),
-                                        ("mean_building_space_area_without_communals", [lambda x: round(x, 2)], 1, 1),
-                                        ("mean_building_space_communal_area", [lambda x: round(x, 2)], 1, 1),
-                                        ("mean_building_space_effective_year", [lambda x: round(x, 2)], 1, 1),
-                                        ("mean_building_space_category", [lambda x: round(x, 2)], 1, 1),
-                                        ("mean_building_space_economic_value", [lambda x: round(x, 2)], 1, 1)
-                                        ]
-                            br_with_CAT_by_floors = (
-                                agg_CAT["by_floors"].groupby(["building_reference"])
-                                .apply(lambda df: pd.Series({
-                                        key: value
-                                        for agg_elem in agg_list
-                                        for key, value in
-                                        process_variable(df, agg_elem[0], agg_elem[1], agg_elem[2], agg_elem[3]).items()
-                                    }),
-                                    include_groups=False)
-                                .reset_index()
-                            )
-
-                            # Reduce agg_CAT["building"] to each building reference
-                            def process_variable(df, variable, ops, multiplier=1, divider=1):
-                                return {
-                                    f"br__{variable}": utils.agg_op(
-                                        df,
-                                        funcs=ops,
-                                        grouping="use_type",
-                                        variable=f"br__{variable}",
-                                        multiplier=multiplier,
-                                        divider=divider
-                                    )
-                                }
-                            agg_list = [("building_spaces",[sum],1,1),
-                                        ("area_with_communals",[sum],1,1),
-                                        ("area_without_communals",[sum],1,1),
-                                        ("communal_area",[sum],1,1),
-                                        ("economic_value",[sum],1,1),
-                                        ("mean_building_space_area_with_communals",[sum],1,1),
-                                        ("mean_building_space_area_without_communals",[sum],1,1),
-                                        ("mean_building_space_communal_area",[sum],1,1),
-                                        ("mean_building_space_effective_year",[sum],1,1),
-                                        ("mean_building_space_category",[sum],1,1),
-                                        ("mean_building_space_economic_value",[sum],1,1),
-                                        ('building_spaces_reference',[chain.from_iterable, list],1,1),
-                                        ('building_spaces_postal_address',[chain.from_iterable, list],1,1),
-                                        ('building_spaces_inner_address',[chain.from_iterable, list],1,1),
-                                        ('building_spaces_floor_number',[chain.from_iterable, list],1,1),
-                                        ('building_spaces_category',[chain.from_iterable, list],1,1),
-                                        ('building_spaces_effective_year',[chain.from_iterable, list],1,1),
-                                        ('building_spaces_area_without_communal',[chain.from_iterable, list],1,1),
-                                        ('building_spaces_area_with_communal',[chain.from_iterable, list],1,1),
-                                        ('building_spaces_economic_value',[chain.from_iterable, list],1,1),
-                                        ('building_spaces_detailed_use_type',[chain.from_iterable, list],1,1)
-                                        ]
-                            br_with_CAT_summarised = (
-                                agg_CAT["building"].groupby(["building_reference"])
-                                .apply(lambda df: pd.Series({
-                                    key: value
-                                    for agg_elem in agg_list
-                                    for key, value in process_variable(df, agg_elem[0], agg_elem[1], agg_elem[2], agg_elem[3]).items()
-                                }),
-                                       include_groups=False)
-                                .reset_index()
-                            )
+                            # Reduce agg_CAT to per-building br__* columns (shared
+                            # with the no-inference CAT path in mergers.py).
+                            br_with_CAT = _br_aggregate_from_agg_CAT(agg_CAT)
 
                             sbr_results = (sbr_results.
                                 merge(sbr_with_CAT_by_floors, on=["building_reference","single_building_reference"], how="left").
                                 merge(sbr_with_CAT_summarised, on=["building_reference","single_building_reference"], how="left"))
 
-                            br_results = (br_results.
-                                merge(br_with_CAT_by_floors, on="building_reference", how="left").
-                                merge(br_with_CAT_summarised, on="building_reference", how="left"))
+                            br_results = br_results.merge(br_with_CAT, on="building_reference", how="left")
 
                     sbr_results_concat = pd.concat([sbr_results_concat, sbr_results], ignore_index=True)
                     br_results_concat = pd.concat([br_results_concat, br_results], ignore_index=True)
 
-                # Atomic write: stage to a sibling .tmp and rename. Avoids the
-                # zero-byte/truncated pickle problem when the process is killed
-                # (OOM, SIGTERM) between open() and pickle flush — which then
-                # poisons subsequent runs with EOFError on read.
-                sbr_tmp = sbr_cache_path + ".tmp"
-                br_tmp = br_cache_path + ".tmp"
-                sbr_results_concat.to_pickle(sbr_tmp)
-                br_results_concat.to_pickle(br_tmp)
-                os.replace(sbr_tmp, sbr_cache_path)
-                os.replace(br_tmp, br_cache_path)
+                # Apply municipality-level cleanups WRITE-SIDE so the
+                # central DB never holds the unclean version, and Phase B
+                # avoids a second pass. Both transforms are idempotent —
+                # safe if shards happen to get re-ingested.
+                sbr_results_concat = _strip_per_space_leak_columns(sbr_results_concat)
+                br_results_concat = _strip_per_space_leak_columns(br_results_concat)
+                br_results_concat = _dedup_br_building_spaces_lists(br_results_concat)
+
+                # Atomic write: stage to {shard}.tmp and rename, so a
+                # SIGKILL between connect() and final flush either leaves
+                # the prior shard intact (if any) or leaves no shard at
+                # all. Never a corrupt one at the canonical path.
+                from hypercadaster_ES import _db as _db_mod
+                shard_tmp = shard_path + ".tmp"
+                if os.path.exists(shard_tmp):
+                    os.remove(shard_tmp)
+                shard_con = _db_mod.open_shard(shard_tmp)
+                try:
+                    _db_mod.write_df_safe(shard_con, "sbr_results",
+                                          sbr_results_concat, if_exists="replace")
+                    _db_mod.write_df_safe(shard_con, "br_results",
+                                          br_results_concat, if_exists="replace")
+                finally:
+                    shard_con.close()
+                os.replace(shard_tmp, shard_path)
 
                 return sbr_results_concat, br_results_concat
 
@@ -2040,21 +2449,24 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                 return None, None
 
         else:
+            # Resume path: shard already on disk from a prior run.
+            from hypercadaster_ES import _db as _db_mod
             try:
-                return (pd.read_pickle(sbr_cache_path),
-                        pd.read_pickle(br_cache_path))
-            except (EOFError, pickle_module.UnpicklingError, OSError) as cache_err:
-                # Cache turned out to be corrupt even though both files passed
-                # the size check. Remove the bad pair and recompute by recursing.
+                _resume_con = _db_mod.open_shard_read(shard_path)
+                try:
+                    return (_db_mod.read_df_safe(_resume_con, "sbr_results"),
+                            _db_mod.read_df_safe(_resume_con, "br_results"))
+                finally:
+                    _resume_con.close()
+            except Exception as cache_err:
                 sys.stderr.write(
-                    f"Corrupt cache for zone '{zone_reference}' ({cache_err}); "
+                    f"Corrupt shard for zone '{zone_reference}' ({cache_err}); "
                     f"deleting and recomputing.\n"
                 )
-                for _p in (sbr_cache_path, br_cache_path):
-                    try:
-                        os.remove(_p)
-                    except OSError:
-                        pass
+                try:
+                    os.remove(shard_path)
+                except OSError:
+                    pass
                 return process_zone(
                     gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf,
                     streets_gdf, buildings_CAT, results_dir, plots,
@@ -2615,3 +3027,141 @@ def aggregate_CAT_file_building_spaces(building_CAT_df):
         "by_floors": agg_CAT_by_floors,
         "building": agg_CAT_building,
     }
+
+
+def _br_aggregate_from_agg_CAT(agg_CAT):
+    """Apply the br-level aggregation over the dict produced by
+    ``aggregate_CAT_file_building_spaces``.
+
+    Returns a DataFrame keyed by ``building_reference`` carrying the
+    ``br__*_by_floor`` and ``br__*`` columns. Extracted from the inline
+    block in ``process_zone`` so the no-inference CAT path in
+    ``mergers.py`` can reuse exactly the same aggregation.
+    """
+    def _process_by_floors(df, variable, ops, multiplier=1, divider=1):
+        return {
+            f"br__{variable}_by_floor": utils.agg_op(
+                df,
+                funcs=ops,
+                grouping=["use_type", "floor_number"],
+                variable=f"br__{variable}_by_floor",
+                multiplier=multiplier,
+                divider=divider,
+            )
+        }
+
+    floors_agg_list = [
+        ("building_spaces", [lambda x: round(x, 2)], 1, 1),
+        ("area_with_communals", [lambda x: round(x, 2)], 1, 1),
+        ("area_without_communals", [lambda x: round(x, 2)], 1, 1),
+        ("communal_area", [lambda x: round(x, 2)], 1, 1),
+        ("economic_value", [lambda x: round(x, 2)], 1, 1),
+        ("mean_building_space_area_with_communals", [lambda x: round(x, 2)], 1, 1),
+        ("mean_building_space_area_without_communals", [lambda x: round(x, 2)], 1, 1),
+        ("mean_building_space_communal_area", [lambda x: round(x, 2)], 1, 1),
+        ("mean_building_space_effective_year", [lambda x: round(x, 2)], 1, 1),
+        ("mean_building_space_category", [lambda x: round(x, 2)], 1, 1),
+        ("mean_building_space_economic_value", [lambda x: round(x, 2)], 1, 1),
+    ]
+    br_by_floors = (
+        agg_CAT["by_floors"].groupby(["building_reference"])
+        .apply(lambda df: pd.Series({
+            key: value
+            for agg_elem in floors_agg_list
+            for key, value in _process_by_floors(df, agg_elem[0], agg_elem[1],
+                                                 agg_elem[2], agg_elem[3]).items()
+        }), include_groups=False)
+        .reset_index()
+    )
+
+    def _process_building(df, variable, ops, multiplier=1, divider=1):
+        return {
+            f"br__{variable}": utils.agg_op(
+                df,
+                funcs=ops,
+                grouping="use_type",
+                variable=f"br__{variable}",
+                multiplier=multiplier,
+                divider=divider,
+            )
+        }
+
+    building_agg_list = [
+        ("building_spaces", [sum], 1, 1),
+        ("area_with_communals", [sum], 1, 1),
+        ("area_without_communals", [sum], 1, 1),
+        ("communal_area", [sum], 1, 1),
+        ("economic_value", [sum], 1, 1),
+        ("mean_building_space_area_with_communals", [sum], 1, 1),
+        ("mean_building_space_area_without_communals", [sum], 1, 1),
+        ("mean_building_space_communal_area", [sum], 1, 1),
+        ("mean_building_space_effective_year", [sum], 1, 1),
+        ("mean_building_space_category", [sum], 1, 1),
+        ("mean_building_space_economic_value", [sum], 1, 1),
+        ('building_spaces_reference', [chain.from_iterable, list], 1, 1),
+        ('building_spaces_postal_address', [chain.from_iterable, list], 1, 1),
+        ('building_spaces_inner_address', [chain.from_iterable, list], 1, 1),
+        ('building_spaces_floor_number', [chain.from_iterable, list], 1, 1),
+        ('building_spaces_category', [chain.from_iterable, list], 1, 1),
+        ('building_spaces_effective_year', [chain.from_iterable, list], 1, 1),
+        ('building_spaces_area_without_communal', [chain.from_iterable, list], 1, 1),
+        ('building_spaces_area_with_communal', [chain.from_iterable, list], 1, 1),
+        ('building_spaces_economic_value', [chain.from_iterable, list], 1, 1),
+        ('building_spaces_detailed_use_type', [chain.from_iterable, list], 1, 1),
+    ]
+    br_building = (
+        agg_CAT["building"].groupby(["building_reference"])
+        .apply(lambda df: pd.Series({
+            key: value
+            for agg_elem in building_agg_list
+            for key, value in _process_building(df, agg_elem[0], agg_elem[1],
+                                                 agg_elem[2], agg_elem[3]).items()
+        }), include_groups=False)
+        .reset_index()
+    )
+
+    return br_by_floors.merge(br_building, on="building_reference", how="outer")
+
+
+def br_attributes_from_CAT(buildings_CAT):
+    """Compute the CAT-derived ``br__*`` attributes for every building in
+    ``buildings_CAT`` without running geometric building-parts inference.
+
+    Used by ``hc.merge(building_parts_inference=False, use_CAT_files=True)``
+    so the resulting GeoDataFrame still carries the rich per-building CAT
+    aggregates (``br__building_spaces_*``, ``br__area_with_communals``,
+    ``br__economic_value``, ...) that the full inference path produces.
+
+    Parameters
+    ----------
+    buildings_CAT : polars.DataFrame or pandas.DataFrame
+        Per-building-space CAT rows, the same frame produced by
+        ``parse_horizontal_division_buildings_CAT_files``.
+
+    Returns
+    -------
+    pandas.DataFrame keyed by ``building_reference`` with the same
+    ``br__*_by_floor`` and ``br__*`` columns the inference path emits.
+    """
+    if buildings_CAT is None:
+        return pd.DataFrame(columns=["building_reference"])
+    if hasattr(buildings_CAT, "to_pandas"):
+        df = buildings_CAT.to_pandas()
+    else:
+        df = buildings_CAT
+
+    if df.empty:
+        return pd.DataFrame(columns=["building_reference"])
+
+    rows = []
+    for _br, sub in df.groupby("building_reference", sort=False):
+        agg_CAT = aggregate_CAT_file_building_spaces(building_CAT_df=sub)
+        rows.append(_br_aggregate_from_agg_CAT(agg_CAT))
+
+    if not rows:
+        return pd.DataFrame(columns=["building_reference"])
+
+    out = pd.concat(rows, ignore_index=True)
+    out = _strip_per_space_leak_columns(out)
+    out = _dedup_br_building_spaces_lists(out)
+    return out

@@ -28,7 +28,7 @@ wd = "/home/gmor/Nextcloud2/Beegroup/data/hypercadaster_ES"
 
 # Municipality codes to analyze
 # (08900: Barcelona, 25023: Alpicat, 25285: Torrefarrera - last two, both in Lleida province)
-cadaster_codes = ["08900"]
+cadaster_codes = ["25023"]
 
 # Download all required data for all municipalities at once
 print("Downloading cadastral and auxiliary data for all municipalities...")
@@ -45,6 +45,7 @@ print("="*60)
 all_results = []
 
 for i, municipality in enumerate(cadaster_codes, 1):
+    #break
     print(f"\n[{i}/{len(cadaster_codes)}] Processing municipality: {municipality}")
     print("-" * 50)
     individual_filename = f"{wd}/{municipality}_complete_inference.pkl"
@@ -64,21 +65,30 @@ for i, municipality in enumerate(cadaster_codes, 1):
             use_CAT_files=True,             # Use detailed CAT format files for space analysis
             CAT_files_rel_dir="cadaster/CAT_files",   # Directory containing CAT files
             compact_addresses=True,
-            pois_layer=True
+            pois_layer=True,
+            force_update=True,              # wipe central DB rows + cache shards for this code
         )
     else:
         gdf_municipality = pd.read_pickle(individual_filename, compression="gzip")
 
-    # import pprint
-    # pprint.pp(gdf_municipality[gdf_municipality["building_reference"]=="8341105DF2884A"].iloc[0].to_dict())
-    hc.utils.plot_building_reference(gdf_municipality,'8341105DF2884A',output_path="/home/gmor/test.png")
-    hc.utils.plot_building_shadows_analysis(gdf_municipality, '8341105DF2884A',output_path="/home/gmor/test2.png")
-    
+    import pprint
+    _test_br = '8341105DF2884A'
+    if _test_br not in set(gdf_municipality["building_reference"]):
+        _test_br = gdf_municipality["building_reference"].iloc[0]
+    pprint.pp(gdf_municipality[gdf_municipality["building_reference"]==_test_br].iloc[0].to_dict())
+    hc.utils.plot_building_reference(gdf_municipality,_test_br,output_path="/home/gmor/test.png")
+    # `wd=wd` auto-fetches the heavy shadow / terrain BLOB columns from
+    # the central DuckDB for this one building (excluded from the bulk
+    # `hc.merge` frame for memory reasons — see the [hc.merge] notice at
+    # the end of the run, and `hc.utils.get_heavy_columns_for_building`).
+    hc.utils.plot_building_shadows_analysis(gdf_municipality, _test_br,
+                                            output_path="/home/gmor/test2.png", wd=wd)
+
     # Save individual result
     gdf_municipality.to_pickle(individual_filename, compression="gzip")
     print(f"Individual result saved: {individual_filename}")
     print(f"Buildings processed: {len(gdf_municipality):,}")
-    
+
     all_results.append(gdf_municipality)
 
 if len(cadaster_codes)>1:

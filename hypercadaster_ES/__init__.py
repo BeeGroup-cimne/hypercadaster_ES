@@ -7,7 +7,7 @@ postal codes, elevation models, and Barcelona open data.
 
 Main functionality:
 - Download cadastral data for specified provinces/municipalities
-- Merge with external geographic and administrative datasets  
+- Merge with external geographic and administrative datasets
 - Building inference and analysis capabilities
 - Export capabilities for external simulation tools
 
@@ -21,6 +21,7 @@ Examples:
 from .functions import download, merge
 from .utils import get_ine_codes_from_bounding_box, ine_to_cadaster_codes, municipality_name
 from .mergers import aggregate_to_grid, aggregate_to_h3
+from ._db import ResultsHandle
 from . import mergers, utils, building_inference, downloaders, interoperability
 
 __version__ = "1.0.6"
@@ -31,4 +32,5 @@ __all__ = [
     "download", "merge", "get_ine_codes_from_bounding_box",
     "ine_to_cadaster_codes", "municipality_name",
     "aggregate_to_grid", "aggregate_to_h3",
+    "ResultsHandle",
 ]

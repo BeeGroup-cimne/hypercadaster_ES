@@ -3252,18 +3252,18 @@ def compact_addresses(
 # SHADOW VISUALIZATION
 # ==========================================
 
-def plot_building_shadows_analysis(gdf, building_reference, output_path=None, interactive=True, 
-                                   include_elevation=True, floor_height=None):
+def plot_building_shadows_analysis(gdf, building_reference, output_path=None, interactive=True,
+                                   include_elevation=True, floor_height=None, wd=None):
     """
     Create comprehensive shadow analysis visualization for a building.
-    
+
     This function creates multiple visualizations showing:
     - Polar plot of shadow distances by orientation
     - Building contour vs shadow distances
     - Elevation profile effects on shadows
     - Multi-floor shadow comparison
     - Interactive 3D shadow casting visualization
-    
+
     Parameters:
     -----------
     gdf : pandas.DataFrame or geopandas.GeoDataFrame
@@ -3277,9 +3277,16 @@ def plot_building_shadows_analysis(gdf, building_reference, output_path=None, in
     include_elevation : bool, default True
         Whether to include elevation data in the analysis
     floor_height : float, optional
-        Height per floor in meters for multi-floor analysis. If None, automatically 
+        Height per floor in meters for multi-floor analysis. If None, automatically
         detects from shadow data or defaults to 3.0m
-        
+    wd : str, optional
+        Working directory of the central DuckDB. When provided, missing
+        heavy columns (`br__shadows`, `br__shadows_at_distance`,
+        `br__terrain_grid` — excluded from the bulk `hc.merge` result
+        for memory reasons) are auto-fetched for this single building
+        before plotting. Without `wd`, the plot degrades gracefully but
+        the per-floor shadow + DEM panels stay empty.
+
     Returns:
     --------
     None or plotly.graph_objects.Figure
@@ -3287,15 +3294,45 @@ def plot_building_shadows_analysis(gdf, building_reference, output_path=None, in
     """
     import numpy as np
     import pandas as pd
-    
+
     # Filter data for the specific building
     building_data = gdf[gdf['building_reference'] == building_reference]
     if building_data.empty:
         print(f"No data found for building {building_reference}")
         return None
-    
+
     # Get building data
     building_row = building_data.iloc[0]
+
+    # Auto-hydrate heavy BLOB columns from the central DB if missing.
+    # `hc.merge` deliberately excludes them so the bulk frame stays small;
+    # for a single-building plot they fit easily.
+    if wd is not None:
+        from hypercadaster_ES import _db
+        cadaster_code = building_row.get("cadaster_code")
+        if cadaster_code is None and "cadaster_code" in building_row.index:
+            cadaster_code = building_row["cadaster_code"]
+        if cadaster_code is not None:
+            missing = [
+                c for c in _db.HEAVY_BLOB_COLS
+                if c.startswith("br__")
+                and (c not in building_row.index or building_row[c] is None)
+            ]
+            if missing:
+                try:
+                    fetched = get_heavy_columns_for_building(
+                        wd, str(cadaster_code), building_reference,
+                        table="br_results", columns=missing,
+                    )
+                    # `building_row` is a Series view; mutate a copy so
+                    # downstream uses see the hydrated values without
+                    # touching the caller's gdf.
+                    building_row = building_row.copy()
+                    for col, val in fetched.items():
+                        building_row[col] = val
+                except Exception as _hydrate_err:
+                    print(f"Warning: could not auto-hydrate heavy cols "
+                          f"for {building_reference}: {_hydrate_err}")
     
     # Auto-detect floor height if not provided
     if floor_height is None:
@@ -4217,15 +4254,98 @@ def agg_op(df, funcs, grouping, variable, multiplier=1, divider=1):
 
     return build_nested_dict(grouped_result, grouping, '_adjusted_value')
 
-def read_br_inferred_indicators(cadaster_code, wd):
+def _read_inferred_indicators_from_db(cadaster_code, wd, table):
+    """Read a per-municipality slice of an inferred-indicators table from
+    the central DuckDB. Returns the same pandas frame shape that the
+    pickled file used to expose. Drops the central-DB-only bookkeeping
+    columns so the result is what downstream consumers expect."""
+    from hypercadaster_ES import _db
     result_dir = results_dir_(wd)
-    return pd.read_pickle(f"{result_dir}/{cadaster_code}_br_results.pkl", compression="gzip")
+    db_path = _db.db_path(result_dir)
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(
+            f"Central DuckDB not found at {db_path}; run hc.merge(...) "
+            f"with building_parts_inference=True first."
+        )
+    con = _db.open_shard_read(db_path)
+    try:
+        return _db.read_df_safe(
+            con, table,
+            where="cadaster_code = ?", params=[cadaster_code],
+        ).drop(columns=["cadaster_code", "zone_reference"], errors="ignore")
+    finally:
+        con.close()
+
+
+def read_br_inferred_indicators(cadaster_code, wd):
+    return _read_inferred_indicators_from_db(cadaster_code, wd, "br_results")
+
 
 def read_sbr_inferred_indicators(cadaster_code, wd):
+    return _read_inferred_indicators_from_db(cadaster_code, wd, "sbr_results")
+
+
+def get_heavy_columns_for_building(wd, cadaster_code, building_reference,
+                                   *, table="br_results", columns=None):
+    """Fetch the heavy BLOB columns that `hc.merge` excludes by default.
+
+    `hc.merge` keeps memory bounded on large municipalities by NOT
+    materialising a handful of huge per-building dict columns
+    (shadows, terrain grids — see `hypercadaster_ES._db.HEAVY_BLOB_COLS`).
+    Each of those columns is ~11 GB on disk for Barcelona and explodes
+    into many tens of GB of Python dicts when unpickled into a 70 k-row
+    frame. Use this helper to retrieve them one building at a time.
+
+    Parameters
+    ----------
+    wd : str
+        Working directory (same one passed to `hc.merge`).
+    cadaster_code : str
+        Municipality cadaster code (e.g. '08900').
+    building_reference : str
+        Building reference id (e.g. '8341105DF2884A').
+    table : str, default 'br_results'
+        Source table — 'br_results' (per-building) or 'sbr_results'
+        (per single-building-reference).
+    columns : iterable[str], optional
+        Specific column names to fetch. If None, fetches every
+        HEAVY_BLOB_COL belonging to the chosen `table`.
+
+    Returns
+    -------
+    dict[str, object]
+        {column_name: unpickled_value}. Missing rows yield None for
+        every requested column.
+
+    Example
+    -------
+    >>> import hypercadaster_ES as hc
+    >>> wd = '/path/to/working_dir'
+    >>> heavy = hc.utils.get_heavy_columns_for_building(
+    ...     wd, '08900', '8341105DF2884A'
+    ... )
+    >>> set(heavy)
+    {'br__shadows', 'br__shadows_at_distance', 'br__terrain_grid'}
+    >>> heavy['br__shadows']         # dict keyed by floor number
+    {0: <shapely Polygon ...>, 1: <shapely Polygon ...>, ...}
+
+    To plot shadows for one building without manually merging, pass
+    `wd=` to `plot_building_shadows_analysis` — it will auto-hydrate
+    the missing columns for the requested building.
+    """
+    from hypercadaster_ES import _db
     result_dir = results_dir_(wd)
-    return pd.read_pickle(f"{result_dir}/{cadaster_code}_sbr_results.pkl", compression="gzip")
+    return _db.get_blob_for_building(
+        result_dir, cadaster_code, building_reference,
+        table=table, columns=columns,
+    )
+
 
 def read_addresses_indicators(cadaster_code, wd):
+    # `_no_inference.pkl` is the output of hc.merge(building_parts_inference=False)
+    # written by user scripts (e.g. examples/buildings_without_inference.py),
+    # not by this package. Until that flow also writes to the central DB
+    # (planned step 8 — see DESIGN_duckdb_migration.md), keep the pickle reader.
     result_dir = results_dir_(wd)
     return pd.read_pickle(f"{result_dir}/{cadaster_code}_no_inference.pkl", compression="gzip")
 
