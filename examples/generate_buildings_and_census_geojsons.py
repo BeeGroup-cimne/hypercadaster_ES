@@ -50,6 +50,9 @@ output_dir = "/home/gmor/Nextcloud2/Beegroup/Projects/ClimateReady-BCN/WP3-Vulne
 print("Processing buildings for GeoJSON export...")
 
 # Load processed building data
+# This dataset requires CAT-derived columns (building_area_residential) so
+# we load the full merged result. Prefer the central DuckDB; fall back to
+# the legacy pickle for backward compatibility.
 print(f"Loading building data from: {wd}")
 gdf = pd.read_pickle(f"{wd}/{'~'.join(cadaster_codes)}_only_addresses.pkl", compression="gzip")
 

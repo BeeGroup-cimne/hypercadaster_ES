@@ -34,7 +34,10 @@ wd = "/home/gmor/Nextcloud2/Beegroup/data/hypercadaster_ES"
 cadaster_codes = ["08900"]
 
 print("Loading building data with facade inference results...")
-# Load previously processed building data with building inference enabled
+# The central DuckDB is now the canonical artifact — hc.merge() writes all
+# merged data to building_results.duckdb.  We still materialise a pickle
+# here; alternatively you could query the DB directly via
+# hc.utils.read_br_inferred_indicators(code, wd).
 gdf = pd.read_pickle(f"{wd}/{'~'.join(cadaster_codes)}.pkl", compression="gzip")
 
 # Filter for buildings with valid location data

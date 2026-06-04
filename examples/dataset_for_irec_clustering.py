@@ -37,7 +37,10 @@ wd = "/home/gmor/Nextcloud2/Beegroup/data/hypercadaster_ES"
 cadaster_codes = ["08900"]
 
 print("Loading processed building data...")
-# Read the previously processed pickle file with building data
+# The central DuckDB is now the canonical artifact — hc.merge() writes all
+# merged data to building_results.duckdb.  We still materialise a pickle
+# here for the downstream IREC transform; alternatively you could query
+# the DB directly via hc.utils.read_br_inferred_indicators(code, wd).
 gdf = pd.read_pickle(f"{wd}/{'~'.join(cadaster_codes)}.pkl", compression="gzip")
 
 # Filter buildings that have valid location information

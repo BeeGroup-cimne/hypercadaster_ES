@@ -12,8 +12,63 @@ hypercadaster_ES/
 ├── 📥 downloaders.py          # Data download functionality
 ├── 🛠️ utils.py                # Utility functions and helpers
 ├── 🏗️ building_inference.py   # Advanced building analysis
-└── 🔌 interoperability.py     # External system integrations
+├── 🔌 interoperability.py     # External system integrations
+└── 🗄️ _db.py                  # DuckDB persistence layer (internal)
 ```
+
+## 🗄️ _db.py — DuckDB Persistence Layer
+
+Internal module providing the DuckDB-based storage backend that replaced pickle
+artifacts in v1.1.0. Owns connection lifecycle, schema DDL, CRS sidecar, and
+GeoDataFrame ↔ DuckDB round-trip helpers.
+
+### Core Functions
+
+| Function | Description |
+|----------|-------------|
+| ``open_db(results_dir)`` | Open central DB (auto-loads spatial extension) |
+| ``ensure_schema(con)`` | Create ``_meta`` and ``zone_status`` tables |
+| ``write_gdf(con, table, gdf)`` | Persist GeoDataFrame (geometry → native GEOMETRY) |
+| ``read_gdf(con, table)`` | Read table back as GeoDataFrame (GEOMETRY → shapely) |
+| ``write_df_safe(con, table, df)`` | DataFrame → DuckDB with lossless round-trip (dict/list → BLOB) |
+| ``read_df_safe(con, table)`` | Inverse of ``write_df_safe`` (BLOB → pickle.loads) |
+| ``read_df_safe_chunks(con, table)`` | Streaming variant — yields pandas chunks |
+| ``get_blob_for_building(results_dir, code, ref)`` | Fetch heavy per-building BLOBs on demand |
+
+### ResultsHandle
+
+``hc.ResultsHandle(db_path, cadaster_code)`` — lightweight wrapper around the
+central DuckDB. Opens a short-lived read-only connection per query.
+
+| Method | Returns |
+|--------|---------|
+| ``.sbr_relation()`` | Lazy DuckDB relation for sbr_results |
+| ``.br_relation()`` | Lazy DuckDB relation for br_results |
+| ``.sbr_iter_batches(n)`` | Iterator of pandas chunks |
+| ``.br_iter_batches(n)`` | Iterator of pandas chunks |
+| ``.sbr_to_pandas()`` | Full sbr DataFrame (escape hatch) |
+| ``.br_to_pandas()`` | Full br DataFrame (escape hatch) |
+| ``.sbr_count()`` | Row count for sbr_results |
+| ``.br_count()`` | Row count for br_results |
+
+### Database Schema
+
+**Structural tables** (created automatically):
+
+| Table | Purpose |
+|-------|---------|
+| ``_meta`` | Key-value store (CRS per table) |
+| ``zone_status`` | Progress ledger (replaces per-zone pickle existence check) |
+
+**Domain tables** (created lazily by writers):
+
+| Table | Source |
+|-------|--------|
+| ``sbr_results`` | Single-building-reference inference output (per-zone shards) |
+| ``br_results`` | Building-reference inference output (per-zone shards) |
+| ``aux_building_parts`` | Per-municipality building parts + proximity flags |
+| ``aux_footprints`` | Per-municipality floor footprints |
+| ``buildings`` | Final merged building GeoDataFrame per municipality |
 
 ## 🎮 functions.py - Main Entry Points
 

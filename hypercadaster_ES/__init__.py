@@ -24,7 +24,7 @@ from .mergers import aggregate_to_grid, aggregate_to_h3
 from ._db import ResultsHandle
 from . import mergers, utils, building_inference, downloaders, interoperability
 
-__version__ = "1.0.6"
+__version__ = "1.1.0"
 __author__ = "Jose Manuel Broto Vispe"
 __email__ = "jmbrotovispe@gmail.com"
 

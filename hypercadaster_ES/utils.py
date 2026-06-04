@@ -4342,11 +4342,35 @@ def get_heavy_columns_for_building(wd, cadaster_code, building_reference,
 
 
 def read_addresses_indicators(cadaster_code, wd):
-    # `_no_inference.pkl` is the output of hc.merge(building_parts_inference=False)
-    # written by user scripts (e.g. examples/buildings_without_inference.py),
-    # not by this package. Until that flow also writes to the central DB
-    # (planned step 8 — see DESIGN_duckdb_migration.md), keep the pickle reader.
+    """Read basic building indicators for a municipality.
+
+    When ``hc.merge(...)`` was run with ``building_parts_inference=False``,
+    the central DuckDB still carries the 12 basic columns (gml_id,
+    building_status, building_reference, ..., zone_type).  Query that
+    table directly instead of a separate pickle artifact.
+
+    Falls back to the legacy pickle path if the DuckDB table is missing
+    (e.g. old data or external producer).
+    """
+    from hypercadaster_ES import _db
     result_dir = results_dir_(wd)
+    db_path = _db.db_path(result_dir)
+    if os.path.exists(db_path):
+        try:
+            con = _db.open_shard_read(db_path)
+            try:
+                df = _db.read_df_safe(
+                    con, "buildings",
+                    where="cadaster_code = ?", params=[cadaster_code],
+                )
+                if not df.empty and set(_db.BASIC_BUILDING_COLUMNS).issubset(df.columns):
+                    return df[_db.BASIC_BUILDING_COLUMNS]
+            finally:
+                con.close()
+        except Exception:
+            pass  # fall through to legacy path
+
+    # Legacy pickle fallback — `_no_inference.pkl` written by user scripts
     return pd.read_pickle(f"{result_dir}/{cadaster_code}_no_inference.pkl", compression="gzip")
 
 # ==========================================

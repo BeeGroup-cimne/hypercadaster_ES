@@ -70,10 +70,24 @@ import hypercadaster_ES as hc
 hc.download("./data", cadaster_codes=["08900"])
 
 # Merge all data into a unified GeoDataFrame
+# (persisted to building_results.duckdb internally)
 gdf = hc.merge("./data", cadaster_codes=["08900"])
 
 # Save results
 gdf.to_pickle("barcelona_data.pkl", compression="gzip")
+```
+
+### Accessing Results via DuckDB
+The central ``building_results.duckdb`` is the canonical artifact. Query
+directly instead of materialising full GeoDataFrames:
+
+```python
+# Read inferred indicators from DB (returns pandas DataFrame)
+br = hc.utils.read_br_inferred_indicators("08900", "./data")
+
+# Fetch heavy shadow/terrain columns for one building
+heavy = hc.utils.get_heavy_columns_for_building(
+    "./data", "08900", "8341105DF2884A")
 ```
 
 For detailed installation instructions and advanced examples, see [Installation & Quick Start](docs/installation-quickstart.md).

@@ -2,6 +2,79 @@
 
 All notable changes to hypercadaster_ES will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-06-04
+
+### 🚀 DuckDB Migration — Eliminating User-Facing RAM Peaks
+
+The internal persistence layer has been migrated from pickle-based artifacts to
+**DuckDB** with native spatial support. The central `building_results.duckdb`
+file is now the canonical output of ``hc.merge()`` — pickle files are no longer
+written by the library (user scripts may still materialise and save pickles as
+an escape hatch).
+
+#### Added
+
+**DuckDB Persistence Layer** (`_db.py`)
+- Central DuckDB file per ``results_dir`` with spatial extension (native GEOMETRY)
+- Per-zone shard DBs for parallel worker writes (no single-writer contention)
+- Schema reconciliation across shards (lazy ``ALTER TABLE ADD COLUMN``)
+- Lossless round-trip for opaque Python objects (dict/list → pickled BLOB)
+- CRS sidecar storage in ``_meta`` table
+- ``ResultsHandle`` — lightweight wrapper around DB + cadaster_code
+- Streaming readers (``read_df_safe_chunks``) for bounded-RAM materialisation
+- Automatic WAL checkpointing and memory cap
+
+**API Additions**
+- ``hc.ResultsHandle`` — public class for lazy DB access
+- ``hc.utils.get_heavy_columns_for_building()`` — fetch shadow/terrain BLOBs per building
+- ``plot_zones_ratio`` parameter on ``hc.merge()`` to control plot scope
+- ``force_update`` and ``cleanup_shards`` parameters for cache management
+
+#### Changed
+
+**Building Inference Pipeline**
+- ``process_building_parts()`` now returns ``ResultsHandle`` (was ``(sbr_df, br_df)``)
+- Per-zone writes: pickle → per-zone ``{zone}.duckdb`` shard files
+- Phase A: shard ingestion via ``ATTACH``/``INSERT`` into central DB
+- Phase B materialisation removed from ``process_building_parts`` (DB is the artifact)
+- Aux frames (``gdf_global``, ``gdf_footprints_global``) stored in DuckDB tables
+- Workers query aux slices on demand instead of COW-inheriting full frames
+
+**Merger**
+- SBR aggregation rewritten in SQL (``GROUP BY`` + ``json_group_object``) —
+  replaces pandas ``groupby``/``apply`` dict construction (dominant RAM peak)
+- ``buildings`` table written to central DB for every municipality
+
+**Data Reading**
+- ``read_br_inferred_indicators()`` / ``read_sbr_inferred_indicators()`` now query DuckDB
+- ``read_addresses_indicators()`` queries DuckDB with pickle fallback
+
+#### Removed
+
+- Municipality-level pickle writes (``{code}_{sbr,br}_results.pkl``)
+- ``_read_compressed_pickle()`` and gzip/zstd dual-decoder
+- Per-zone pickle writes (replaced by shard DBs)
+- ``_downcast_floats()`` (DuckDB column types provide same memory shape)
+
+#### Performance Impact
+
+- **RAM peak**: eliminated — the full sbr/br DataFrames are no longer held
+  in-process during merging; SQL runs against the DB on disk
+- **Resume semantics**: re-running with same ``(code, results_dir)`` skips
+  completed zones (``zone_status`` table); delete the DB file for clean run
+- **Dependency**: ``duckdb >= 1.5.3`` (spatial extension)
+
+#### Migration Notes for User Scripts
+
+- ``hc.merge()`` still returns a GeoDataFrame (backward compatible)
+- The central ``building_results.duckdb`` is the persistent artifact
+- ``read_*_indicators()`` still return pandas DataFrames (signature unchanged)
+- Heavy BLOB columns (shadows, terrain grids) are excluded from bulk reads;
+  use ``hc.utils.get_heavy_columns_for_building()`` for per-building access
+- Pass ``wd=`` to ``plot_building_shadows_analysis()`` to auto-hydrate heavy columns
+
+---
+
 ## [1.0.0] - 2025-08-28
 
 ### 🚀 Major Release - Initial Public Release

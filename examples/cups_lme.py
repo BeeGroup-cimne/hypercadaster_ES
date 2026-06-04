@@ -224,6 +224,9 @@ log.info("Example normalized addresses: %s",
 # ============================================================
 
 log.info("Reading reference pickle: %s", PICKLE_FILE)
+# The central DuckDB is now the canonical artifact — hc.merge() writes
+# all merged data to building_results.duckdb.  We still read the pickle
+# here; alternatively query via hc.utils.read_br_inferred_indicators().
 gdf = pd.read_pickle(PICKLE_FILE, compression="gzip")
 
 source_crs = getattr(gdf, "crs", None) or FALLBACK_CRS

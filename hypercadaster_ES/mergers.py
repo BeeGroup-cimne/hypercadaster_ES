@@ -1018,6 +1018,25 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
                                          'n_floors_above_ground', 'building_area', 'zone_reference', 'zone_type']]
         # When building_parts_inference=True but buildings_CAT=None, keep all columns (including br__ and sbr_data)
 
+        # Persist the per-municipality result to the central DuckDB as a
+        # `buildings` table so downstream consumers (read_addresses_indicators,
+        # future MunicipalityHandle) can query on demand.
+        from hypercadaster_ES import _db as _db_mod_build
+        _build_con = _db_mod_build.open_db(results_dir)
+        try:
+            if "cadaster_code" not in building_gdf_.columns:
+                building_gdf_ = building_gdf_.assign(cadaster_code=code)
+            else:
+                building_gdf_ = building_gdf_.copy(deep=False)
+                building_gdf_["cadaster_code"] = code
+            _db_mod_build.write_gdf(
+                _build_con, "buildings", building_gdf_,
+                geom_cols=("building_geometry",),
+                if_exists="append",
+            )
+        finally:
+            _build_con.close()
+
         # Include it in the general building_gdf_
         if "building_gdf" in locals():
             if building_gdf_.crs != building_gdf.crs:

@@ -31,18 +31,33 @@ cadaster_dir = f"{WD}/cadaster"
 open_street_dir = f"{WD}/os_maps"
 DEM_raster_dir = f"{WD}/DEM_rasters"
 
-# 1. Drop the stale zone cache so process_zone has to recompute with the fix.
-for suffix in ("_sbr_results.pkl", "_br_results.pkl"):
-    p = f"{cache_dir}/{ZONE}{suffix}"
+# 1. Drop the stale zone cache (shard DB) so process_zone recomputes.
+for ext in (".duckdb", "_sbr_results.pkl", "_br_results.pkl"):
+    p = f"{cache_dir}/{ZONE}{ext}"
     if os.path.exists(p):
         os.remove(p)
         print(f"Removed stale cache: {p}")
 
-# 2. Load the prebuilt municipality auxiliaries.
-print("Loading aux1/aux2...")
-gdf_global = pd.read_pickle(f"{cache_dir}/{CODE}_aux1.pkl")
-gdf_footprints_global = pd.read_pickle(f"{cache_dir}/{CODE}_aux2.pkl")
-gdf_global = gpd.GeoDataFrame(gdf_global).set_geometry("building_part_geometry")
+# 2. Load the prebuilt municipality auxiliaries from the central DuckDB.
+# The aux pickles were replaced by aux_building_parts / aux_footprints tables
+# in building_results.duckdb (see DESIGN_duckdb_migration.md).
+print("Loading aux1/aux2 from DuckDB...")
+from hypercadaster_ES import _db as _db_mod
+_central = _db_mod.open_shard_read(_db_mod.db_path(results_dir))
+try:
+    aux_df = _db_mod.read_df_safe(
+        _central, "aux_building_parts",
+        where="cadaster_code = ?", params=[CODE],
+    )
+    footprint_df = _db_mod.read_df_safe(
+        _central, "aux_footprints",
+        where="cadaster_code = ?", params=[CODE],
+    )
+finally:
+    _central.close()
+
+gdf_global = gpd.GeoDataFrame(aux_df).set_geometry("building_part_geometry")
+gdf_footprints_global = gpd.GeoDataFrame(footprint_df).set_geometry("building_footprint_by_floor")
 
 # Mirror the production join: attach per-building elevation onto the global
 # footprints frame so the shadow-casting gate in process_zone has real
