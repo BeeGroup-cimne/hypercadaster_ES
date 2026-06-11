@@ -23,7 +23,7 @@ import geopandas as gpd
 
 # Configuration
 wd = "/home/gmor/Nextcloud2/Beegroup/data/hypercadaster_ES"
-force_update = True
+force_update = False
 cadaster_codes = ["25023"] #08900: Barcelona, 25023: Alpicat, 25285: Torrefarrera
 
 # Download all required data for all municipalities at once
@@ -68,7 +68,7 @@ for i, municipality in enumerate(cadaster_codes, 1):
         gdf_municipality = pd.read_pickle(individual_filename, compression="gzip")
 
     import pprint
-    _test_br = '6555406BG9165N'
+    _test_br = '6455445BG9165N'
     if _test_br not in set(gdf_municipality["building_reference"]):
         _test_br = gdf_municipality["building_reference"].iloc[0]
     pprint.pp(gdf_municipality[gdf_municipality["building_reference"]==_test_br].iloc[0].to_dict())

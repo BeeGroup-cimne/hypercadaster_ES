@@ -3642,16 +3642,23 @@ def _render_dem_panel(ax, terrain_grid, building_footprint_general, centroid_xy)
         elev = np.array(terrain_grid['elev'], dtype=float)
         cx_off = (nx - 1) * cell / 2.0
         cy_off = (ny - 1) * cell / 2.0
+        # gx/gy are the CENTROID coordinates of each DEM pixel.
         gx = np.arange(nx) * cell - cx_off
         gy = np.arange(ny) * cell - cy_off
 
+        # Interpolate a smooth surface treating each pixel value as a sample
+        # located at that pixel's centroid (gx[i], gy[j]); evaluate a cubic
+        # spline on a fine grid spanning the centroid hull.
         grid_x_fine, grid_y_fine, elev_fine = gx, gy, elev
         try:
-            from scipy.ndimage import zoom as _ndimage_zoom
+            from scipy.interpolate import RectBivariateSpline
             up = 5
-            elev_fine = _ndimage_zoom(elev, up, order=3, mode='nearest')
-            grid_x_fine = np.linspace(gx[0], gx[-1], elev_fine.shape[1])
-            grid_y_fine = np.linspace(gy[0], gy[-1], elev_fine.shape[0])
+            grid_x_fine = np.linspace(gx[0], gx[-1], nx * up)
+            grid_y_fine = np.linspace(gy[0], gy[-1], ny * up)
+            kx = min(3, nx - 1); ky = min(3, ny - 1)
+            if kx >= 1 and ky >= 1:
+                spline = RectBivariateSpline(gy, gx, elev, kx=ky, ky=kx)
+                elev_fine = spline(grid_y_fine, grid_x_fine)
         except ImportError:
             pass
 
@@ -3677,7 +3684,8 @@ def _render_dem_panel(ax, terrain_grid, building_footprint_general, centroid_xy)
         ax.set_xlabel('East offset (m)')
         ax.set_ylabel('North offset (m)')
         ax.set_title(
-            f'DEM  ({cell:.0f} m grid, ±{nx * cell / 2:.0f} m, bicubic ×5)'
+            f'DEM  ({cell:.0f} m grid, ±{nx * cell / 2:.0f} m, '
+            f'centroid spline ×5)'
         )
         return True
     except Exception:
@@ -4665,6 +4673,52 @@ _WALL_TYPE_COLOURS = {
 }
 _WALL_TYPE_DEFAULT = '#AAAAAA'
 
+# Horizontal structural slab/roof surfaces (br__structural_floors). Kept
+# visually distinct from the (vertical) wall palette above.
+_STRUCTURAL_FLOOR_COLOURS = {
+    'adiabatic': '#884EA0',   # slab between two floors (purple)
+    'roof':      '#C0392B',   # top exposed to air (red)
+    'floor':     '#16A085',   # underside exposed to air / overhang (teal)
+    'terrain':   '#7E5109',   # on/under ground (dark brown)
+}
+_STRUCTURAL_FLOOR_DEFAULT = '#AAAAAA'
+
+
+def _triangulate_polygon_xy(poly):
+    """Triangulate a 2-D (multi)polygon for a flat Mesh3d surface.
+
+    Returns (verts, tris) where `verts` is a list of (x, y) tuples and
+    `tris` a list of (i, j, k) index triples into `verts`. Concavities and
+    holes (patios) are respected by discarding Delaunay triangles whose
+    centroid falls outside the polygon.
+    """
+    from shapely.ops import triangulate as _shp_triangulate
+    verts, tris = [], []
+    vidx = {}
+
+    def _vi(pt):
+        key = (round(pt[0], 4), round(pt[1], 4))
+        idx = vidx.get(key)
+        if idx is None:
+            idx = len(verts)
+            vidx[key] = idx
+            verts.append(key)
+        return idx
+
+    polys = list(poly.geoms) if hasattr(poly, 'geoms') else [poly]
+    for p in polys:
+        if p is None or p.is_empty or not hasattr(p, 'exterior'):
+            continue
+        try:
+            for tri in _shp_triangulate(p):
+                if not p.contains(tri.centroid):
+                    continue
+                cc = list(tri.exterior.coords)[:3]
+                tris.append((_vi(cc[0]), _vi(cc[1]), _vi(cc[2])))
+        except Exception:
+            continue
+    return verts, tris
+
 
 def plot_building_dem(gdf, building_reference, output_path=None, wd=None, dpi=150):
     """Standalone DEM contour map for a single building.
@@ -4980,7 +5034,8 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
     row = building_data.iloc[0].copy()
 
     # ---- Auto-fetch heavy columns from DuckDB ---------------------------------
-    heavy_cols = ['br__wall_segments', 'br__shadows', 'br__terrain_grid']
+    heavy_cols = ['br__wall_segments', 'br__shadows', 'br__terrain_grid',
+                  'br__building_footprint_by_floor']
     missing = [c for c in heavy_cols
                if c not in row.index or row.get(c) is None]
     if wd is not None and missing:
@@ -5062,16 +5117,23 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
 
             cx_off = (tnx - 1) * cell / 2.0
             cy_off = (tny - 1) * cell / 2.0
-            lx = np.arange(tnx) * cell - cx_off   # already centroid-relative
+            # lx/ly are each pixel's CENTROID coordinate (centroid-relative).
+            lx = np.arange(tnx) * cell - cx_off
             ly = np.arange(tny) * cell - cy_off
 
-            # Bicubic upsample to remove blocky appearance
+            # Smooth surface by interpolating each pixel value as a sample at
+            # its centroid (lx[i], ly[j]) with a cubic spline on a fine grid.
             try:
-                from scipy.ndimage import zoom as _sz
+                from scipy.interpolate import RectBivariateSpline
                 up = 4
-                elev_f = _sz(elev, up, order=3, mode='nearest')
-                lx_f = np.linspace(lx[0], lx[-1], elev_f.shape[1])
-                ly_f = np.linspace(ly[0], ly[-1], elev_f.shape[0])
+                lx_f = np.linspace(lx[0], lx[-1], tnx * up)
+                ly_f = np.linspace(ly[0], ly[-1], tny * up)
+                kx = min(3, tnx - 1); ky = min(3, tny - 1)
+                if kx >= 1 and ky >= 1:
+                    _sp = RectBivariateSpline(ly, lx, elev, kx=ky, ky=kx)
+                    elev_f = _sp(ly_f, lx_f)
+                else:
+                    elev_f, lx_f, ly_f = elev, lx, ly
             except ImportError:
                 elev_f, lx_f, ly_f = elev, lx, ly
 
@@ -5227,6 +5289,116 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
             color=colour, opacity=1.0,
             name=label, showlegend=True, flatshading=True,
         ))
+
+    # ---- Layer 4: Structural floor/roof slabs (br__structural_floors) --------
+    # Reconstruct the horizontal slab surfaces from the per-floor footprints
+    # and classify each region with the same interface logic used during
+    # inference:  terrain (floor-0 base), adiabatic (slab between two floors),
+    # roof (top exposed to air), floor (overhang underside exposed to air).
+    fp_by_floor = row.get('br__building_footprint_by_floor')
+    if isinstance(fp_by_floor, list) and fp_by_floor:
+        try:
+            from shapely.ops import unary_union as _uu_floor
+            from shapely import wkb as _swkb_floor
+
+            def _decode_floor_geom(g):
+                if isinstance(g, (bytes, bytearray, memoryview)):
+                    try:
+                        return _swkb_floor.loads(bytes(g))
+                    except Exception:
+                        return None
+                return g
+
+            # Group footprints by floor index → union geometry per floor.
+            floor_union = {}
+            for rec in fp_by_floor:
+                try:
+                    # records are [group, floor, geometry]
+                    _fl = int(rec[1]); _g = _decode_floor_geom(rec[2])
+                except Exception:
+                    continue
+                if _g is None or getattr(_g, 'is_empty', True):
+                    continue
+                floor_union.setdefault(_fl, []).append(_g)
+            for _fl in list(floor_union):
+                try:
+                    floor_union[_fl] = _uu_floor(floor_union[_fl])
+                except Exception:
+                    floor_union[_fl] = None
+
+            above_floors = [f for f in floor_union if f >= 0]
+            max_floor = max(above_floors) if above_floors else -1
+
+            # region (polygon), type, z-elevation
+            struct_regions = []
+
+            def _safe_diff(a, b):
+                try:
+                    return a.difference(b)
+                except Exception:
+                    return None
+
+            def _safe_inter(a, b):
+                try:
+                    return a.intersection(b)
+                except Exception:
+                    return None
+
+            # Terrain: base of floor 0 at ground level (z = 0).
+            base0 = floor_union.get(0)
+            if base0 is not None and not base0.is_empty:
+                struct_regions.append((base0, 'terrain', 0.0))
+
+            for _f in range(0, max_floor + 1):
+                a = floor_union.get(_f)
+                if a is None or a.is_empty:
+                    continue
+                z_top = (_f + 1) * floor_height        # top-of-floor slab level
+                above = floor_union.get(_f + 1)
+                if above is None or above.is_empty:
+                    struct_regions.append((a, 'roof', z_top))
+                    continue
+                inter = _safe_inter(a, above)
+                roof_reg = _safe_diff(a, above)        # not covered above → roof
+                over_reg = _safe_diff(above, a)        # overhang underside → floor
+                if inter is not None and not inter.is_empty:
+                    struct_regions.append((inter, 'adiabatic', z_top))
+                if roof_reg is not None and not roof_reg.is_empty:
+                    struct_regions.append((roof_reg, 'roof', z_top))
+                if over_reg is not None and not over_reg.is_empty:
+                    struct_regions.append((over_reg, 'floor', z_top))
+
+            # Accumulate triangulated meshes per type so each type is a single
+            # toggleable legend trace.
+            struct_buckets = {}
+            for region, stype, z_val in struct_regions:
+                verts, tris = _triangulate_polygon_xy(region)
+                if not verts or not tris:
+                    continue
+                bkt = struct_buckets.setdefault(
+                    stype, {'x': [], 'y': [], 'z': [], 'i': [], 'j': [], 'k': []})
+                base = len(bkt['x'])
+                for (vx, vy) in verts:
+                    rx, ry = vx - ox, vy - oy
+                    bkt['x'].append(rx); bkt['y'].append(ry); bkt['z'].append(z_val)
+                    all_x.append(rx); all_y.append(ry); all_z.append(z_val)
+                for (ti, tj, tk) in tris:
+                    bkt['i'].append(base + ti)
+                    bkt['j'].append(base + tj)
+                    bkt['k'].append(base + tk)
+
+            for stype, b in struct_buckets.items():
+                colour = _STRUCTURAL_FLOOR_COLOURS.get(stype, _STRUCTURAL_FLOOR_DEFAULT)
+                label = f'Slab: {stype}'
+                traces.append(go.Mesh3d(
+                    x=b['x'], y=b['y'], z=b['z'],
+                    i=b['i'], j=b['j'], k=b['k'],
+                    color=colour, opacity=0.85,
+                    name=label, showlegend=True, flatshading=True,
+                    hovertemplate=f'{label}<extra></extra>',
+                ))
+        except Exception:
+            pass  # structural slabs are nice-to-have
 
     # ---- 1:1:1 aspect — XY up to 4× building span (or available data) --------
     # Z is sized to the building; XY expands to show terrain/shadow context

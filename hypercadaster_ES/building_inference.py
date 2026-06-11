@@ -118,6 +118,22 @@ def _split_segment_at_geom_boundaries(segment, geom_list, buffer=0.15, min_sub_l
     return parts if parts else [segment]
 
 
+def _floor_index_at_elevation(ground_elev, elev, ground_floor_height, floor_height):
+    """
+    Index of the above-ground floor whose vertical span contains absolute
+    elevation `elev`, for a building whose ground sits at `ground_elev`.
+    Floor 0 spans [ground, ground + ground_floor_height); each subsequent
+    floor adds `floor_height`.  Returns a negative value for elevations below
+    the ground (basement / no above-ground floor there).
+    """
+    rel = elev - ground_elev
+    if rel < 0:
+        return -1
+    if rel < ground_floor_height:
+        return 0
+    return 1 + int((rel - ground_floor_height) // floor_height)
+
+
 def _outward_probe_point(segment, building_poly, dist=0.25):
     """
     Return a Point a short distance `dist` on the OUTWARD side of `segment`
@@ -1436,6 +1452,10 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                 patios_area = {}
                 patios_n = {}
                 perimeter = {}
+                # Horizontal structural surfaces (slabs/roof), classified by
+                # air/ground/inter-floor contact. Per floor: {type: area_m2}
+                # with types adiabatic|roof|floor|terrain.
+                structural_floors = {}
                 # Five-bucket wall classification (replaces the old
                 # patios|adiabatic|air_contact scheme):
                 #   main_facade_wall  — exterior wall facing open air (was air_contact_wall);
@@ -1493,26 +1513,38 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                         .groupby("single_building_reference")["elevation"]
                         .first()
                     )
-                adjacent_roof_elev = {}
-                adj_footprint_all = {}   # {sbr: union of all floor footprints}
+                adj_footprint_all = {}   # {sbr: union of all floor footprints} — split geometry only
+                adj_floor_footprints = {}  # {sbr: {neighbour_floor_idx: geom}} — height-aware classification
+                adj_ground_elev = {}     # {sbr: ground elevation}
                 from shapely.ops import unary_union as _uu_adj
+
+                def _register_neighbour_footprints(_rows_by_group, _elev_lookup):
+                    """Populate adj_footprint_all / adj_floor_footprints /
+                    adj_ground_elev from a (group -> rows) groupby, keeping
+                    per-floor footprints so the adiabatic test can require a
+                    neighbour floor at the matching height (not just any floor
+                    in the union). Skips groups already registered."""
+                    for _sbr, _rows in _rows_by_group:
+                        if _sbr in adj_floor_footprints:
+                            continue
+                        adj_ground_elev[_sbr] = utils._coerce_scalar_float(
+                            _elev_lookup.get(_sbr, current_building_elevation), 0.0)
+                        _per_floor = {}
+                        for _fl, _fl_rows in _rows.groupby("floor"):
+                            try:
+                                _per_floor[int(_fl)] = _uu_adj(_fl_rows.geometry.values)
+                            except Exception:
+                                pass
+                        adj_floor_footprints[_sbr] = _per_floor
+                        try:
+                            adj_footprint_all[_sbr] = _uu_adj(_rows.geometry.values)
+                        except Exception:
+                            pass
 
                 # Adjacent buildings (share a parcel boundary)
                 if len(gdf_aux_footprints_) > 0:
-                    _max_floor_per_adj = gdf_aux_footprints_.groupby("group")["floor"].max()
-                    for _adj_sbr, _adj_max_f in _max_floor_per_adj.items():
-                        adjacent_roof_elev[_adj_sbr] = utils.floor_base_elevation(
-                            utils._coerce_scalar_float(
-                                adjacent_elev_by_sbr.get(_adj_sbr, current_building_elevation),
-                                0.0,
-                            ),
-                            int(_adj_max_f) + 1, ground_floor_height, floor_height,
-                        )
-                    for _adj_sbr, _adj_rows in gdf_aux_footprints_.groupby("group"):
-                        try:
-                            adj_footprint_all[_adj_sbr] = _uu_adj(_adj_rows.geometry.values)
-                        except Exception:
-                            pass
+                    _register_neighbour_footprints(
+                        gdf_aux_footprints_.groupby("group"), adjacent_elev_by_sbr)
 
                 # Nearby buildings (different parcel, same block — may still be
                 # physically touching). Also included so the adiabatic check sees
@@ -1528,22 +1560,8 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                         )
                     except Exception:
                         pass
-                    _max_floor_nearby = gdf_aux_footprints_nearby.groupby("group")["floor"].max()
-                    for _nbr_sbr, _nbr_max_f in _max_floor_nearby.items():
-                        if _nbr_sbr not in adjacent_roof_elev:
-                            adjacent_roof_elev[_nbr_sbr] = utils.floor_base_elevation(
-                                utils._coerce_scalar_float(
-                                    _nearby_elev_by_sbr.get(_nbr_sbr, current_building_elevation),
-                                    0.0,
-                                ),
-                                int(_nbr_max_f) + 1, ground_floor_height, floor_height,
-                            )
-                    for _nbr_sbr, _nbr_rows in gdf_aux_footprints_nearby.groupby("group"):
-                        if _nbr_sbr not in adj_footprint_all:
-                            try:
-                                adj_footprint_all[_nbr_sbr] = _uu_adj(_nbr_rows.geometry.values)
-                            except Exception:
-                                pass
+                    _register_neighbour_footprints(
+                        gdf_aux_footprints_nearby.groupby("group"), _nearby_elev_by_sbr)
 
                 if n_underground_floors > 0:
 
@@ -1727,20 +1745,17 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                                                 plt.close(fig)
                                             segment_assigned = "terrain_contact"
 
-                                    # 3. ADIABATIC — segment touches any floor of a
-                                    # neighbour (adjacent or nearby) AND that
-                                    # neighbour's roof is at or above this floor's
-                                    # base elevation.  Checked BEFORE party_wall: a
-                                    # tall-enough building physically behind the wall
-                                    # means no heat exchange (adiabatic) regardless
-                                    # of whether a parcel boundary also runs there.
-                                    # Union of all neighbour floors (adj_footprint_all)
-                                    # handles the case where a 2-floor neighbour must
-                                    # be visible from floor 3+ of a taller building.
-                                    # Per-segment splitting upstream ensures only the
-                                    # portion actually backed by the neighbour gets
-                                    # this label; the rest falls through to party_wall
-                                    # or main_facade.
+                                    # 3. ADIABATIC — a neighbour building floor sits
+                                    # immediately behind this wall AT THIS FLOOR's
+                                    # height.  Checked BEFORE party_wall: a building
+                                    # physically behind the wall means no heat
+                                    # exchange regardless of whether a parcel boundary
+                                    # also runs there.  Height-aware: the neighbour's
+                                    # footprint AT THE FLOOR that vertically aligns
+                                    # with the current floor is used (not the union of
+                                    # all neighbour floors), so a shorter or set-back
+                                    # neighbour no longer shelters our upper floors
+                                    # just because its ground floor was in contact.
                                     if segment_assigned is None:
                                         # Probe just outside the wall: a wall is
                                         # only adiabatic if a neighbour footprint
@@ -1749,37 +1764,46 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                                         # (probe is None) we fall back to the
                                         # looser coincidence test.
                                         _probe = _outward_probe_point(segment, geom)
-                                        for adj_sbr, adj_union_geom in adj_footprint_all.items():
+                                        _floor_mid_elev = (floor_base_elev + floor_top_elev) / 2.0
+                                        for adj_sbr, _per_floor_fp in adj_floor_footprints.items():
+                                            # Which neighbour floor (by its own ground
+                                            # elevation) spans our floor's mid-height?
+                                            _g_n = adj_ground_elev.get(
+                                                adj_sbr, current_building_elevation)
+                                            _fn = _floor_index_at_elevation(
+                                                _g_n, _floor_mid_elev,
+                                                ground_floor_height, floor_height)
+                                            _nb_fp = _per_floor_fp.get(_fn)
+                                            if _nb_fp is None:
+                                                # Neighbour has no floor at this height.
+                                                continue
                                             if _probe is not None:
                                                 try:
-                                                    behind = adj_union_geom.buffer(0.05).contains(_probe)
+                                                    behind = _nb_fp.buffer(0.05).contains(_probe)
                                                 except Exception:
                                                     behind = False
                                                 if not behind:
                                                     continue
                                             elif not utils.segment_intersects_with_tolerance(
-                                                    segment, adj_union_geom,
+                                                    segment, _nb_fp,
                                                     buffer_distance=0.1,
                                                     area_percentage_threshold=15
                                             ):
                                                 continue
-                                            adj_top = adjacent_roof_elev.get(
-                                                adj_sbr, float("-inf"))
-                                            if adj_top >= floor_base_elev:
-                                                adiabatic_wall[floor] += round(segment.length, 2)
-                                                if plots:
-                                                    fig, ax = plt.subplots()
-                                                    utils.plot_shapely_geometries(
-                                                        geometries=[geom] + [segment],
-                                                        title=f"Wall ID: {i}, floor: {floor},\n"
-                                                              f"orientation: {segment_orientation}, "
-                                                              f"type: adiabatic",
-                                                        ax=ax,
-                                                        contextual_geometry=building_geom)
-                                                    pdf.savefig(fig)
-                                                    plt.close(fig)
-                                                segment_assigned = "adiabatic"
-                                                break
+                                            adiabatic_wall[floor] += round(segment.length, 2)
+                                            if plots:
+                                                fig, ax = plt.subplots()
+                                                utils.plot_shapely_geometries(
+                                                    geometries=[geom] + [segment],
+                                                    title=f"Wall ID: {i}, floor: {floor},\n"
+                                                          f"orientation: {segment_orientation}, "
+                                                          f"type: adiabatic",
+                                                    ax=ax,
+                                                    contextual_geometry=building_geom)
+                                                pdf.savefig(fig)
+                                                plt.close(fig)
+                                            segment_assigned = "adiabatic"
+                                            break
 
                                     # 4. PARTY_WALL — segment lies on a parcel
                                     # boundary with no tall-enough building behind it
@@ -1854,6 +1878,64 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                         party_wall_significant_orientations.extend(flagged)
                         party_wall_significant_orientations_by_floor[floor] = flagged
                     party_wall_significant_orientations = list(set(party_wall_significant_orientations))
+
+                    # --- Horizontal structural surfaces (br__structural_floors) ---
+                    # Classify every horizontal slab/roof surface by its contact:
+                    #   terrain   — base of floor 0 (+ underground slabs); on/under ground
+                    #   adiabatic — slab between two stacked floors (A_F ∩ A_{F+1})
+                    #   roof      — top of floor F not covered above (air above)
+                    #   floor     — underside of floor F+1 overhanging floor F (air below)
+                    # Interface-based accounting avoids double counting: each
+                    # surface is attributed once, to the lower floor of its
+                    # interface (overhang underside attributed to the upper floor).
+                    from shapely.ops import unary_union as _uu_struct
+                    _floor_union = {}
+                    for _f in range(n_floors + 1):
+                        _geoms_f = gdf_aux_footprint_building[
+                            gdf_aux_footprint_building["floor"] == _f]["geometry"].values
+                        try:
+                            _floor_union[_f] = _uu_struct(_geoms_f) if len(_geoms_f) else None
+                        except Exception:
+                            _floor_union[_f] = None
+
+                    for _f in range(n_floors + 1):
+                        structural_floors[_f] = {
+                            "adiabatic": 0.0, "roof": 0.0, "floor": 0.0, "terrain": 0.0}
+
+                    # Ground floor base sits on terrain.
+                    if _floor_union.get(0) is not None:
+                        structural_floors[0]["terrain"] = round(_floor_union[0].area, 2)
+
+                    for _f in range(n_floors + 1):
+                        _a = _floor_union.get(_f)
+                        if _a is None or _a.is_empty:
+                            continue
+                        _above = _floor_union.get(_f + 1)
+                        if _above is None or _above.is_empty:
+                            # Nothing above — whole top surface is roof.
+                            structural_floors[_f]["roof"] += round(_a.area, 2)
+                            continue
+                        try:
+                            _inter = _a.intersection(_above)
+                            _inter_area = _inter.area if not _inter.is_empty else 0.0
+                        except Exception:
+                            _inter_area = 0.0
+                        # Slab shared by both floors → between floors → adiabatic.
+                        structural_floors[_f]["adiabatic"] += round(_inter_area, 2)
+                        # Part of this floor's top not covered above → roof.
+                        structural_floors[_f]["roof"] += round(max(_a.area - _inter_area, 0.0), 2)
+                        # Part of the floor above not supported below → overhang
+                        # underside exposed to air → floor (attributed to F+1).
+                        structural_floors[_f + 1]["floor"] += round(
+                            max(_above.area - _inter_area, 0.0), 2)
+
+                    # Underground floor slabs are surrounded by ground → terrain.
+                    if n_underground_floors > 0:
+                        for _uf in range(1, n_underground_floors + 1):
+                            structural_floors.setdefault(
+                                -_uf, {"adiabatic": 0.0, "roof": 0.0, "floor": 0.0, "terrain": 0.0})
+                            structural_floors[-_uf]["terrain"] = round(
+                                underground_floor_area.get(_uf, 0.0), 2)
 
                     # Close the PDF file for the current building
                     if plots:
@@ -2178,6 +2260,17 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                     'sbr__terrain_contact_wall': np.sum([terrain_contact_wall[floor] for floor in range(n_floors + 1)]) if terrain_contact_wall != {} else 0.0,
                     'sbr__patios_wall_by_floor': [patios_wall[floor] for floor in range(n_floors + 1)] if patios_wall != {} else [],
                     'sbr__patios_wall_total': np.sum([patios_wall[floor] for floor in range(n_floors + 1)]) if patios_wall != {} else 0.0,
+                    # Horizontal structural surfaces classified by contact type
+                    # (adiabatic|roof|floor|terrain). _by_floor is above-ground
+                    # only; the total includes underground (terrain) slabs.
+                    'sbr__structural_floors_by_floor': {
+                        _t: [structural_floors[floor][_t] for floor in range(n_floors + 1)]
+                        for _t in ("adiabatic", "roof", "floor", "terrain")
+                    } if structural_floors != {} else {},
+                    'sbr__structural_floors': {
+                        _t: round(np.sum([structural_floors[floor][_t] for floor in structural_floors]), 2)
+                        for _t in ("adiabatic", "roof", "floor", "terrain")
+                    } if structural_floors != {} else {},
                     # Per-segment wall records (energy-simulation interop).
                     # Heavy column — excluded from the bulk read path; fetch
                     # on-demand via `utils.get_heavy_columns_for_building`.
@@ -2399,6 +2492,21 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                         'br__patios_wall_by_floor': [[sum(values) for values in zip_longest(
                             *sbr_results['sbr__patios_wall_by_floor'], fillvalue=0)]],
                         'br__patios_wall_total': [sum(sbr_results['sbr__patios_wall_total'])],
+                        # Horizontal structural surfaces by contact type. Per
+                        # type, _by_floor lists are summed element-wise across
+                        # sbrs; totals are summed scalars.
+                        'br__structural_floors_by_floor': [{
+                            _t: [sum(vals) for vals in zip_longest(
+                                *(d.get(_t, []) for d in sbr_results["sbr__structural_floors_by_floor"]
+                                  if isinstance(d, dict)),
+                                fillvalue=0)]
+                            for _t in ("adiabatic", "roof", "floor", "terrain")
+                        }],
+                        'br__structural_floors': [{
+                            _t: round(sum(d.get(_t, 0) for d in sbr_results["sbr__structural_floors"]
+                                          if isinstance(d, dict)), 2)
+                            for _t in ("adiabatic", "roof", "floor", "terrain")
+                        }],
                         # Per-segment wall records concatenated across sbrs.
                         # Heavy column — same fetch model as br__shadows.
                         'br__wall_segments': [sum(sbr_results['sbr__wall_segments'].tolist(), start=[])],
