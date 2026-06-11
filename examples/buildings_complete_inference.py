@@ -17,18 +17,14 @@ Key features demonstrated:
 Author: hypercadaster_ES examples
 """
 import os.path
-
 import hypercadaster_ES as hc
 import pandas as pd
 import geopandas as gpd
 
 # Configuration
-# Working directory where all data will be stored
 wd = "/home/gmor/Nextcloud2/Beegroup/data/hypercadaster_ES"
-
-# Municipality codes to analyze
-# (08900: Barcelona, 25023: Alpicat, 25285: Torrefarrera - last two, both in Lleida province)
-cadaster_codes = ["25023"]
+force_update = True
+cadaster_codes = ["25023"] #08900: Barcelona, 25023: Alpicat, 25285: Torrefarrera
 
 # Download all required data for all municipalities at once
 print("Downloading cadastral and auxiliary data for all municipalities...")
@@ -49,7 +45,7 @@ for i, municipality in enumerate(cadaster_codes, 1):
     print(f"\n[{i}/{len(cadaster_codes)}] Processing municipality: {municipality}")
     print("-" * 50)
     individual_filename = f"{wd}/{municipality}_complete_inference.pkl"
-    if not os.path.exists(individual_filename):
+    if force_update or not os.path.exists(individual_filename):
         # Process single municipality with full inference
         gdf_municipality = hc.merge(
             wd=wd,
@@ -66,13 +62,13 @@ for i, municipality in enumerate(cadaster_codes, 1):
             CAT_files_rel_dir="cadaster/CAT_files",   # Directory containing CAT files
             compact_addresses=True,
             pois_layer=True,
-            force_update=True,              # wipe central DB rows + cache shards for this code
+            force_update=force_update,              # wipe central DB rows + cache shards for this code
         )
     else:
         gdf_municipality = pd.read_pickle(individual_filename, compression="gzip")
 
     import pprint
-    _test_br = '8341105DF2884A'
+    _test_br = '6555406BG9165N'
     if _test_br not in set(gdf_municipality["building_reference"]):
         _test_br = gdf_municipality["building_reference"].iloc[0]
     pprint.pp(gdf_municipality[gdf_municipality["building_reference"]==_test_br].iloc[0].to_dict())
@@ -81,8 +77,10 @@ for i, municipality in enumerate(cadaster_codes, 1):
     # the central DuckDB for this one building (excluded from the bulk
     # `hc.merge` frame for memory reasons — see the [hc.merge] notice at
     # the end of the run, and `hc.utils.get_heavy_columns_for_building`).
-    hc.utils.plot_building_shadows_analysis(gdf_municipality, _test_br,
-                                            output_path="/home/gmor/test2.png", wd=wd)
+    hc.utils.plot_building_shadows_analysis(gdf_municipality, _test_br, output_path="/home/gmor/test2.png", wd=wd)
+    hc.utils.plot_building_dem(gdf_municipality, _test_br, output_path="/home/gmor/test3.png", wd=wd, dpi=30)
+    hc.utils.plot_building_geometry(gdf_municipality, _test_br, output_path="/home/gmor/test4.png", wd=wd)
+    hc.utils.plot_building_3d_geometry(gdf_municipality, _test_br, output_path="/home/gmor/test5.png", wd=wd)
 
     # Save individual result
     gdf_municipality.to_pickle(individual_filename, compression="gzip")
@@ -90,39 +88,39 @@ for i, municipality in enumerate(cadaster_codes, 1):
     print(f"Buildings processed: {len(gdf_municipality):,}")
 
     all_results.append(gdf_municipality)
-
-if len(cadaster_codes)>1:
-
-    # Combine all results
-    print("\n" + "="*60)
-    print("COMBINING RESULTS FROM ALL MUNICIPALITIES")
-    print("="*60)
-
-    if len(all_results) > 1:
-        print("Concatenating results from all municipalities...")
-        combined_gdf = pd.concat(all_results, ignore_index=True)
-    else:
-        combined_gdf = all_results[0]
-
-    # Save combined results
-    output_filename = f"{wd}/{'~'.join(cadaster_codes)}_complete_inference.pkl"
-    print(f"Saving combined results to: {output_filename}")
-    combined_gdf.to_pickle(output_filename, compression="gzip")
-
-    # Summary statistics
-    print("\n" + "="*60)
-    print("ANALYSIS COMPLETED")
-    print("="*60)
-    print(f"Total buildings processed: {len(combined_gdf):,}")
-    print(f"Municipalities analyzed: {len(cadaster_codes)}")
-    print(f"Municipality breakdown:")
-    for municipality in cadaster_codes:
-        count = len(combined_gdf[combined_gdf['processing_municipality'] == municipality])
-        print(f"  - {municipality}: {count:,} buildings")
-
-    print(f"\nResults saved with compression to reduce file size.")
-    print(f"Individual files: [municipality]_complete_inference.pkl")
-    print(f"Combined file: {'~'.join(cadaster_codes)}_complete_inference.pkl")
+#
+# if len(cadaster_codes)>1:
+#
+#     # Combine all results
+#     print("\n" + "="*60)
+#     print("COMBINING RESULTS FROM ALL MUNICIPALITIES")
+#     print("="*60)
+#
+#     if len(all_results) > 1:
+#         print("Concatenating results from all municipalities...")
+#         combined_gdf = pd.concat(all_results, ignore_index=True)
+#     else:
+#         combined_gdf = all_results[0]
+#
+#     # Save combined results
+#     output_filename = f"{wd}/{'~'.join(cadaster_codes)}_complete_inference.pkl"
+#     print(f"Saving combined results to: {output_filename}")
+#     combined_gdf.to_pickle(output_filename, compression="gzip")
+#
+#     # Summary statistics
+#     print("\n" + "="*60)
+#     print("ANALYSIS COMPLETED")
+#     print("="*60)
+#     print(f"Total buildings processed: {len(combined_gdf):,}")
+#     print(f"Municipalities analyzed: {len(cadaster_codes)}")
+#     print(f"Municipality breakdown:")
+#     for municipality in cadaster_codes:
+#         count = len(combined_gdf[combined_gdf['processing_municipality'] == municipality])
+#         print(f"  - {municipality}: {count:,} buildings")
+#
+#     print(f"\nResults saved with compression to reduce file size.")
+#     print(f"Individual files: [municipality]_complete_inference.pkl")
+#     print(f"Combined file: {'~'.join(cadaster_codes)}_complete_inference.pkl")
 
 # Note: The following commented list contains problematic zone references
 # from Barcelona analysis that may require special handling in future versions

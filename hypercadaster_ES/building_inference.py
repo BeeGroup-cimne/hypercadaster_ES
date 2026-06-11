@@ -39,10 +39,10 @@ from tqdm import tqdm
 
 # Geospatial libraries
 import geopandas as gpd
-from shapely.ops import linemerge
+from shapely.ops import linemerge, substring as _shp_substring
 from shapely.geometry.polygon import orient
 from shapely.geometry import (Polygon, LineString, LinearRing, MultiPolygon, MultiLineString,
-                              GeometryCollection)
+                              GeometryCollection, Point)
 
 # Visualization
 import matplotlib
@@ -66,6 +66,96 @@ warnings.filterwarnings(
 # inferred result rows. We bin them spatially so chunking stays balanced.
 NEARBY_ZONE_PREFIX = "_nb_"
 NEARBY_GRID_SIZE_M = 200
+
+
+def _split_segment_at_geom_boundaries(segment, geom_list, buffer=0.15, min_sub_len=0.05):
+    """
+    Split `segment` (a LineString) at points where any geometry in
+    `geom_list` crosses in or out (buffered boundary intersection).
+    Returns a list of sub-LineStrings of at least `min_sub_len` metres.
+    When no split points are found the original segment is returned as a
+    one-element list.
+    """
+    seg_len = segment.length
+    if seg_len < 1e-6 or not geom_list:
+        return [segment]
+    params = set()
+    for geom in geom_list:
+        try:
+            bnd = geom.buffer(buffer).boundary
+            inter = segment.intersection(bnd)
+        except Exception:
+            continue
+        if inter.is_empty:
+            continue
+        pts = list(inter.geoms) if hasattr(inter, 'geoms') else [inter]
+        for pt in pts:
+            try:
+                t = segment.project(pt) / seg_len
+            except Exception:
+                continue
+            margin = min_sub_len / seg_len
+            if margin < t < 1.0 - margin:
+                params.add(round(t, 6))
+    if not params:
+        return [segment]
+    parts = []
+    prev = 0.0
+    for t in sorted(params):
+        try:
+            sub = _shp_substring(segment, prev, t, normalized=True)
+            if sub.length >= min_sub_len:
+                parts.append(sub)
+        except Exception:
+            pass
+        prev = t
+    try:
+        sub = _shp_substring(segment, prev, 1.0, normalized=True)
+        if sub.length >= min_sub_len:
+            parts.append(sub)
+    except Exception:
+        pass
+    return parts if parts else [segment]
+
+
+def _outward_probe_point(segment, building_poly, dist=0.25):
+    """
+    Return a Point a short distance `dist` on the OUTWARD side of `segment`
+    (the side facing away from `building_poly`'s interior), measured from the
+    segment midpoint along its perpendicular.  Returns None when the outward
+    side cannot be disambiguated.
+
+    Used to decide whether a wall is truly adiabatic: only if a neighbour's
+    footprint sits immediately behind the wall (outward side) is it shared.
+    A footprint that merely runs near/parallel on the interior side must not
+    flip the wall to adiabatic.
+    """
+    try:
+        (x1, y1), (x2, y2) = segment.coords[0], segment.coords[-1]
+    except Exception:
+        return None
+    dx, dy = x2 - x1, y2 - y1
+    length = math.hypot(dx, dy)
+    if length < 1e-9:
+        return None
+    # Unit perpendicular.
+    px, py = -dy / length, dx / length
+    mid = segment.interpolate(0.5, normalized=True)
+    cand_a = Point(mid.x + px * dist, mid.y + py * dist)
+    cand_b = Point(mid.x - px * dist, mid.y - py * dist)
+    try:
+        inner = building_poly.buffer(0.01)
+        a_in = inner.contains(cand_a)
+        b_in = inner.contains(cand_b)
+    except Exception:
+        return None
+    if a_in and not b_in:
+        return cand_b
+    if b_in and not a_in:
+        return cand_a
+    # Ambiguous (both inside a concave nook, or both outside) — caller falls
+    # back to the looser coincidence test.
+    return None
 
 
 def _force_reset_code(results_dir, code, _db_mod):
@@ -110,12 +200,10 @@ def _force_reset_code(results_dir, code, _db_mod):
             except Exception:
                 pass
             for tbl in ("sbr_results", "br_results",
-                        "aux_building_parts", "aux_footprints"):
+                        "aux_building_parts", "aux_footprints",
+                        "_br_merged"):
                 try:
-                    con.execute(
-                        f'DELETE FROM "main"."{tbl}" WHERE cadaster_code = ?',
-                        [code],
-                    )
+                    con.execute(f'DROP TABLE IF EXISTS "main"."{tbl}"')
                 except Exception:
                     pass
             try:
@@ -809,167 +897,171 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
         # ----------------------------------------------------------------
         from hypercadaster_ES import _db as _db_mod
         central_con = _db_mod.open_db(results_dir)
-        try:
-            # Clean up any orphan rows left by a previous run that died
-            # between an INSERT and the mark_zone for the same zone (no
-            # transaction boundary covered that gap in earlier versions).
-            # We use zone_status as the source of truth: any rows in the
-            # result tables whose (cadaster_code, zone_reference) isn't
-            # marked 'ok' are partial state and must be discarded so the
-            # re-ingest of that zone doesn't duplicate rows.
-            for _tbl in ("sbr_results", "br_results"):
-                try:
-                    central_con.execute(
-                        f'DELETE FROM "{_tbl}" '
-                        f'WHERE cadaster_code = ? '
-                        f'AND zone_reference NOT IN ('
-                        f'    SELECT zone_reference FROM zone_status '
-                        f'    WHERE cadaster_code = ? AND state = \'ok\''
-                        f')',
-                        [code, code],
-                    )
-                except Exception:
-                    pass  # table may not exist yet on the very first run
-
-            # Phase A short-circuit. If a previous run already aggregated
-            # every expected zone (zone_status marks them all 'ok' and the
-            # tables exist), skip straight to Phase B. Avoids redoing the
-            # ~33 min ATTACH loop after a Phase B crash on Barcelona.
-            def _phase_a_can_skip():
-                try:
-                    have_tables = {
-                        r[0] for r in central_con.execute(
-                            "SELECT table_name FROM information_schema.tables "
-                            "WHERE table_schema = 'main'"
-                        ).fetchall()
-                    }
-                    if not {"sbr_results", "br_results"} <= have_tables:
-                        return False
-                    done = _db_mod.completed_zones(central_con, code)
-                    return set(ok_zone_refs).issubset(done)
-                except Exception:
-                    return False
-
-            if _phase_a_can_skip():
-                sys.stderr.write(
-                    f"Phase A: all {len(ok_zone_refs)} zones already aggregated "
-                    f"into central DB; skipping ATTACH loop\n"
+        # NOTE: we don't close central_con here — ownership is passed to
+        # ResultsHandle which hands it to mergers.py.
+        # Clean up any orphan rows left by a previous run that died
+        # between an INSERT and the mark_zone for the same zone (no
+        # transaction boundary covered that gap in earlier versions).
+        # We use zone_status as the source of truth: any rows in the
+        # result tables whose (cadaster_code, zone_reference) isn't
+        # marked 'ok' are partial state and must be discarded so the
+        # re-ingest of that zone doesn't duplicate rows.
+        for _tbl in ("sbr_results", "br_results"):
+            try:
+                central_con.execute(
+                    f'DELETE FROM "{_tbl}" '
+                    f'WHERE cadaster_code = ? '
+                    f'AND zone_reference NOT IN ('
+                    f'    SELECT zone_reference FROM zone_status '
+                    f'    WHERE cadaster_code = ? AND state = \'ok\''
+                    f')',
+                    [code, code],
                 )
-                n_aggregated = len(ok_zone_refs)
-            else:
-                # Incremental: skip zones already marked 'ok', and lazily
-                # extend the central schema as new shards introduce new
-                # CAT-derived columns. Per-zone schemas vary in this
-                # codebase (process_zone's merges with CAT data produce
-                # different column sets per zone), so the central table
-                # is the union of every shard's columns rather than any
-                # single shard's schema.
-                done_zones = _db_mod.completed_zones(central_con, code)
-                already_done = sum(1 for zr in ok_zone_refs if zr in done_zones)
-                if already_done:
-                    sys.stderr.write(
-                        f"Phase A: resuming with {already_done}/{len(ok_zone_refs)} "
-                        f"zones already aggregated\n"
-                    )
+            except Exception:
+                pass  # table may not exist yet on the very first run
 
-                agg_bar = tqdm(total=len(ok_zone_refs), desc="Aggregating zone shards",
-                               mininterval=1.0, leave=True, ncols=80)
-                agg_bar.update(already_done)
-                n_aggregated = already_done
+        # Phase A short-circuit. If a previous run already aggregated
+        # every expected zone (zone_status marks them all 'ok' and the
+        # tables exist), skip straight to Phase B. Avoids redoing the
+        # ~33 min ATTACH loop after a Phase B crash on Barcelona.
+        def _phase_a_can_skip():
+            try:
+                have_tables = {
+                    r[0] for r in central_con.execute(
+                        "SELECT table_name FROM information_schema.tables "
+                        "WHERE table_schema = 'main'"
+                    ).fetchall()
+                }
+                if not {"sbr_results", "br_results"} <= have_tables:
+                    return False
+                done = _db_mod.completed_zones(central_con, code)
+                return set(ok_zone_refs).issubset(done)
+            except Exception:
+                return False
 
-                for zr in ok_zone_refs:
-                    if zr in done_zones:
-                        continue
-                    sp = f"{cache_dir}/{zr}.duckdb"
-                    if not os.path.exists(sp):
-                        agg_bar.write(f"Missing shard for zone '{zr}'; skipping")
-                        agg_bar.update(1)
-                        continue
-                    try:
-                        central_con.execute(f"ATTACH '{sp}' AS shard (READ_ONLY)")
-                        try:
-                            # Transactional: either both result tables get
-                            # this zone's rows AND mark_zone fires, or none
-                            # does. No half-state for the next run to trip on.
-                            central_con.execute("BEGIN TRANSACTION")
-                            try:
-                                bk = {"cadaster_code": code, "zone_reference": zr}
-                                _db_mod.ingest_shard_table(
-                                    central_con,
-                                    shard_alias="shard",
-                                    shard_table="sbr_results",
-                                    central_table="sbr_results",
-                                    bookkeeping=bk,
-                                )
-                                _db_mod.ingest_shard_table(
-                                    central_con,
-                                    shard_alias="shard",
-                                    shard_table="br_results",
-                                    central_table="br_results",
-                                    bookkeeping=bk,
-                                )
-                                _db_mod.mark_zone(central_con, code, zr, "ok")
-                                central_con.execute("COMMIT")
-                                n_aggregated += 1
-                            except Exception:
-                                central_con.execute("ROLLBACK")
-                                raise
-                        finally:
-                            central_con.execute("DETACH shard")
-                    except Exception as _agg_err:
-                        agg_bar.write(
-                            f"Shard aggregation failed for '{zr}' "
-                            f"({type(_agg_err).__name__}: {_agg_err}); skipping"
-                        )
+        if _phase_a_can_skip():
+            sys.stderr.write(
+                f"Phase A: all {len(ok_zone_refs)} zones already aggregated "
+                f"into central DB; skipping ATTACH loop\n"
+            )
+            n_aggregated = len(ok_zone_refs)
+        else:
+            # Incremental: skip zones already marked 'ok', and lazily
+            # extend the central schema as new shards introduce new
+            # CAT-derived columns. Per-zone schemas vary in this
+            # codebase (process_zone's merges with CAT data produce
+            # different column sets per zone), so the central table
+            # is the union of every shard's columns rather than any
+            # single shard's schema.
+            done_zones = _db_mod.completed_zones(central_con, code)
+            already_done = sum(1 for zr in ok_zone_refs if zr in done_zones)
+            if already_done:
+                sys.stderr.write(
+                    f"Phase A: resuming with {already_done}/{len(ok_zone_refs)} "
+                    f"zones already aggregated\n"
+                )
+
+            agg_bar = tqdm(total=len(ok_zone_refs), desc="Aggregating zone shards",
+                           mininterval=1.0, leave=True, ncols=80)
+            agg_bar.update(already_done)
+            n_aggregated = already_done
+
+            for zr in ok_zone_refs:
+                if zr in done_zones:
+                    continue
+                sp = f"{cache_dir}/{zr}.duckdb"
+                if not os.path.exists(sp):
+                    agg_bar.write(f"Missing shard for zone '{zr}'; skipping")
                     agg_bar.update(1)
-                    # Periodic CHECKPOINT flushes DuckDB's WAL and releases
-                    # transient memory so the parent's heap stays flat
-                    # across thousands of shards instead of growing
-                    # linearly until OOM.
-                    if (n_aggregated and n_aggregated % 200 == 0):
-                        _db_mod.maybe_checkpoint(central_con)
-                agg_bar.close()
-                _db_mod.maybe_checkpoint(central_con)
-
-            # Post-Phase-A cleanup: drop cache shards whose data is now
-            # safely in the central DB. The worker-skip filter (above)
-            # ensures future runs don't re-compute these zones. Failure
-            # of an individual unlink is logged but not fatal.
-            if cleanup_shards:
+                    continue
                 try:
-                    has_central_data = central_con.execute(
-                        'SELECT 1 FROM "main"."sbr_results" '
-                        'WHERE cadaster_code = ? LIMIT 1', [code],
-                    ).fetchone() is not None
-                except Exception:
-                    has_central_data = False
+                    central_con.execute(f"ATTACH '{sp}' AS shard (READ_ONLY)")
+                    try:
+                        # Transactional: either both result tables get
+                        # this zone's rows AND mark_zone fires, or none
+                        # does. No half-state for the next run to trip on.
+                        central_con.execute("BEGIN TRANSACTION")
+                        try:
+                            bk = {"cadaster_code": code, "zone_reference": zr}
+                            _db_mod.ingest_shard_table(
+                                central_con,
+                                shard_alias="shard",
+                                shard_table="sbr_results",
+                                central_table="sbr_results",
+                                bookkeeping=bk,
+                            )
+                            _db_mod.ingest_shard_table(
+                                central_con,
+                                shard_alias="shard",
+                                shard_table="br_results",
+                                central_table="br_results",
+                                bookkeeping=bk,
+                            )
+                            _db_mod.mark_zone(central_con, code, zr, "ok")
+                            central_con.execute("COMMIT")
+                            n_aggregated += 1
+                        except Exception:
+                            central_con.execute("ROLLBACK")
+                            raise
+                    finally:
+                        central_con.execute("DETACH shard")
+                except Exception as _agg_err:
+                    agg_bar.write(
+                        f"Shard aggregation failed for '{zr}' "
+                        f"({type(_agg_err).__name__}: {_agg_err}); skipping"
+                    )
+                agg_bar.update(1)
+                # Periodic CHECKPOINT flushes DuckDB's WAL and releases
+                # transient memory so the parent's heap stays flat
+                # across thousands of shards instead of growing
+                # linearly until OOM.
+                if (n_aggregated and n_aggregated % 200 == 0):
+                    _db_mod.maybe_checkpoint(central_con)
+            agg_bar.close()
+            _db_mod.maybe_checkpoint(central_con)
 
-                if has_central_data:
-                    done_now = _db_mod.completed_zones(central_con, code)
-                    deleted = 0
-                    for zr in done_now:
-                        sp = f"{cache_dir}/{zr}.duckdb"
-                        if os.path.exists(sp):
-                            try:
-                                os.remove(sp); deleted += 1
-                            except OSError as _e:
-                                sys.stderr.write(
-                                    f"[cleanup_shards] could not remove {sp}: {_e}\n"
-                                )
-                    if deleted:
-                        sys.stderr.write(
-                            f"[cleanup_shards] removed {deleted} aggregated shards "
-                            f"from cache for cadaster_code={code}\n"
-                        )
-        finally:
-            central_con.close()
+        # Post-Phase-A cleanup: drop cache shards whose data is now
+        # safely in the central DB. The worker-skip filter (above)
+        # ensures future runs don't re-compute these zones. Failure
+        # of an individual unlink is logged but not fatal.
+        if cleanup_shards:
+            try:
+                has_central_data = central_con.execute(
+                    'SELECT 1 FROM "main"."sbr_results" '
+                    'WHERE cadaster_code = ? LIMIT 1', [code],
+                ).fetchone() is not None
+            except Exception:
+                has_central_data = False
+
+            if has_central_data:
+                done_now = _db_mod.completed_zones(central_con, code)
+                deleted = 0
+                for zr in done_now:
+                    sp = f"{cache_dir}/{zr}.duckdb"
+                    if os.path.exists(sp):
+                        try:
+                            os.remove(sp); deleted += 1
+                        except OSError as _e:
+                            sys.stderr.write(
+                                f"[cleanup_shards] could not remove {sp}: {_e}\n"
+                            )
+                if deleted:
+                    sys.stderr.write(
+                        f"[cleanup_shards] removed {deleted} aggregated shards "
+                        f"from cache for cadaster_code={code}\n"
+                    )
+        # Do NOT close central_con here — pass ownership to ResultsHandle.
+        # The caller (mergers.py) will close it after consuming the handle.
 
     # Phase B materialisation is gone — the central DB IS the artifact.
     # Return a lightweight handle; the caller (mergers.py) consumes it
-    # via SQL instead of materialising full DataFrames.
+    # via SQL instead of materialising full DataFrames. Pass the open
+    # central_con so the handle reuses it and avoids the "different
+    # configuration" DuckDB error.
     from hypercadaster_ES import _db as _db_mod_handle
     return _db_mod_handle.ResultsHandle(
-        _db_mod_handle.db_path(results_dir), code
+        _db_mod_handle.db_path(results_dir), code,
+        parent_con=central_con,
     )
 
 
@@ -1402,6 +1494,10 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                         .first()
                     )
                 adjacent_roof_elev = {}
+                adj_footprint_all = {}   # {sbr: union of all floor footprints}
+                from shapely.ops import unary_union as _uu_adj
+
+                # Adjacent buildings (share a parcel boundary)
                 if len(gdf_aux_footprints_) > 0:
                     _max_floor_per_adj = gdf_aux_footprints_.groupby("group")["floor"].max()
                     for _adj_sbr, _adj_max_f in _max_floor_per_adj.items():
@@ -1412,6 +1508,42 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                             ),
                             int(_adj_max_f) + 1, ground_floor_height, floor_height,
                         )
+                    for _adj_sbr, _adj_rows in gdf_aux_footprints_.groupby("group"):
+                        try:
+                            adj_footprint_all[_adj_sbr] = _uu_adj(_adj_rows.geometry.values)
+                        except Exception:
+                            pass
+
+                # Nearby buildings (different parcel, same block — may still be
+                # physically touching). Also included so the adiabatic check sees
+                # walls that share a face with a neighbour from another parcel.
+                if len(gdf_aux_footprints_nearby) > 0:
+                    _nearby_elev_by_sbr = {}
+                    _elev_src = gdf_footprints_global if "elevation" in gdf_footprints_global.columns else gdf_zone
+                    _elev_col = "group" if _elev_src is gdf_footprints_global else "single_building_reference"
+                    try:
+                        _nearby_elev_by_sbr = dict(
+                            _elev_src[_elev_src[_elev_col].isin(nearby_buildings)]
+                            .groupby(_elev_col)["elevation"].first()
+                        )
+                    except Exception:
+                        pass
+                    _max_floor_nearby = gdf_aux_footprints_nearby.groupby("group")["floor"].max()
+                    for _nbr_sbr, _nbr_max_f in _max_floor_nearby.items():
+                        if _nbr_sbr not in adjacent_roof_elev:
+                            adjacent_roof_elev[_nbr_sbr] = utils.floor_base_elevation(
+                                utils._coerce_scalar_float(
+                                    _nearby_elev_by_sbr.get(_nbr_sbr, current_building_elevation),
+                                    0.0,
+                                ),
+                                int(_nbr_max_f) + 1, ground_floor_height, floor_height,
+                            )
+                    for _nbr_sbr, _nbr_rows in gdf_aux_footprints_nearby.groupby("group"):
+                        if _nbr_sbr not in adj_footprint_all:
+                            try:
+                                adj_footprint_all[_nbr_sbr] = _uu_adj(_nbr_rows.geometry.values)
+                            except Exception:
+                                pass
 
                 if n_underground_floors > 0:
 
@@ -1478,15 +1610,15 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                             floor_top_elev = (current_building_elevation + ground_floor_height
                                               + floor * floor_height)
 
-                        # Precompute adjacent footprints at this floor (sbr-id, geom)
-                        # so the adiabatic test can look up the neighbour's roof
-                        # elevation via `adjacent_roof_elev[sbr_id]`.
-                        adj_at_floor = [
-                            (row.group, row.geometry)
-                            for row in gdf_aux_footprints_[
-                                gdf_aux_footprints_.floor == floor
-                            ].itertuples(index=False)
-                        ]
+                        # Base elevation of the current floor — used by the
+                        # adiabatic test: a neighbour must reach at least this
+                        # height (not just floor 0) to shelter this wall.
+                        if floor == 0:
+                            floor_base_elev = current_building_elevation
+                        else:
+                            floor_base_elev = (current_building_elevation
+                                               + ground_floor_height
+                                               + (floor - 1) * floor_height)
 
                         for geom in walls:
 
@@ -1508,158 +1640,202 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                                         "length_m": round(ring_seg.length, 2),
                                     })
 
-                            # Break down the exterior into segments
+                            # Break down the exterior into segments.
+                            # Precompute split-boundary geometries for this
+                            # floor once (parcel edges + neighbour footprints)
+                            # so we can split each wall segment wherever a
+                            # neighbour starts or ends — giving finer per-type
+                            # accounting rather than one label for a long wall.
+                            _split_geoms = (
+                                list(related_parcels_geom)
+                                + list(adj_footprint_all.values())
+                            )
+
                             exterior_coords = list(orient(geom, sign=-1.0).exterior.coords)
                             for i in range(len(exterior_coords) - 1):
-                                segment_assigned = None
-                                segment = LineString([exterior_coords[i], exterior_coords[i + 1]])
-                                if segment.length < 0.001:
+                                raw_segment = LineString(
+                                    [exterior_coords[i], exterior_coords[i + 1]])
+                                if raw_segment.length < 0.001:
                                     continue
 
-                                # Determine the orientation of this segment
-                                segment_orientation = str(utils.calculate_wall_outdoor_normal_orientation(
-                                    segment,
-                                    orientation_interval=orientation_discrete_interval_in_degrees))
+                                # Orientation is the same for all sub-segments
+                                # (they are collinear).
+                                segment_orientation = str(
+                                    utils.calculate_wall_outdoor_normal_orientation(
+                                        raw_segment,
+                                        orientation_interval=orientation_discrete_interval_in_degrees))
 
-                                # 1. PATIOS — segment intersects an interior courtyard polygon.
-                                for patio in patios:
-                                    if utils.segment_intersects_with_tolerance(
-                                            segment, patio,
-                                            buffer_distance=0.1,
-                                            area_percentage_threshold=15
-                                    ):
-                                        patios_wall[floor] += round(segment.length, 2)
-                                        if plots:
-                                            fig, ax = plt.subplots()
-                                            utils.plot_shapely_geometries(
-                                                geometries = [geom] + [segment],
-                                                title = f"Wall ID:{i}, floor: {floor},\n"
-                                                        f"orientation: {segment_orientation},"
-                                                        f"type: patios",
-                                                ax = ax,
-                                                contextual_geometry = building_geom)
-                                            pdf.savefig(fig)
-                                            plt.close(fig)
-                                        segment_assigned = "patios"
-                                        break
+                                sub_segments = _split_segment_at_geom_boundaries(
+                                    raw_segment, _split_geoms)
 
-                                # 2. TERRAIN_CONTACT — basement (floor<0, dead under
-                                # current above-ground loop scope) OR midpoint sits
-                                # below the floor's top-of-slab elevation per DEM.
-                                if segment_assigned is None:
-                                    is_terrain = False
-                                    if floor < 0:
-                                        is_terrain = True
-                                    elif dem_sampler is not None:
-                                        mid = segment.interpolate(0.5, normalized=True)
-                                        try:
-                                            terrain_elev = float(
-                                                dem_sampler([mid.x], [mid.y])[0]
-                                            )
-                                        except (TypeError, ValueError, Exception):
-                                            terrain_elev = None
-                                        if (terrain_elev is not None
-                                                and not math.isnan(terrain_elev)
-                                                and terrain_elev > floor_top_elev):
-                                            is_terrain = True
-                                    if is_terrain:
-                                        terrain_contact_wall[floor] += round(segment.length, 2)
-                                        if plots:
-                                            fig, ax = plt.subplots()
-                                            utils.plot_shapely_geometries(
-                                                geometries = [geom] + [segment],
-                                                title = f"Wall ID:{i}, floor: {floor},\n"
-                                                        f"orientation: {segment_orientation},"
-                                                        f"type: terrain_contact",
-                                                ax = ax,
-                                                contextual_geometry = building_geom)
-                                            pdf.savefig(fig)
-                                            plt.close(fig)
-                                        segment_assigned = "terrain_contact"
+                                for segment in sub_segments:
+                                    segment_assigned = None
 
-                                # 3. ADIABATIC — touches an adjacent neighbour's
-                                # footprint AT this floor AND the neighbour's roof
-                                # rises at least 0.5 m above our eye level (so a
-                                # low neighbour doesn't shadow a tall wall).
-                                if segment_assigned is None:
-                                    for adj_sbr, adj_geom in adj_at_floor:
-                                        if not utils.segment_intersects_with_tolerance(
-                                                segment, adj_geom,
-                                                buffer_distance=0.1,
-                                                area_percentage_threshold=15
-                                        ):
-                                            continue
-                                        adj_top = adjacent_roof_elev.get(
-                                            adj_sbr, float("-inf"))
-                                        if adj_top >= eye_level_floor + 0.5:
-                                            adiabatic_wall[floor] += round(segment.length, 2)
-                                            if plots:
-                                                fig, ax = plt.subplots()
-                                                utils.plot_shapely_geometries(
-                                                    geometries = [geom] + [segment],
-                                                    title = f"Wall ID: {i}, floor: {floor},\n"
-                                                            f"orientation: {segment_orientation}, "
-                                                            f"type: adiabatic",
-                                                    ax = ax,
-                                                    contextual_geometry = building_geom)
-                                                pdf.savefig(fig)
-                                                plt.close(fig)
-                                            segment_assigned = "adiabatic"
-                                            break
-
-                                # 4. PARTY_WALL — segment lies on any related parcel
-                                # boundary (per-orientation; treats the boundary like
-                                # an exterior wall without windows).
-                                if segment_assigned is None and len(related_parcels_geom) > 0:
-                                    for related_parcel in related_parcels_geom:
+                                    # 1. PATIOS — segment intersects an interior
+                                    # courtyard polygon.
+                                    for patio in patios:
                                         if utils.segment_intersects_with_tolerance(
-                                                segment, related_parcel,
+                                                segment, patio,
                                                 buffer_distance=0.1,
                                                 area_percentage_threshold=15
                                         ):
-                                            party_wall[floor][segment_orientation] += round(segment.length, 2)
+                                            patios_wall[floor] += round(segment.length, 2)
                                             if plots:
                                                 fig, ax = plt.subplots()
                                                 utils.plot_shapely_geometries(
-                                                    geometries = [geom] + [segment],
-                                                    title = f"Wall ID: {i}, floor: {floor},\n"
-                                                            f"orientation: {segment_orientation}, "
-                                                            f"type: party_wall",
-                                                    ax = ax,
-                                                    contextual_geometry = building_geom)
+                                                    geometries=[geom] + [segment],
+                                                    title=f"Wall ID:{i}, floor: {floor},\n"
+                                                          f"orientation: {segment_orientation},"
+                                                          f"type: patios",
+                                                    ax=ax,
+                                                    contextual_geometry=building_geom)
                                                 pdf.savefig(fig)
                                                 plt.close(fig)
-                                            segment_assigned = "party_wall"
+                                            segment_assigned = "patios"
                                             break
 
-                                # 5. MAIN_FACADE — true exterior wall facing open air.
-                                if segment_assigned is None:
-                                    main_facade_wall[floor][segment_orientation] += round(segment.length, 2)
-                                    if plots:
-                                        fig, ax = plt.subplots()
-                                        utils.plot_shapely_geometries(
-                                            geometries = [geom] + [segment],
-                                            title = f"Wall ID: {i}, floor: {floor},\n"
-                                                    f"orientation: {segment_orientation}, "
-                                                    f"type: main_facade",
-                                            ax = ax,
-                                            contextual_geometry = building_geom)
-                                        pdf.savefig(fig)
-                                        plt.close(fig)
-                                    segment_assigned = "main_facade"
+                                    # 2. TERRAIN_CONTACT — basement OR midpoint
+                                    # below the floor's top-of-slab per DEM.
+                                    if segment_assigned is None:
+                                        is_terrain = False
+                                        if floor < 0:
+                                            is_terrain = True
+                                        elif dem_sampler is not None:
+                                            mid = segment.interpolate(0.5, normalized=True)
+                                            try:
+                                                terrain_elev = float(
+                                                    dem_sampler([mid.x], [mid.y])[0]
+                                                )
+                                            except (TypeError, ValueError, Exception):
+                                                terrain_elev = None
+                                            if (terrain_elev is not None
+                                                    and not math.isnan(terrain_elev)
+                                                    and terrain_elev > floor_top_elev):
+                                                is_terrain = True
+                                        if is_terrain:
+                                            terrain_contact_wall[floor] += round(segment.length, 2)
+                                            if plots:
+                                                fig, ax = plt.subplots()
+                                                utils.plot_shapely_geometries(
+                                                    geometries=[geom] + [segment],
+                                                    title=f"Wall ID:{i}, floor: {floor},\n"
+                                                          f"orientation: {segment_orientation},"
+                                                          f"type: terrain_contact",
+                                                    ax=ax,
+                                                    contextual_geometry=building_geom)
+                                                pdf.savefig(fig)
+                                                plt.close(fig)
+                                            segment_assigned = "terrain_contact"
 
-                                # Per-segment record (energy-simulation interop).
-                                wall_segments_sbr.append({
-                                    "geometry": segment,
-                                    "type": segment_assigned,
-                                    "floor": floor,
-                                    "orientation_degrees": (
-                                        float(segment_orientation)
-                                        if segment_assigned in ("party_wall", "main_facade")
-                                        else None
-                                    ),
-                                    "length_m": round(segment.length, 2),
-                                })
+                                    # 3. ADIABATIC — segment touches any floor of a
+                                    # neighbour (adjacent or nearby) AND that
+                                    # neighbour's roof is at or above this floor's
+                                    # base elevation.  Checked BEFORE party_wall: a
+                                    # tall-enough building physically behind the wall
+                                    # means no heat exchange (adiabatic) regardless
+                                    # of whether a parcel boundary also runs there.
+                                    # Union of all neighbour floors (adj_footprint_all)
+                                    # handles the case where a 2-floor neighbour must
+                                    # be visible from floor 3+ of a taller building.
+                                    # Per-segment splitting upstream ensures only the
+                                    # portion actually backed by the neighbour gets
+                                    # this label; the rest falls through to party_wall
+                                    # or main_facade.
+                                    if segment_assigned is None:
+                                        # Probe just outside the wall: a wall is
+                                        # only adiabatic if a neighbour footprint
+                                        # actually lies on its outward side. When
+                                        # the outward side can't be disambiguated
+                                        # (probe is None) we fall back to the
+                                        # looser coincidence test.
+                                        _probe = _outward_probe_point(segment, geom)
+                                        for adj_sbr, adj_union_geom in adj_footprint_all.items():
+                                            if _probe is not None:
+                                                try:
+                                                    behind = adj_union_geom.buffer(0.05).contains(_probe)
+                                                except Exception:
+                                                    behind = False
+                                                if not behind:
+                                                    continue
+                                            elif not utils.segment_intersects_with_tolerance(
+                                                    segment, adj_union_geom,
+                                                    buffer_distance=0.1,
+                                                    area_percentage_threshold=15
+                                            ):
+                                                continue
+                                            adj_top = adjacent_roof_elev.get(
+                                                adj_sbr, float("-inf"))
+                                            if adj_top >= floor_base_elev:
+                                                adiabatic_wall[floor] += round(segment.length, 2)
+                                                if plots:
+                                                    fig, ax = plt.subplots()
+                                                    utils.plot_shapely_geometries(
+                                                        geometries=[geom] + [segment],
+                                                        title=f"Wall ID: {i}, floor: {floor},\n"
+                                                              f"orientation: {segment_orientation}, "
+                                                              f"type: adiabatic",
+                                                        ax=ax,
+                                                        contextual_geometry=building_geom)
+                                                    pdf.savefig(fig)
+                                                    plt.close(fig)
+                                                segment_assigned = "adiabatic"
+                                                break
+
+                                    # 4. PARTY_WALL — segment lies on a parcel
+                                    # boundary with no tall-enough building behind it
+                                    # (per-orientation; treated like an exterior wall
+                                    # without windows).
+                                    if segment_assigned is None and len(related_parcels_geom) > 0:
+                                        for related_parcel in related_parcels_geom:
+                                            if utils.segment_intersects_with_tolerance(
+                                                    segment, related_parcel,
+                                                    buffer_distance=0.1,
+                                                    area_percentage_threshold=15
+                                            ):
+                                                party_wall[floor][segment_orientation] += round(segment.length, 2)
+                                                if plots:
+                                                    fig, ax = plt.subplots()
+                                                    utils.plot_shapely_geometries(
+                                                        geometries=[geom] + [segment],
+                                                        title=f"Wall ID: {i}, floor: {floor},\n"
+                                                              f"orientation: {segment_orientation}, "
+                                                              f"type: party_wall",
+                                                        ax=ax,
+                                                        contextual_geometry=building_geom)
+                                                    pdf.savefig(fig)
+                                                    plt.close(fig)
+                                                segment_assigned = "party_wall"
+                                                break
+
+                                    # 5. MAIN_FACADE — true exterior wall facing
+                                    # open air.
+                                    if segment_assigned is None:
+                                        main_facade_wall[floor][segment_orientation] += round(segment.length, 2)
+                                        if plots:
+                                            fig, ax = plt.subplots()
+                                            utils.plot_shapely_geometries(
+                                                geometries=[geom] + [segment],
+                                                title=f"Wall ID: {i}, floor: {floor},\n"
+                                                      f"orientation: {segment_orientation}, "
+                                                      f"type: main_facade",
+                                                ax=ax,
+                                                contextual_geometry=building_geom)
+                                            pdf.savefig(fig)
+                                            plt.close(fig)
+                                        segment_assigned = "main_facade"
+
+                                    # Per-segment record (energy-simulation interop).
+                                    wall_segments_sbr.append({
+                                        "geometry": segment,
+                                        "type": segment_assigned,
+                                        "floor": floor,
+                                        "orientation_degrees": (
+                                            float(segment_orientation)
+                                            if segment_assigned in ("party_wall", "main_facade")
+                                            else None
+                                        ),
+                                        "length_m": round(segment.length, 2),
+                                    })
 
                     # Significant-orientation summaries: any direction where the
                     # per-floor wall length crosses 10 % of the floor perimeter.
@@ -2505,6 +2681,9 @@ def parse_horizontal_division_buildings_CAT_files(cadaster_code, CAT_files_dir):
     """
 
     combined_dfs = downloaders.parse_CAT_file(cadaster_code, CAT_files_dir, allowed_dataset_types=[14, 15])
+
+    if combined_dfs is None:
+        return None
 
     # Join the building space and building spaces detailed datasets. Order the items by floor.
     building_spaces_detailed = combined_dfs[14]

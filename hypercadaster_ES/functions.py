@@ -272,11 +272,11 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
     if "index" in gdf.columns:
         gdf.drop("index", axis=1, inplace=True)
 
-    # columns that have dicts
-    cols_with_dicts = [c for c in gdf.columns
-                       if gdf[c].apply(lambda v: isinstance(v, dict) or isinstance(v,list)).any()]
+    # columns that have dicts, lists, or bytearrays (BLOB geometry data)
+    cols_with_unhashable = [c for c in gdf.columns
+                       if gdf[c].apply(lambda v: isinstance(v, (dict, list, bytearray))).any()]
 
-    subset = [c for c in gdf.columns if c not in cols_with_dicts + ['geometry']]
+    subset = [c for c in gdf.columns if c not in cols_with_unhashable + ['geometry']]
     gdf = gdf.drop_duplicates(subset=subset, keep='first')
     
     # Apply address compaction if requested

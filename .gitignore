@@ -10,3 +10,5 @@ all_directions_barcelona.py
 .idea
 .DS_Store
 *.pyc
+.qwen/
+test_olivella/

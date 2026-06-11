@@ -1626,7 +1626,7 @@ def parse_CAT_file(cadaster_code, CAT_files_dir, allowed_dataset_types = [14, 15
         return combined_dfs
 
 
-    def get_CAT_file_path(CAT_files_dir, cadaster_code, timeout=3600):
+    def get_CAT_file_path(CAT_files_dir, cadaster_code, timeout=30):
         def sort_key(path):
             # Strip .CAT.gz or .CAT extension to get base like "08001U_23012026"
             base = os.path.basename(path)
@@ -1643,7 +1643,7 @@ def parse_CAT_file(cadaster_code, CAT_files_dir, allowed_dataset_types = [14, 15
         start_time = time.time()
         province_code = cadaster_code[:2]
 
-        while CAT_file is None or task_time < timeout:
+        while CAT_file is None and task_time < timeout:
             try:
                 all_entries = os.listdir(CAT_files_dir)
 

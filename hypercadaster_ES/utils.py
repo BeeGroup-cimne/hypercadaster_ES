@@ -3647,32 +3647,28 @@ def _render_dem_panel(ax, terrain_grid, building_footprint_general, centroid_xy)
 
         grid_x_fine, grid_y_fine, elev_fine = gx, gy, elev
         try:
-            from scipy.interpolate import RegularGridInterpolator
-            from scipy.ndimage import gaussian_filter
+            from scipy.ndimage import zoom as _ndimage_zoom
             up = 5
-            grid_x_fine = np.linspace(gx[0], gx[-1], (nx - 1) * up + 1)
-            grid_y_fine = np.linspace(gy[0], gy[-1], (ny - 1) * up + 1)
-            interp = RegularGridInterpolator(
-                (gy, gx), elev, method='linear', bounds_error=False,
-                fill_value=np.nan,
-            )
-            FY, FX = np.meshgrid(grid_y_fine, grid_x_fine, indexing='ij')
-            elev_fine = interp((FY, FX))
-            elev_fine = gaussian_filter(elev_fine, sigma=up * 0.6)
+            elev_fine = _ndimage_zoom(elev, up, order=3, mode='nearest')
+            grid_x_fine = np.linspace(gx[0], gx[-1], elev_fine.shape[1])
+            grid_y_fine = np.linspace(gy[0], gy[-1], elev_fine.shape[0])
         except ImportError:
             pass
 
-        cf = ax.contourf(grid_x_fine, grid_y_fine, elev_fine,
-                         levels=12, cmap='terrain', alpha=0.85)
-        ax.contour(grid_x_fine, grid_y_fine, elev_fine, levels=12,
-                   colors='saddlebrown', linewidths=0.5, alpha=0.7)
-        plt.colorbar(cf, ax=ax, fraction=0.04, pad=0.02, label='Elev (m)')
+        # Smooth continuous surface (Gouraud shading on the upsampled grid)
+        # matches the appearance of the 3D go.Surface plot.
+        pm = ax.pcolormesh(grid_x_fine, grid_y_fine, elev_fine,
+                           cmap='terrain', shading='gouraud', alpha=0.88)
+        ax.contour(grid_x_fine, grid_y_fine, elev_fine, levels=10,
+                   colors='saddlebrown', linewidths=0.4, alpha=0.6)
+        plt.colorbar(pm, ax=ax, fraction=0.04, pad=0.02, label='Elev (m)')
 
-        # General building footprint (recentred).
+        # General building footprint (recentred) — blue so it reads
+        # clearly against the terrain colormap.
         _draw_polygon_cartesian(
             ax, building_footprint_general,
             centroid_xy[0], centroid_xy[1],
-            facecolor='none', edgecolor='black', alpha=1.0, linewidth=1.4,
+            facecolor='none', edgecolor='#1565C0', alpha=1.0, linewidth=2.0,
         )
 
         ax.set_xlim(gx[0], gx[-1])
@@ -3681,7 +3677,7 @@ def _render_dem_panel(ax, terrain_grid, building_footprint_general, centroid_xy)
         ax.set_xlabel('East offset (m)')
         ax.set_ylabel('North offset (m)')
         ax.set_title(
-            f'DEM contour map ({cell:.0f} m grid, ±{nx * cell / 2:.0f} m, bilinear interp)'
+            f'DEM  ({cell:.0f} m grid, ±{nx * cell / 2:.0f} m, bicubic ×5)'
         )
         return True
     except Exception:
@@ -3725,10 +3721,8 @@ def _build_polar_shadow_page(shadow_data, building_reference, floor_height):
 
     n_cols = 4
     n_rows_polars = math.ceil(n_floors_plot / n_cols)
-    fig = plt.figure(figsize=(4.0 * n_cols, 3.6 * n_rows_polars + 6.5))
-    gs = GridSpec(n_rows_polars + 1, n_cols,
-                  height_ratios=[1.0] * n_rows_polars + [1.6],
-                  hspace=0.5, wspace=0.45)
+    fig = plt.figure(figsize=(4.0 * n_cols, 3.6 * n_rows_polars + 1.0))
+    gs = GridSpec(n_rows_polars, n_cols, hspace=0.5, wspace=0.45)
 
     for f in range(n_floors_plot):
         r_idx, c_idx = divmod(f, n_cols)
@@ -3776,11 +3770,6 @@ def _build_polar_shadow_page(shadow_data, building_reference, floor_height):
         ax_blank = fig.add_subplot(gs[r_idx, c_idx])
         ax_blank.set_visible(False)
 
-    ax_dem = fig.add_subplot(gs[-1, :])
-    if not _render_dem_panel(ax_dem, shadow_data.get('terrain_grid'),
-                             general_footprint, (cx, cy)):
-        ax_dem.set_visible(False)
-
     fig.suptitle(
         f'Per-floor shadow horizon (polar / by orientation) — {building_reference}'
         f'  (building floors: {bldg_floors}, max floor seen: {max_floors})',
@@ -3814,9 +3803,9 @@ def _build_multipoly_shadow_page(shadow_data, building_reference, floor_height):
 
     n_cols = 4
     n_rows_polars = math.ceil(n_floors_plot / n_cols)
-    fig = plt.figure(figsize=(4.0 * n_cols, 3.6 * n_rows_polars + 6.5))
-    gs = GridSpec(n_rows_polars + 1, n_cols,
-                  height_ratios=[1.0] * n_rows_polars + [1.6],
+    fig = plt.figure(figsize=(4.0 * n_cols, 3.6 * n_rows_polars + 1.0))
+    gs = GridSpec(n_rows_polars, n_cols,
+                  height_ratios=[1.0] * n_rows_polars,
                   hspace=0.4, wspace=0.35)
 
     for i, f in enumerate(floor_keys_sorted):
@@ -3853,11 +3842,6 @@ def _build_multipoly_shadow_page(shadow_data, building_reference, floor_height):
         r_idx, c_idx = divmod(i, n_cols)
         ax_blank = fig.add_subplot(gs[r_idx, c_idx])
         ax_blank.set_visible(False)
-
-    ax_dem = fig.add_subplot(gs[-1, :])
-    if not _render_dem_panel(ax_dem, shadow_data.get('terrain_grid'),
-                             general_footprint, (cx, cy)):
-        ax_dem.set_visible(False)
 
     fig.suptitle(
         f'Per-floor blocked-region multipolygon — {building_reference}'
@@ -4006,6 +3990,12 @@ def _extract_shadow_data(building_row):
 
     if 'br__building_footprint_geometry' in building_row.index:
         bfg = building_row['br__building_footprint_geometry']
+        if isinstance(bfg, (bytes, bytearray, memoryview)):
+            try:
+                from shapely import wkb as _shapely_wkb_utils
+                bfg = _shapely_wkb_utils.loads(bytes(bfg))
+            except Exception:
+                bfg = None
         if bfg is not None and not (hasattr(bfg, 'is_empty') and bfg.is_empty):
             shadow_data['building_footprint'] = bfg
 
@@ -4661,4 +4651,633 @@ def plot_building_reference(
     plt.savefig(output_path, dpi=dpi)
     plt.close(fig)
 
-    return output_path
+
+# ==========================================
+# DEM / GEOMETRY VISUALISATIONS
+# ==========================================
+
+_WALL_TYPE_COLOURS = {
+    'main_facade':    '#E86B2E',
+    'party_wall':     '#4C72B0',
+    'adiabatic':      '#9B59B6',
+    'patios':         '#55A868',
+    'terrain_contact':'#8B5A2B',
+}
+_WALL_TYPE_DEFAULT = '#AAAAAA'
+
+
+def plot_building_dem(gdf, building_reference, output_path=None, wd=None, dpi=150):
+    """Standalone DEM contour map for a single building.
+
+    Uses the ``br__terrain_grid`` heavy column (auto-fetched from DuckDB
+    when *wd* is supplied).  The building's general footprint is overlaid
+    in blue.
+
+    Parameters
+    ----------
+    gdf : DataFrame / GeoDataFrame
+        Output of ``hc.merge``.
+    building_reference : str
+        Building reference id.
+    output_path : str, optional
+        Save path (.png / .pdf / …).  Displays interactively when None.
+    wd : str, optional
+        Working directory for the central DuckDB — required to fetch the
+        terrain grid when it is absent from *gdf*.
+    dpi : int, default 150
+    """
+    import matplotlib.pyplot as plt
+
+    building_data = gdf[gdf['building_reference'] == building_reference]
+    if building_data.empty:
+        print(f"No data found for building {building_reference}")
+        return None
+    row = building_data.iloc[0].copy()
+
+    if wd is not None and (
+        'br__terrain_grid' not in row.index or row.get('br__terrain_grid') is None
+    ):
+        from hypercadaster_ES import _db
+        cadaster_code = row.get('cadaster_code')
+        if cadaster_code is not None:
+            try:
+                fetched = get_heavy_columns_for_building(
+                    wd, str(cadaster_code), building_reference,
+                    table='br_results', columns=['br__terrain_grid'],
+                )
+                for col, val in fetched.items():
+                    row[col] = val
+            except Exception as _e:
+                print(f"Warning: could not fetch terrain grid: {_e}")
+
+    terrain_grid = row.get('br__terrain_grid')
+    if not (isinstance(terrain_grid, dict) and terrain_grid.get('elev')):
+        print(f"No terrain grid available for building {building_reference}")
+        return None
+
+    bfg = row.get('br__building_footprint_geometry')
+    if isinstance(bfg, (bytes, bytearray, memoryview)):
+        try:
+            from shapely import wkb as _swkb
+            bfg = _swkb.loads(bytes(bfg))
+        except Exception:
+            bfg = None
+    cx = bfg.centroid.x if bfg is not None else 0.0
+    cy = bfg.centroid.y if bfg is not None else 0.0
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    drawn = _render_dem_panel(ax, terrain_grid, bfg, (cx, cy))
+    if not drawn:
+        print(f"Could not render DEM for building {building_reference}")
+        plt.close(fig)
+        return None
+
+    fig.suptitle(f'Terrain DEM — {building_reference}', fontsize=13)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+    if output_path:
+        plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
+        plt.close(fig)
+        print(f"DEM plot saved to {output_path}")
+    else:
+        plt.show()
+    return fig
+
+
+def plot_building_geometry(gdf, building_reference, output_path=None, wd=None, dpi=150):
+    """2-D floor-plan grid showing wall segments coloured by wall type.
+
+    Wall type colour legend:
+        main_facade     #E86B2E  (orange)
+        party_wall      #4C72B0  (blue)
+        patios          #55A868  (green)
+        terrain_contact #8B5A2B  (brown)
+        unknown/None    #AAAAAA  (grey)
+
+    Parameters
+    ----------
+    gdf : DataFrame / GeoDataFrame
+    building_reference : str
+    output_path : str, optional
+    wd : str, optional
+        Working directory — used to auto-fetch ``br__wall_segments``.
+    dpi : int, default 150
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    from matplotlib.gridspec import GridSpec
+
+    building_data = gdf[gdf['building_reference'] == building_reference]
+    if building_data.empty:
+        print(f"No data found for building {building_reference}")
+        return None
+    row = building_data.iloc[0].copy()
+
+    if wd is not None and (
+        'br__wall_segments' not in row.index or row.get('br__wall_segments') is None
+    ):
+        from hypercadaster_ES import _db
+        cadaster_code = row.get('cadaster_code')
+        if cadaster_code is not None:
+            try:
+                fetched = get_heavy_columns_for_building(
+                    wd, str(cadaster_code), building_reference,
+                    table='br_results', columns=['br__wall_segments'],
+                )
+                for col, val in fetched.items():
+                    row[col] = val
+            except Exception as _e:
+                print(f"Warning: could not fetch wall segments: {_e}")
+
+    wall_segments = row.get('br__wall_segments')
+    if not isinstance(wall_segments, list) or not wall_segments:
+        print(f"No wall segment data available for building {building_reference}")
+        return None
+
+    # Decode any remaining bytearray / bytes values in the row so that
+    # subsequent code never has to deal with raw binary objects.
+    def _robust_decode(v):
+        """Try WKB (geometry) then pickle on any bytes-like value."""
+        if not isinstance(v, (bytes, bytearray, memoryview)):
+            return v
+        b = bytes(v)
+        # shapely WKB (plain or EWKB with SRID)
+        try:
+            from shapely import wkb as _swkb
+            return _swkb.loads(b, include_srid=True)
+        except Exception:
+            pass
+        # pickle-encoded Python object
+        try:
+            import pickle as _pkl
+            return _pkl.loads(b)
+        except Exception:
+            pass
+        return v   # return as-is if both fail
+
+    for _col in list(row.index):
+        _v = row[_col]
+        if isinstance(_v, (bytes, bytearray, memoryview)):
+            row[_col] = _robust_decode(_v)
+
+    bfg = row.get('br__building_footprint_geometry')
+    if not hasattr(bfg, 'exterior') and not hasattr(bfg, 'geoms'):
+        bfg = row.get('building_geometry')
+
+    _footprint_rings = []   # list of (xs, ys) tuples — one per ring to draw
+    if bfg is not None:
+        geoms = list(bfg.geoms) if hasattr(bfg, 'geoms') else [bfg]
+        for g in geoms:
+            if hasattr(g, 'exterior'):
+                coords = list(g.exterior.coords)
+                _footprint_rings.append(([p[0] for p in coords],
+                                         [p[1] for p in coords]))
+
+    # Group segments by floor
+    floors_map = {}
+    for seg in wall_segments:
+        if not isinstance(seg, dict):
+            continue
+        f = seg.get('floor', 0)
+        try:
+            f = int(f)
+        except (TypeError, ValueError):
+            f = 0
+        floors_map.setdefault(f, []).append(seg)
+
+    # Pre-compute shared axis extent from ALL segments + footprint so every
+    # floor subplot uses the same scale.
+    all_xs, all_ys = [], []
+    for seg in wall_segments:
+        geom = seg.get('geometry') if isinstance(seg, dict) else None
+        if geom is None:
+            continue
+        try:
+            xs, ys = geom.xy
+            all_xs.extend(xs); all_ys.extend(ys)
+        except Exception:
+            pass
+    for ring_xs, ring_ys in _footprint_rings:
+        all_xs.extend(ring_xs); all_ys.extend(ring_ys)
+
+    if all_xs:
+        cx = (min(all_xs) + max(all_xs)) / 2
+        cy = (min(all_ys) + max(all_ys)) / 2
+        half = max(max(all_xs) - min(all_xs),
+                   max(all_ys) - min(all_ys)) / 2 * 1.15 + 1.0
+        x_lim = (cx - half, cx + half)
+        y_lim = (cy - half, cy + half)
+        # Offset all coords to centroid-relative for readable axis labels
+        ox, oy = cx, cy
+    else:
+        x_lim = y_lim = (-10, 10)
+        ox, oy = 0.0, 0.0
+
+    floor_keys = sorted(floors_map)
+    n_floors = max(1, len(floor_keys))
+    n_cols = min(4, n_floors)
+    n_rows = math.ceil(n_floors / n_cols)
+
+    fig = plt.figure(figsize=(4.5 * n_cols, 4.0 * n_rows + 1.0))
+    gs = GridSpec(n_rows, n_cols, hspace=0.45, wspace=0.35)
+
+    for idx, floor in enumerate(floor_keys):
+        r, c = divmod(idx, n_cols)
+        ax = fig.add_subplot(gs[r, c])
+        ax.set_aspect('equal')
+        ax.set_xlim(x_lim[0] - ox, x_lim[1] - ox)
+        ax.set_ylim(y_lim[0] - oy, y_lim[1] - oy)
+
+        for ring_xs, ring_ys in _footprint_rings:
+            ax.plot([x - ox for x in ring_xs],
+                    [y - oy for y in ring_ys],
+                    color='#BBBBBB', linewidth=0.8, linestyle=':', zorder=1)
+
+        for seg in floors_map[floor]:
+            geom = seg.get('geometry')
+            wtype = seg.get('type')
+            colour = _WALL_TYPE_COLOURS.get(wtype, _WALL_TYPE_DEFAULT)
+            if geom is None:
+                continue
+            try:
+                xs, ys = geom.xy
+                ax.plot([x - ox for x in xs],
+                        [y - oy for y in ys],
+                        color=colour, linewidth=1.5,
+                        solid_capstyle='round', zorder=2)
+            except Exception:
+                pass
+
+        ax.set_title(f'Floor {floor}', fontsize=10, pad=5)
+        ax.tick_params(labelsize=7)
+        ax.grid(True, alpha=0.2, linestyle=':')
+        ax.set_xlabel('ΔX (m)', fontsize=7)
+        ax.set_ylabel('ΔY (m)', fontsize=7)
+
+    for idx in range(n_floors, n_rows * n_cols):
+        r, c = divmod(idx, n_cols)
+        fig.add_subplot(gs[r, c]).set_visible(False)
+
+    legend_patches = [
+        mpatches.Patch(color=v, label=k.replace('_', ' ').title())
+        for k, v in _WALL_TYPE_COLOURS.items()
+    ] + [mpatches.Patch(color=_WALL_TYPE_DEFAULT, label='Unknown')]
+    fig.legend(handles=legend_patches, loc='lower center',
+               ncol=len(legend_patches), fontsize=9,
+               bbox_to_anchor=(0.5, 0.0), frameon=True)
+
+    fig.suptitle(f'Wall geometry by floor — {building_reference}', fontsize=12)
+    fig.tight_layout(rect=[0, 0.05, 1, 0.96])
+
+    if output_path:
+        plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
+        plt.close(fig)
+        print(f"2-D geometry plot saved to {output_path}")
+    else:
+        plt.show()
+    return fig
+
+
+def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None,
+                               floor_height=3.0):
+    """Interactive 3-D view of a building's geometry with terrain and neighbour shadows.
+
+    Renders three layers in a single plotly scene:
+      1. **Terrain**  — ``br__terrain_grid`` as a coloured heightmap surface
+         (recentred on the building centroid).
+      2. **Building shades** — ``br__shadows`` per-floor blocked-region polygons
+         from neighbouring buildings, shown as semi-transparent horizontal planes
+         at the corresponding floor height  (floor × floor_height).
+      3. **Wall segments** — ``br__wall_segments`` extruded into vertical rectangles
+         spanning *floor* × floor_height to (floor+1) × floor_height, coloured by
+         wall type.
+
+    All three axes use the same metre scale (1:1:1 aspect ratio).
+
+    Output
+    ------
+    Always saves as an interactive HTML file.  If *output_path* has a
+    non-``.html`` extension it is replaced automatically.
+    Pass ``output_path=None`` to open directly in the default browser.
+
+    Parameters
+    ----------
+    gdf : DataFrame / GeoDataFrame
+    building_reference : str
+    output_path : str, optional
+    wd : str, optional
+        Working directory — used to auto-fetch heavy BLOB columns
+        (``br__wall_segments``, ``br__shadows``, ``br__terrain_grid``).
+    floor_height : float, default 3.0
+        Height of each storey in metres.
+    """
+    import plotly.graph_objects as go
+
+    building_data = gdf[gdf['building_reference'] == building_reference]
+    if building_data.empty:
+        print(f"No data found for building {building_reference}")
+        return None
+    row = building_data.iloc[0].copy()
+
+    # ---- Auto-fetch heavy columns from DuckDB ---------------------------------
+    heavy_cols = ['br__wall_segments', 'br__shadows', 'br__terrain_grid']
+    missing = [c for c in heavy_cols
+               if c not in row.index or row.get(c) is None]
+    if wd is not None and missing:
+        cadaster_code = row.get('cadaster_code')
+        if cadaster_code is not None:
+            try:
+                fetched = get_heavy_columns_for_building(
+                    wd, str(cadaster_code), building_reference,
+                    table='br_results', columns=missing,
+                )
+                for col, val in fetched.items():
+                    row[col] = val
+            except Exception as _e:
+                print(f"Warning: could not fetch heavy columns: {_e}")
+
+    wall_segments = row.get('br__wall_segments')
+    if not isinstance(wall_segments, list) or not wall_segments:
+        print(f"No wall segment data available for building {building_reference}")
+        return None
+
+    # ---- Ground elevation (absolute metres) — offsets all building z-coords ---
+    ground_z = None
+    for _ecol in ('elevation', 'br__elevation', 'br__mean_elevation'):
+        try:
+            _ev = row.get(_ecol)
+            if _ev is not None:
+                ground_z = float(_ev)
+                break
+        except (TypeError, ValueError):
+            pass
+    # Fallback: centre cell of the terrain grid (computed below if needed)
+
+    # ---- Determine building centroid (for terrain grid alignment) -------------
+    centroid_x, centroid_y = None, None
+    bfg = row.get('br__building_footprint_geometry')
+    if bfg is not None and isinstance(bfg, (bytes, bytearray, memoryview)):
+        try:
+            from shapely import wkb as _swkb
+            bfg = _swkb.loads(bytes(bfg))
+        except Exception:
+            bfg = None
+    if bfg is not None and not (hasattr(bfg, 'is_empty') and bfg.is_empty):
+        centroid_x, centroid_y = bfg.centroid.x, bfg.centroid.y
+    # Fallback: centre of wall-segment bounding box
+    if centroid_x is None:
+        seg_xs, seg_ys = [], []
+        for seg in wall_segments:
+            geom = seg.get('geometry')
+            if geom is None:
+                continue
+            try:
+                for x, y, *_ in geom.coords:
+                    seg_xs.append(x); seg_ys.append(y)
+            except Exception:
+                pass
+        if seg_xs:
+            centroid_x = (min(seg_xs) + max(seg_xs)) / 2
+            centroid_y = (min(seg_ys) + max(seg_ys)) / 2
+
+    import numpy as np
+
+    # ---- Coordinate offsets: all scene coords are centroid-relative (X, Y)
+    # and ground-relative (Z) so the building fills the view regardless of
+    # absolute UTM values or absolute elevation.
+    ox = centroid_x if centroid_x is not None else 0.0
+    oy = centroid_y if centroid_y is not None else 0.0
+
+    traces = []
+    all_x, all_y, all_z = [], [], []   # relative coords for range calc
+
+    # ---- Layer 1: Terrain DEM surface (bicubic-upsampled, no pixels) ---------
+    terrain_grid = row.get('br__terrain_grid')
+    if isinstance(terrain_grid, dict) and terrain_grid.get('elev'):
+        try:
+            cell = float(terrain_grid['cell_size'])
+            tnx = int(terrain_grid['nx'])
+            tny = int(terrain_grid['ny'])
+            elev = np.array(terrain_grid['elev'], dtype=float)
+
+            cx_off = (tnx - 1) * cell / 2.0
+            cy_off = (tny - 1) * cell / 2.0
+            lx = np.arange(tnx) * cell - cx_off   # already centroid-relative
+            ly = np.arange(tny) * cell - cy_off
+
+            # Bicubic upsample to remove blocky appearance
+            try:
+                from scipy.ndimage import zoom as _sz
+                up = 4
+                elev_f = _sz(elev, up, order=3, mode='nearest')
+                lx_f = np.linspace(lx[0], lx[-1], elev_f.shape[1])
+                ly_f = np.linspace(ly[0], ly[-1], elev_f.shape[0])
+            except ImportError:
+                elev_f, lx_f, ly_f = elev, lx, ly
+
+            # Use terrain centre elevation as ground_z fallback
+            if ground_z is None:
+                ground_z = float(elev[tny // 2, tnx // 2])
+
+            oz = ground_z
+            elev_rel = elev_f - oz           # height above building ground
+
+            GX, GY = np.meshgrid(lx_f, ly_f)
+            traces.append(go.Surface(
+                x=GX, y=GY, z=elev_rel,
+                colorscale='earth', showscale=True,
+                colorbar=dict(title='Height above ground (m)', thickness=12, len=0.5, x=1.02),
+                opacity=0.85,
+                name='Terrain',
+                hovertemplate='ΔX=%{x:.1f} m<br>ΔY=%{y:.1f} m<br>h=%{z:.1f} m<extra></extra>',
+            ))
+            all_x.extend([float(lx_f[0]), float(lx_f[-1])])
+            all_y.extend([float(ly_f[0]), float(ly_f[-1])])
+            all_z.extend([float(elev_rel.min()), float(elev_rel.max())])
+        except Exception:
+            pass  # terrain is nice-to-have
+
+    if ground_z is None:
+        ground_z = 0.0
+    oz = ground_z
+
+    # ---- Layer 2: Shadow boundary panels (buffer circle edges excluded) -------
+    # Each floor's shadow polygon boundary is extruded ±floor_height/2 around
+    # the floor mid-height.  Segments that lie on the analysis buffer circle
+    # (artefacts of the search radius, not real buildings) are filtered out.
+    shadows_geom = row.get('br__shadows')
+    if isinstance(shadows_geom, dict) and shadows_geom:
+        try:
+            # Determine buffer radius: max distance of any shadow vertex from origin
+            shadow_radius = 0.0
+            for poly in shadows_geom.values():
+                if poly is None or (hasattr(poly, 'is_empty') and poly.is_empty):
+                    continue
+                for g in (list(poly.geoms) if hasattr(poly, 'geoms') else [poly]):
+                    if hasattr(g, 'exterior'):
+                        for xp, yp, *_ in g.exterior.coords:
+                            d = math.sqrt((xp - ox) ** 2 + (yp - oy) ** 2)
+                            shadow_radius = max(shadow_radius, d)
+            # Segments are on the circle if both endpoints are within 2 % of radius
+            circle_tol = shadow_radius * 0.02 if shadow_radius > 0 else 0.0
+
+            def _on_circle(x0, y0, x1, y1):
+                d0 = math.sqrt((x0 - ox) ** 2 + (y0 - oy) ** 2)
+                d1 = math.sqrt((x1 - ox) ** 2 + (y1 - oy) ** 2)
+                return (d0 >= shadow_radius - circle_tol and
+                        d1 >= shadow_radius - circle_tol)
+
+            shade_colours = ['#7F8C8D', '#95A5A6', '#BDC3C7', '#909090',
+                             '#808B96', '#778899', '#A9A9A9', '#696969']
+            for floor_idx, poly in sorted(shadows_geom.items()):
+                if poly is None or (hasattr(poly, 'is_empty') and poly.is_empty):
+                    continue
+                z_bot_rel = floor_idx * floor_height
+                z_top_rel = floor_idx * floor_height + floor_height
+                z_mid_rel = (z_bot_rel + z_top_rel) / 2
+                colour = shade_colours[floor_idx % len(shade_colours)]
+
+                geoms_list = list(poly.geoms) if hasattr(poly, 'geoms') else [poly]
+                sx, sy, sz = [], [], []
+                si, sj, sk = [], [], []
+                for g in geoms_list:
+                    if not hasattr(g, 'exterior'):
+                        continue
+                    ring = list(g.exterior.coords)
+                    for ci in range(len(ring) - 1):
+                        x0, y0 = ring[ci][:2]
+                        x1, y1 = ring[ci + 1][:2]
+                        if _on_circle(x0, y0, x1, y1):
+                            continue
+                        rx0, ry0 = x0 - ox, y0 - oy
+                        rx1, ry1 = x1 - ox, y1 - oy
+                        base = len(sx)
+                        sx.extend([rx0, rx1, rx1, rx0])
+                        sy.extend([ry0, ry1, ry1, ry0])
+                        sz.extend([z_bot_rel, z_bot_rel, z_top_rel, z_top_rel])
+                        si.extend([base,     base])
+                        sj.extend([base + 1, base + 2])
+                        sk.extend([base + 2, base + 3])
+                        all_x.extend([rx0, rx1])
+                        all_y.extend([ry0, ry1])
+                        all_z.extend([z_bot_rel, z_top_rel])
+
+                if sx:
+                    traces.append(go.Mesh3d(
+                        x=sx, y=sy, z=sz,
+                        i=si, j=sj, k=sk,
+                        color=colour, opacity=0.35,
+                        name=f'Shade floor {floor_idx}',
+                        showlegend=True, flatshading=True,
+                        hovertemplate=f'Floor {floor_idx}<br>h={z_mid_rel:.1f} m<extra></extra>',
+                    ))
+        except Exception:
+            pass  # shades are nice-to-have
+
+    # ---- Layer 3: Wall segments (centroid-relative X/Y, ground-relative Z) ---
+    type_verts = {}
+    _wall_x, _wall_y, _wall_z = [], [], []   # wall-only coords for scene span
+    for seg in wall_segments:
+        if not isinstance(seg, dict):
+            continue
+        geom = seg.get('geometry')
+        wtype = seg.get('type')
+        floor = seg.get('floor', 0)
+        try:
+            floor = int(floor)
+        except (TypeError, ValueError):
+            floor = 0
+        if geom is None:
+            continue
+        try:
+            coords = list(geom.coords)
+        except Exception:
+            continue
+
+        z_bot_rel = floor * floor_height
+        z_top_rel = (floor + 1) * floor_height
+
+        bucket = type_verts.setdefault(wtype, {'x': [], 'y': [], 'z': [],
+                                                'i': [], 'j': [], 'k': []})
+        for ci in range(len(coords) - 1):
+            x0, y0 = coords[ci][:2]
+            x1, y1 = coords[ci + 1][:2]
+            rx0, ry0 = x0 - ox, y0 - oy
+            rx1, ry1 = x1 - ox, y1 - oy
+            base = len(bucket['x'])
+            bucket['x'].extend([rx0, rx1, rx1, rx0])
+            bucket['y'].extend([ry0, ry1, ry1, ry0])
+            bucket['z'].extend([z_bot_rel, z_bot_rel, z_top_rel, z_top_rel])
+            bucket['i'].extend([base,     base])
+            bucket['j'].extend([base + 1, base + 2])
+            bucket['k'].extend([base + 2, base + 3])
+            all_x.extend([rx0, rx1])
+            all_y.extend([ry0, ry1])
+            all_z.extend([z_bot_rel, z_top_rel])
+            _wall_x.extend([rx0, rx1])
+            _wall_y.extend([ry0, ry1])
+            _wall_z.extend([z_bot_rel, z_top_rel])
+
+    for wtype, b in type_verts.items():
+        colour = _WALL_TYPE_COLOURS.get(wtype, _WALL_TYPE_DEFAULT)
+        label = (wtype or 'unknown').replace('_', ' ').title()
+        traces.append(go.Mesh3d(
+            x=b['x'], y=b['y'], z=b['z'],
+            i=b['i'], j=b['j'], k=b['k'],
+            color=colour, opacity=1.0,
+            name=label, showlegend=True, flatshading=True,
+        ))
+
+    # ---- 1:1:1 aspect — XY up to 4× building span (or available data) --------
+    # Z is sized to the building; XY expands to show terrain/shadow context
+    # up to 4× the building footprint or the terrain extent, whichever is less.
+    if _wall_x and _wall_z:
+        wx_span = max(_wall_x) - min(_wall_x)
+        wy_span = max(_wall_y) - min(_wall_y)
+        wz_span = max(_wall_z) - min(_wall_z)
+        bldg_xy = max(wx_span, wy_span, 1.0)
+        wcx     = (min(_wall_x) + max(_wall_x)) / 2
+        wcy     = (min(_wall_y) + max(_wall_y)) / 2
+        wcz     = (min(_wall_z) + max(_wall_z)) / 2
+        # XY: expand to 4× building footprint, capped by available all_x/y data
+        target_xy = bldg_xy * 4.0
+        if all_x:
+            data_xy = max(max(all_x) - min(all_x), max(all_y) - min(all_y))
+            xy_span = min(target_xy, data_xy)
+        else:
+            xy_span = target_xy
+        # Z: building height with small padding
+        z_span  = max(wz_span, 1.0) * 1.3
+        # Use the larger of xy/z so the cube satisfies 1:1:1
+        span    = max(xy_span, z_span)
+        x_range = [wcx - span / 2, wcx + span / 2]
+        y_range = [wcy - span / 2, wcy + span / 2]
+        z_range = [wcz - span / 2, wcz + span / 2]
+    else:
+        x_range = y_range = z_range = [-1, 1]
+
+    fig = go.Figure(data=traces)
+    fig.update_layout(
+        title=f'3-D building geometry — {building_reference}',
+        scene=dict(
+            xaxis=dict(title='ΔX (m)', range=x_range),
+            yaxis=dict(title='ΔY (m)', range=y_range),
+            zaxis=dict(title='Height above ground (m)', range=z_range),
+            aspectmode='manual',
+            aspectratio=dict(x=1, y=1, z=1),
+            camera=dict(eye=dict(x=1.5, y=-1.5, z=1.0)),
+        ),
+        legend=dict(title='Layer', x=0.01, y=0.99),
+        margin=dict(l=0, r=0, b=0, t=40),
+    )
+
+    if output_path:
+        ext = output_path.rsplit('.', 1)[-1].lower() if '.' in output_path else ''
+        if ext != 'html':
+            output_path = (output_path.rsplit('.', 1)[0] + '.html'
+                           if '.' in output_path else output_path + '.html')
+        fig.write_html(output_path)
+        print(f"3-D geometry plot saved to {output_path}")
+    else:
+        fig.show()
+    return fig

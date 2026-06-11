@@ -359,6 +359,8 @@ def get_cadaster_address(cadaster_dir, cadaster_codes, directions_from_CAT_files
         for code in cadaster_codes:
             # Parse CAT file, if available
             buildings_CAT = building_inference.parse_horizontal_division_buildings_CAT_files(code, CAT_files_dir)
+            if buildings_CAT is None:
+                continue
             addresses_CAT_ = (pl.concat([
                 buildings_CAT[["building_reference", "street_type", "street_name", "street_number1"]].rename(
                     {"street_number1": "street_number"}),
@@ -384,25 +386,26 @@ def get_cadaster_address(cadaster_dir, cadaster_codes, directions_from_CAT_files
 
             return pd.Series({"location": centroid})
 
-        addresses_CAT = addresses_CAT.merge(
-                gdf[["building_reference", "location"]].
-                groupby(["building_reference"]).
-                apply(calculate_centroid,include_groups=False).reset_index(),
-            on="building_reference", how="left")
-        if sum(addresses_CAT['location'].isna())>0:
-            for code in addresses_CAT.cadaster_code[addresses_CAT['location'].isna()].unique():
-                buildings = gpd.read_file(f"{cadaster_dir}/buildings/unzip/A.ES.SDGC.BU.{code}.building.gml", layer="Building")
-                for idx in addresses_CAT.index[(addresses_CAT['location'].isna()) & (addresses_CAT['cadaster_code'] == code)]:
-                    try:
-                        addresses_CAT.loc[idx, 'location'] = list(buildings[buildings['reference'] == addresses_CAT.loc[idx, 'building_reference']].geometry)[0].centroid
-                    except:
-                        pass
-        addresses_CAT = gpd.GeoDataFrame(addresses_CAT)
-        addresses_CAT = addresses_CAT.set_geometry("location")
-        addresses_CAT = addresses_CAT.set_crs(gdf.crs)
-        addresses_CAT["specification"] = "CATFile"
-        gdf = pd.concat([gdf, addresses_CAT], ignore_index=True)
-        gdf = gdf.drop_duplicates(subset=["street_name", "street_number", "street_type", "cadaster_code"], keep="first", ignore_index=True)
+        if not addresses_CAT.empty:
+            addresses_CAT = addresses_CAT.merge(
+                    gdf[["building_reference", "location"]].
+                    groupby(["building_reference"]).
+                    apply(calculate_centroid,include_groups=False).reset_index(),
+                on="building_reference", how="left")
+            if sum(addresses_CAT['location'].isna())>0:
+                for code in addresses_CAT.cadaster_code[addresses_CAT['location'].isna()].unique():
+                    buildings = gpd.read_file(f"{cadaster_dir}/buildings/unzip/A.ES.SDGC.BU.{code}.building.gml", layer="Building")
+                    for idx in addresses_CAT.index[(addresses_CAT['location'].isna()) & (addresses_CAT['cadaster_code'] == code)]:
+                        try:
+                            addresses_CAT.loc[idx, 'location'] = list(buildings[buildings['reference'] == addresses_CAT.loc[idx, 'building_reference']].geometry)[0].centroid
+                        except:
+                            pass
+            addresses_CAT = gpd.GeoDataFrame(addresses_CAT)
+            addresses_CAT = addresses_CAT.set_geometry("location")
+            addresses_CAT = addresses_CAT.set_crs(gdf.crs)
+            addresses_CAT["specification"] = "CATFile"
+            gdf = pd.concat([gdf, addresses_CAT], ignore_index=True)
+            gdf = gdf.drop_duplicates(subset=["street_name", "street_number", "street_type", "cadaster_code"], keep="first", ignore_index=True)
 
     if directions_from_open_data:
         open_data_addresses = process_open_data_addresses(
@@ -557,6 +560,17 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
                            force_update=False, cleanup_shards=True):
 
     sys.stderr.write(f"\nJoining the buildings description for {len(cadaster_codes)} municipalities\n")
+
+    # Drop stale buildings table when force_update is requested so the first
+    # write below uses 'replace' and the schema matches the current run.
+    if force_update:
+        try:
+            from hypercadaster_ES import _db as _db_mod_force
+            _fc = _db_mod_force.open_db(results_dir)
+            _fc.execute("DROP TABLE IF EXISTS buildings")
+            _fc.close()
+        except Exception:
+            pass
 
     for code in tqdm(cadaster_codes, desc="Iterating by cadaster codes...") if len(cadaster_codes)>1 else cadaster_codes:
         # sys.stderr.write("\r" + " " * 60)
@@ -779,21 +793,20 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
                 force_update=force_update, cleanup_shards=cleanup_shards)
 
             # process_building_parts now returns a ResultsHandle pointing
-            # to the central DuckDB.  We consume it via SQL so we never
-            # materialise the full sbr/br DataFrames in-process.
+            # to the central DuckDB.  The handle carries an open parent
+            # connection from Phase A.  We use that connection for our
+            # SQL queries, then close it when done.
             inference_handle = building_part_gdf_
 
             from hypercadaster_ES import _db as _db_mod
 
-            # Open a read-write connection to the central DB so we can
-            # create the merged `buildings` table.
-            central_con = _db_mod.open_db(results_dir)
             code = cadaster_codes[0]  # single-municipality for inference
 
             # Quick check: does the handle have any rows?
             has_data = inference_handle.br_count() > 0
 
             if has_data:
+                central_con = inference_handle._parent_con
                 # Register the slim building_gdf_ as a temp relation so we
                 # can LEFT JOIN it against br_results in DuckDB.
                 slim_cols = ['gml_id', 'building_status', 'building_reference',
@@ -918,19 +931,26 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
                         WHERE _br_merged."building_reference" = c."building_reference"
                     """)
 
-                # Read the merged result back as a GeoDataFrame
+                # Read the merged result back as a GeoDataFrame.
+                # read_gdf converts the designated geometry column and
+                # unpickles any BLOB columns (pickled per-use-type dicts
+                # like br__building_spaces_*); other GEOMETRY columns
+                # stay as raw WKB bytes so write_gdf downstream doesn't
+                # see unexpected geopandas 'geometry' dtype columns.
                 building_gdf_ = _db_mod.read_gdf(
                     central_con, "_br_merged", geom_col="building_geometry"
                 )
 
                 # Also keep br_results for building_part_gdf downstream
                 building_part_gdf = inference_handle.br_to_pandas()
+
+                # We're done with the parent connection — close it.
+                if central_con is not None:
+                    central_con.close()
             else:
                 sys.stderr.write("Warning: Building parts inference returned no results\n")
                 building_gdf_ = building_gdf_[['gml_id', 'building_status', 'building_reference', 'building_use',
                                               'building_geometry', 'year_of_construction', 'zone_reference', 'zone_type']]
-
-            central_con.close()
 
         if buildings_CAT is not None:
             #['n_building_units', 'n_dwellings', 'n_floors_above_ground', 'building_area']
@@ -1029,10 +1049,16 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
             else:
                 building_gdf_ = building_gdf_.copy(deep=False)
                 building_gdf_["cadaster_code"] = code
+            # Check if table exists; use 'replace' for first write.
+            _row = _build_con.execute(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_name = 'buildings' LIMIT 1"
+            ).fetchone()
+            _if_exists = "append" if _row is not None else "replace"
             _db_mod_build.write_gdf(
                 _build_con, "buildings", building_gdf_,
                 geom_cols=("building_geometry",),
-                if_exists="append",
+                if_exists=_if_exists,
             )
         finally:
             _build_con.close()
@@ -1051,6 +1077,11 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
             building_gdf = building_gdf_
 
     if gdf is not None:
+        # Avoid cadaster_code column collision: both gdf (from addresses) and
+        # building_gdf carry it. Since they represent the same municipality,
+        # drop it from the right side so pd.merge doesn't suffix the names.
+        if "cadaster_code" in building_gdf.columns:
+            building_gdf = building_gdf.drop(columns="cadaster_code")
         merged_gdf = pd.merge(gdf, building_gdf, left_on="building_reference", right_on="building_reference", how="left")
     else:
         merged_gdf = building_gdf

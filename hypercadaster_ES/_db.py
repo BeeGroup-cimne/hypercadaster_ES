@@ -159,13 +159,26 @@ def completed_zones(con: duckdb.DuckDBPyConnection, cadaster_code: str) -> set:
 
 def _df_with_wkb(gdf: gpd.GeoDataFrame, geom_cols: Iterable[str]) -> pd.DataFrame:
     """Return a shallow-copied pandas DataFrame where each geometry column
-    has been replaced by its WKB bytes. DuckDB's ST_GeomFromWKB then
-    rehydrates it into native GEOMETRY at INSERT time."""
+    has been replaced by its WKB bytes, and complex object columns are
+    pickled into BLOB bytes. DuckDB's ST_GeomFromWKB rehydrates geometry;
+    `_maybe_unpickle` rehydrates the BLOB columns on read."""
+    geom_set = set(geom_cols)
     df = pd.DataFrame(gdf)
-    for col in geom_cols:
+    for col in geom_set:
         if col not in df.columns:
             continue
         df = df.assign(**{col: gpd.GeoSeries(df[col]).to_wkb()})
+    # Re-pickle any object column whose sample value is a complex Python
+    # object (dict, list, numpy scalar, etc.). Strings and bytes pass
+    # through as-is; they're already DuckDB-compatible. This handles
+    # round-trips through read_gdf which unpickles BLOB columns on read.
+    for col in df.columns:
+        if col in geom_set or df[col].dtype != object:
+            continue
+        sample = _first_non_null(df[col])
+        if sample is None or isinstance(sample, (str, bytes, bytearray, memoryview)):
+            continue
+        df[col] = [None if _is_null(v) else _to_pickle_bytes(v) for v in df[col]]
     return df
 
 
@@ -422,6 +435,10 @@ def ingest_shard_table(central_con: duckdb.DuckDBPyConnection, *,
     # "Duplicate column name in INSERT" binder error.
     shard_typed = [(n, t) for n, t in shard_typed if n not in bookkeeping]
     shard_names = [n for n, _ in shard_typed]
+    # Record pre-resolution types so the SELECT builder knows whether to
+    # call ST_AsWKB (needed for true GEOMETRY) or not (BLOB columns are
+    # already WKB bytes and ST_AsWKB would fail with BLOB→GEOMETRY cast).
+    original_shard_types = {n: t.upper() for n, t in shard_typed}
 
     # Fully qualify with "main" so DESCRIBE / ALTER don't get confused by
     # an identically-named table in the ATTACH'd shard.
@@ -467,6 +484,13 @@ def ingest_shard_table(central_con: duckdb.DuckDBPyConnection, *,
         # If the SQL widening fails (some primitive types can't be
         # encoded), we fall back to dropping the column for this shard
         # with a logged warning.
+        _INT_TYPES = frozenset({
+            "TINYINT", "SMALLINT", "INTEGER", "INT", "BIGINT", "HUGEINT",
+            "INT8", "INT4", "INT2", "INT1", "UBIGINT", "UINTEGER",
+        })
+        _FLOAT_TYPES = frozenset({"FLOAT", "REAL", "DOUBLE", "FLOAT4", "FLOAT8"})
+        _NUMERIC_TYPES = _INT_TYPES | _FLOAT_TYPES
+
         kept = []
         for n, t in shard_typed:
             if n not in existing_types:
@@ -480,28 +504,52 @@ def ingest_shard_table(central_con: duckdb.DuckDBPyConnection, *,
                 pickle_wrap_cols.add(n)
                 kept.append((n, "BLOB"))
             elif st == "BLOB":
-                try:
-                    central_con.execute(
-                        f'ALTER TABLE "main"."{central_table}" '
-                        f'ALTER COLUMN "{n}" SET DATA TYPE BLOB '
-                        f'USING ENCODE(CAST("{n}" AS VARCHAR))'
-                    )
-                    existing_types[n] = "BLOB"
-                    kept.append((n, "BLOB"))
-                    sys.stderr.write(
-                        f"[ingest_shard_table] widened central column "
-                        f"'{n}' from {ct} to BLOB (later shards had "
-                        f"pickled values for it)\n"
-                    )
-                except Exception as _wide_err:
-                    sys.stderr.write(
-                        f"[ingest_shard_table] could not widen '{n}' "
-                        f"from {ct} to BLOB ({_wide_err}); dropping for "
-                        f"this shard.\n"
-                    )
+                # GEOMETRY columns in the shard appear as BLOB when accessed
+                # via ATTACH (spatial extension metadata doesn't transfer).
+                # Keep the central GEOMETRY; the INSERT path below uses
+                # ST_AsWKB / ST_GeomFromWKB to bridge the gap.
+                if ct == "GEOMETRY":
+                    kept.append((n, "GEOMETRY"))
+                else:
+                    try:
+                        central_con.execute(
+                            f'ALTER TABLE "main"."{central_table}" '
+                            f'ALTER COLUMN "{n}" SET DATA TYPE BLOB '
+                            f'USING ENCODE(CAST("{n}" AS VARCHAR))'
+                        )
+                        existing_types[n] = "BLOB"
+                        kept.append((n, "BLOB"))
+                    except Exception as _wide_err:
+                        sys.stderr.write(
+                            f"[ingest_shard_table] could not widen '{n}' "
+                            f"from {ct} to BLOB ({_wide_err}); dropping for "
+                            f"this shard.\n"
+                        )
+            elif ct in _NUMERIC_TYPES and st in _NUMERIC_TYPES:
+                # Numeric drift (e.g. BIGINT central vs DOUBLE shard).
+                # DOUBLE can represent all BIGINT values for quantities like
+                # floor counts without precision loss.
+                if ct in _INT_TYPES:
+                    # Widen central integer column to DOUBLE once.
+                    try:
+                        central_con.execute(
+                            f'ALTER TABLE "main"."{central_table}" '
+                            f'ALTER COLUMN "{n}" SET DATA TYPE DOUBLE'
+                        )
+                        existing_types[n] = "DOUBLE"
+                        kept.append((n, "DOUBLE"))
+                    except Exception as _ne:
+                        sys.stderr.write(
+                            f"[ingest_shard_table] type drift on '{n}' "
+                            f"(central={ct}, shard={st}); could not widen "
+                            f"({_ne}), dropping for this shard.\n"
+                        )
+                else:
+                    # Central already floating — integer shard values fit.
+                    kept.append((n, t))
             else:
-                # Both sides non-BLOB but mismatched (e.g. DOUBLE vs
-                # VARCHAR). Rare in practice; drop with a warning.
+                # Both sides non-BLOB, non-numeric, mismatched
+                # (e.g. DOUBLE vs VARCHAR). Drop with a warning.
                 sys.stderr.write(
                     f"[ingest_shard_table] type drift on '{n}' "
                     f"(central={ct}, shard={st}); dropping for this shard.\n"
@@ -518,24 +566,108 @@ def ingest_shard_table(central_con: duckdb.DuckDBPyConnection, *,
     target_cols = bookkeeping_cols + shard_names
     target_sql = ", ".join(f'"{c}"' for c in target_cols)
 
+    # Ensure spatial extension is loaded on the central connection so
+    # GEOMETRY types from the ATTACH'd shard are resolved correctly.
+    try:
+        central_con.execute("LOAD spatial")
+    except Exception:
+        pass
+
     if not pickle_wrap_cols:
         # Fast path: pure SQL INSERT, no Python materialisation.
-        source_parts = ["?"] * len(bookkeeping_cols)
-        source_parts += [f'"{n}"' for n in shard_names]
-        source_sql = ", ".join(source_parts)
-        central_con.execute(
-            f'INSERT INTO "main"."{central_table}" ({target_sql}) '
-            f'SELECT {source_sql} FROM "{shard_alias}"."{shard_table}"',
-            list(bookkeeping.values()),
-        )
+        # Split shard columns into GEOMETRY and non-GEOMETRY to handle
+        # the ATTACH boundary type mismatch. GEOMETRY columns from the
+        # shard can appear as BLOB to the central connection even when
+        # DESCRIBE reports GEOMETRY (spatial extension metadata doesn't
+        # transfer across ATTACH).
+        # Also detect GEOMETRY columns by checking the central schema:
+        # a shard column stored as BLOB that corresponds to a central
+        # GEOMETRY column needs the same WKB round-trip treatment.
+        geo_cols = {n for n, t in shard_typed if t.upper() == "GEOMETRY"}
+        geo_cols |= {n for n in shard_names
+                     if existing_types.get(n) == "GEOMETRY"}
+        non_geo = [n for n in shard_names if n not in geo_cols]
+        if geo_cols:
+            pass
+
+        if not geo_cols:
+            # No geometry columns — straightforward INSERT.
+            source_parts = ["?"] * len(bookkeeping_cols) + [f'"{n}"' for n in shard_names]
+            source_sql = ", ".join(source_parts)
+            central_con.execute(
+                f'INSERT INTO "main"."{central_table}" ({target_sql}) '
+                f'SELECT {source_sql} FROM "{shard_alias}"."{shard_table}"',
+                list(bookkeeping.values()),
+            )
+        else:
+            # Materialise shard into pandas. GEOMETRY columns need
+            # ST_AsWKB wrapper so they come out as WKB bytes rather than
+            # DuckDB GEOMETRY objects (which appear as BLOB across ATTACH).
+            select_parts = []
+            geo_set = geo_cols
+            for n in shard_names:
+                if n in geo_set:
+                    # ST_AsWKB requires a GEOMETRY argument. If the shard
+                    # stored the column as BLOB (WKB bytes — spatial metadata
+                    # doesn't transfer via ATTACH), calling ST_AsWKB would
+                    # trigger a failing implicit BLOB→GEOMETRY cast. Select
+                    # as-is instead; the bytes are already WKB and
+                    # ST_GeomFromWKB on INSERT handles the conversion.
+                    if original_shard_types.get(n) == "GEOMETRY":
+                        select_parts.append(f'ST_AsWKB("{n}") AS "{n}"')
+                    else:
+                        select_parts.append(f'"{n}"')
+                else:
+                    select_parts.append(f'"{n}"')
+            df = central_con.execute(
+                f'SELECT {", ".join(select_parts)} FROM "{shard_alias}"."{shard_table}"'
+            ).fetchdf()
+            # Ensure WKB bytes are proper Python bytes (not memoryview)
+            for c in geo_cols:
+                if c in df.columns:
+                    df[c] = [bytes(x) if x is not None and not isinstance(x, bytes) else x
+                             for x in df[c]]
+            for c, v in reversed(list(bookkeeping.items())):
+                df.insert(0, c, v)
+            central_con.register("_tmp_ingest_all", df)
+            try:
+                # Wrap GEOMETRY columns with ST_GeomFromWKB on INSERT
+                insert_select_parts = []
+                for c in target_cols:
+                    if c in geo_cols:
+                        insert_select_parts.append(
+                            f'ST_GeomFromWKB("{c}") AS "{c}"'
+                        )
+                    else:
+                        insert_select_parts.append(f'"{c}"')
+                central_con.execute(
+                    f'INSERT INTO "main"."{central_table}" ({target_sql}) '
+                    f'SELECT {", ".join(insert_select_parts)} FROM _tmp_ingest_all'
+                )
+            finally:
+                central_con.unregister("_tmp_ingest_all")
     else:
         # Slow path: pickle-wrap the conflicting primitive columns so
         # they fit the central BLOB column. Materialise into pandas; each
         # shard is a single zone so the frame is bounded.
-        cols_select = ", ".join(f'"{n}"' for n in shard_names)
+        # Geometry columns may coexist with pickle-wrap columns; handle
+        # them the same way as the fast path (already-WKB BLOB selected
+        # as-is, ST_GeomFromWKB applied on INSERT).
+        slow_geo_cols = {n for n, t in shard_typed if t.upper() == "GEOMETRY"}
+        slow_geo_cols |= {n for n in shard_names if existing_types.get(n) == "GEOMETRY"}
+        select_parts_slow = []
+        for n in shard_names:
+            if n in slow_geo_cols and original_shard_types.get(n) == "GEOMETRY":
+                select_parts_slow.append(f'ST_AsWKB("{n}") AS "{n}"')
+            else:
+                select_parts_slow.append(f'"{n}"')
         df = central_con.execute(
-            f'SELECT {cols_select} FROM "{shard_alias}"."{shard_table}"'
+            f'SELECT {", ".join(select_parts_slow)} FROM "{shard_alias}"."{shard_table}"'
         ).fetchdf()
+        for c in slow_geo_cols:
+            if c in df.columns:
+                df[c] = [bytes(x) if x is not None and not isinstance(x, bytes) else x
+                         for x in df[c]]
         for c in pickle_wrap_cols:
             if c in df.columns:
                 df[c] = [None if _is_null(v) else _to_pickle_bytes(v)
@@ -545,9 +677,15 @@ def ingest_shard_table(central_con: duckdb.DuckDBPyConnection, *,
             df.insert(0, c, v)
         central_con.register("_tmp_ingest_wrap", df)
         try:
+            insert_select_slow = []
+            for c in target_cols:
+                if c in slow_geo_cols:
+                    insert_select_slow.append(f'ST_GeomFromWKB("{c}") AS "{c}"')
+                else:
+                    insert_select_slow.append(f'"{c}"')
             central_con.execute(
                 f'INSERT INTO "main"."{central_table}" ({target_sql}) '
-                f'SELECT {target_sql} FROM _tmp_ingest_wrap'
+                f'SELECT {", ".join(insert_select_slow)} FROM _tmp_ingest_wrap'
             )
         finally:
             central_con.unregister("_tmp_ingest_wrap")
@@ -842,7 +980,11 @@ def read_gdf(con: duckdb.DuckDBPyConnection, table: str, *,
     """Read a DuckDB table back as a GeoDataFrame.
 
     The geometry column is materialised from GEOMETRY → WKB → shapely
-    via `GeoSeries.from_wkb`. CRS is restored from `_meta`.
+    via `GeoSeries.from_wkb`. CRS is restored from `_meta`. BLOB
+    columns whose bytes look like pickled data are unpickled (same
+    heuristic as `read_df_safe`); other GEOMETRY columns stay as raw
+    WKB bytes so they don't acquire the geopandas `geometry` dtype
+    (which would cause DuckDB `con.register` failures in `write_gdf`).
     """
     sql = f'SELECT * REPLACE (ST_AsWKB("{geom_col}") AS "{geom_col}") FROM "{table}"'
     if where:
@@ -854,6 +996,19 @@ def read_gdf(con: duckdb.DuckDBPyConnection, table: str, *,
         None if (b is None or b is pd.NA) else bytes(b)
         for b in df[geom_col]
     ])
+    # Unpickle BLOB columns whose content is a pickled Python object.
+    # Only the designated geom_col is converted to GeoSeries; all other
+    # bytes/bytearray columns stay as bytes unless they look like pickle.
+    for col in df.columns:
+        if col == geom_col or df[col].dtype != object:
+            continue
+        sample = _first_non_null(df[col])
+        if sample is None or not isinstance(sample, (bytes, bytearray, memoryview)):
+            continue
+        sb = bytes(sample) if not isinstance(sample, bytes) else sample
+        if len(sb) < 2 or sb[0] != 0x80:
+            continue
+        df[col] = [_maybe_unpickle(v) for v in df[col]]
     return gpd.GeoDataFrame(df, geometry=geom_col, crs=get_table_crs(con, table))
 
 
@@ -868,17 +1023,25 @@ class ResultsHandle:
     open — keeps the handle small and safe to pass across functions.
     Materialisation (pandas frames) happens explicitly via ``to_pandas()``
     so the caller sees the cost.
+
+    If a ``parent_con`` is provided (e.g. from mergers.py that already
+    holds a read-write connection), queries reuse that connection to
+    avoid "can't open same DB with different config" errors.
     """
 
-    __slots__ = ("db_path", "cadaster_code")
+    __slots__ = ("db_path", "cadaster_code", "_parent_con")
 
-    def __init__(self, db_path: str, cadaster_code: str) -> None:
+    def __init__(self, db_path: str, cadaster_code: str,
+                 parent_con: Optional[duckdb.DuckDBPyConnection] = None) -> None:
         self.db_path = db_path
         self.cadaster_code = cadaster_code
+        self._parent_con = parent_con
 
     # -- relation helpers ---------------------------------------------------
 
     def _con(self) -> duckdb.DuckDBPyConnection:
+        if self._parent_con is not None:
+            return self._parent_con
         con = duckdb.connect(self.db_path, read_only=True)
         con.execute("LOAD spatial")
         _silence_progress_bar(con)
@@ -905,6 +1068,7 @@ class ResultsHandle:
     def sbr_iter_batches(self, batch_size: int = 5000):
         """Yield successive pandas chunks for sbr_results."""
         con = self._con()
+        own_con = con is not self._parent_con
         try:
             yield from read_df_safe_chunks(
                 con, "sbr_results",
@@ -913,11 +1077,13 @@ class ResultsHandle:
                 vectors_per_chunk=batch_size // 2048 or 1,
             )
         finally:
-            con.close()
+            if own_con:
+                con.close()
 
     def br_iter_batches(self, batch_size: int = 5000):
         """Yield successive pandas chunks for br_results."""
         con = self._con()
+        own_con = con is not self._parent_con
         try:
             yield from read_df_safe_chunks(
                 con, "br_results",
@@ -926,13 +1092,15 @@ class ResultsHandle:
                 vectors_per_chunk=batch_size // 2048 or 1,
             )
         finally:
-            con.close()
+            if own_con:
+                con.close()
 
     # -- full materialisation (escape hatch) --------------------------------
 
     def sbr_to_pandas(self) -> pd.DataFrame:
         """Materialise all sbr rows for this code into a single DataFrame."""
         con = self._con()
+        own_con = con is not self._parent_con
         try:
             return read_df_safe(
                 con, "sbr_results",
@@ -940,11 +1108,13 @@ class ResultsHandle:
                 exclude_cols=HEAVY_BLOB_COLS,
             )
         finally:
-            con.close()
+            if own_con:
+                con.close()
 
     def br_to_pandas(self) -> pd.DataFrame:
         """Materialise all br rows for this code into a single DataFrame."""
         con = self._con()
+        own_con = con is not self._parent_con
         try:
             return read_df_safe(
                 con, "br_results",
@@ -952,12 +1122,14 @@ class ResultsHandle:
                 exclude_cols=HEAVY_BLOB_COLS,
             )
         finally:
-            con.close()
+            if own_con:
+                con.close()
 
     # -- row count ----------------------------------------------------------
 
     def sbr_count(self) -> int:
         con = self._con()
+        own_con = con is not self._parent_con
         try:
             row = con.execute(
                 'SELECT count(*) FROM "main"."sbr_results" WHERE cadaster_code = ?',
@@ -965,10 +1137,12 @@ class ResultsHandle:
             ).fetchone()
             return row[0] if row else 0
         finally:
-            con.close()
+            if own_con:
+                con.close()
 
     def br_count(self) -> int:
         con = self._con()
+        own_con = con is not self._parent_con
         try:
             row = con.execute(
                 'SELECT count(*) FROM "main"."br_results" WHERE cadaster_code = ?',
@@ -976,4 +1150,5 @@ class ResultsHandle:
             ).fetchone()
             return row[0] if row else 0
         finally:
-            con.close()
+            if own_con:
+                con.close()
