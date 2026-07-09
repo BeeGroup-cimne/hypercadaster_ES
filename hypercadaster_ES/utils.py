@@ -5,6 +5,7 @@ import sys
 import os
 import time
 import shutil
+from ._pretty import PrettyDict
 import fnmatch
 import math
 import hashlib
@@ -85,38 +86,122 @@ def tqdm_joblib(tqdm_object):
 
 
 # ==========================================
+# STAGE TIMING / INSTRUMENTATION
+# ==========================================
+# Lightweight, always-flushed stderr markers used to locate the
+# post-KPI-inference bottleneck on Barcelona-scale runs. The pipeline
+# can sit silently for a long time between progress bars (e.g. the gap
+# between "Inferring building KPIs" finishing and "Aggregating zone
+# shards" starting); these markers make every stage boundary visible
+# with wall-clock timing so a single run pinpoints where the time goes.
+
+# Process start, captured at import time, so each marker also shows how
+# far into the overall run we are.
+_STAGE_T0 = time.time()
+
+
+def _rss_mb():
+    """Current process resident-set size in MiB, or None if unavailable.
+
+    Reads /proc/self/status (Linux, no dependency). Used to surface the
+    memory footprint at each stage boundary so OOM-prone stages are
+    obvious in the log without a profiler.
+    """
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0  # kB -> MiB
+    except Exception:
+        pass
+    return None
+
+
+def stage_log(message):
+    """Emit an immediately-flushed, timestamped stage marker to stderr.
+
+    Format: ``[stage +H:MM:SS | RSS NNNN MB] message`` where the offset
+    is wall-clock time since this module was imported (≈ process start)
+    and RSS is the current resident memory. Cheap enough to call
+    anywhere in the hot path's outer loop.
+    """
+    elapsed = int(time.time() - _STAGE_T0)
+    h, rem = divmod(elapsed, 3600)
+    m, s = divmod(rem, 60)
+    rss = _rss_mb()
+    rss_str = f" | RSS {rss:,.0f} MB" if rss is not None else ""
+    sys.stderr.write(f"[stage +{h}:{m:02d}:{s:02d}{rss_str}] {message}\n")
+    sys.stderr.flush()
+
+
+@contextmanager
+def stage_timer(name):
+    """Context manager that brackets a stage with start/end stderr markers.
+
+    Logs ``▶ <name>`` on entry and ``✔ <name> (took Xs)`` on exit (or
+    ``�’ <name> FAILED`` if the body raises, re-raising afterwards). The
+    "took" duration is the stage's own wall time, independent of the
+    process-relative offset in the marker prefix.
+    """
+    stage_log(f"▶ {name}")
+    t = time.time()
+    try:
+        yield
+    except BaseException:
+        stage_log(f"✗ {name} FAILED after {time.time() - t:.1f}s")
+        raise
+    else:
+        stage_log(f"✔ {name} (took {time.time() - t:.1f}s)")
+
+
+# ==========================================
 # DIRECTORY MANAGEMENT
 # ==========================================
 
 
 def cadaster_dir_(wd):
+    """Path to the cadastral data subdirectory of working dir ``wd``."""
     return f"{wd}/cadaster"
 
 def districts_dir_(wd):
+    """Path to the districts subdirectory of working dir ``wd``."""
     return f"{wd}/districts"
 
 def census_tracts_dir_(wd):
+    """Path to the census-tracts subdirectory of working dir ``wd``."""
     return f"{wd}/census_tracts"
 
 def results_dir_(wd):
+    """Path to the results subdirectory (holds the DuckDB) of working dir ``wd``."""
     return f"{wd}/results"
 
 def open_street_dir_(wd):
+    """Path to the OpenStreetMap cache subdirectory of working dir ``wd``."""
     return f"{wd}/os_maps"
 
 def DEM_raster_dir_(wd):
+    """Path to the DEM raster subdirectory of working dir ``wd``."""
     return f"{wd}/DEM_rasters"
 
 def postal_codes_dir_(wd):
+    """Path to the postal-codes subdirectory of working dir ``wd``."""
     return f"{wd}/postal_codes"
 
 def neighborhoods_dir_(wd):
+    """Path to the neighbourhoods subdirectory of working dir ``wd``."""
     return f"{wd}/neighbourhoods"
 
 def open_data_dir_(wd):
+    """Path to the (Barcelona) open-data subdirectory of working dir ``wd``."""
     return f"{wd}/open_data"
 
 def create_dirs(data_dir):
+    """Create the full working-directory tree used by :func:`hypercadaster_ES.download`.
+
+    Idempotently makes the cadaster/address/parcel/buildings, census, districts,
+    DEM, neighbourhoods, postal-code, open-data and results subfolders under
+    ``data_dir``.
+    """
     os.makedirs(census_tracts_dir_(data_dir), exist_ok=True)
     os.makedirs(districts_dir_(data_dir), exist_ok=True)
     os.makedirs(cadaster_dir_(data_dir), exist_ok=True)
@@ -154,6 +239,27 @@ def create_dirs(data_dir):
 def list_municipalities(province_codes=None,
                         inspire_url="https://www.catastro.hacienda.gob.es/INSPIRE/buildings/ES.SDGC.BU.atom.xml",
                         echo=True):
+    """List Catastro municipalities (with their INSPIRE download URLs).
+
+    Scrapes the INSPIRE ATOM feed and, for each municipality, returns its
+    ``name`` (``{cadaster_code}-{MUNICIPALITY}``) and the ``url`` of its data
+    archive.
+
+    Parameters
+    ----------
+    province_codes : list[str], optional
+        Restrict to these 2-digit province codes; None returns all provinces.
+    inspire_url : str
+        ATOM feed to scrape (buildings feed by default; pass the parcels or
+        addresses feed to enumerate those instead).
+    echo : bool, default True
+        Print progress per province.
+
+    Returns
+    -------
+    list[dict]
+        ``[{"name": ..., "url": ...}, ...]``.
+    """
     response = requests.get(inspire_url)
     soup = BeautifulSoup(response.content, "xml")
     municipalities = soup.find_all("div", id='scrolltable')
@@ -194,6 +300,18 @@ def list_municipalities(province_codes=None,
 
 
 def ine_to_cadaster_codes(ine_codes):
+    """Map INE municipality codes to cadastral codes (via the bundled xlsx).
+
+    Parameters
+    ----------
+    ine_codes : list[str] | None
+        INE municipality codes; None returns None.
+
+    Returns
+    -------
+    list[str] | None
+        Cadastral codes in the same order.
+    """
     if ine_codes is not None:
         map_code_dict = pd.read_excel(files("hypercadaster_ES").joinpath("cached_files/ine_inspire_codes.xlsx"), dtype=object, engine='openpyxl').set_index(
             'CÓDIGO INE').to_dict()['CÓDIGO CATASTRO']
@@ -203,6 +321,18 @@ def ine_to_cadaster_codes(ine_codes):
     return cadaster_codes
 
 def cadaster_to_ine_codes(cadaster_codes):
+    """Map cadastral codes to INE municipality codes (via the bundled xlsx).
+
+    Parameters
+    ----------
+    cadaster_codes : list[str] | None
+        Cadastral codes; None returns None.
+
+    Returns
+    -------
+    list[str] | None
+        INE codes in the same order.
+    """
     if cadaster_codes is not None:
         map_code_dict = pd.read_excel(files("hypercadaster_ES").joinpath("cached_files/ine_inspire_codes.xlsx"), dtype=object, engine='openpyxl').set_index(
             'CÓDIGO CATASTRO').to_dict()['CÓDIGO INE']
@@ -212,7 +342,21 @@ def cadaster_to_ine_codes(cadaster_codes):
     return ine_codes
 
 def municipality_name(ine_codes):
+    """Return the official municipality name(s) for the given INE code(s).
 
+    Looks the codes up in the current INE municipality dictionary (fetched from
+    ine.es). Accepts a single code or a list.
+
+    Parameters
+    ----------
+    ine_codes : str | list[str]
+        INE municipality code(s).
+
+    Returns
+    -------
+    list[str]
+        Matching municipality names.
+    """
     ine_codes = [ine_codes] if not isinstance(ine_codes, list) else ine_codes
     df = pd.read_excel("https://www.ine.es/daco/daco42/codmun/diccionario24.xlsx", header=1)
     df['Municipality code'] = df['CPRO'].astype(int).apply(lambda x: f"{x:02d}") +\
@@ -274,6 +418,22 @@ def get_ine_codes_from_bounding_box(wd, bbox, year=2022):
     return intersecting_municipalities['ine_municipality_code'].tolist()
 
 def get_administrative_divisions_naming(cadaster_codes):
+    """Return municipality/province/autonomous-community naming for the codes.
+
+    Reads the bundled INE↔INSPIRE table and returns the ``ine_code``,
+    ``cadaster_code``, ``municipality_name``, ``province_name`` and
+    ``autonomous_community_name`` rows for the requested cadastral codes.
+
+    Parameters
+    ----------
+    cadaster_codes : list[str]
+        Cadastral municipality codes to look up.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per matched municipality with the naming columns above.
+    """
     municipalities = pd.read_excel(files("hypercadaster_ES").joinpath("cached_files/ine_inspire_codes.xlsx"), dtype=object, engine='openpyxl')
     municipalities.drop(['INMUEBLES TOTALES', 'INMUEBLES URBANOS', 'INMUEBLES RÚSTICOS',
                          'Regularizados', 'Regularizados\nurbanos', 'Regularizados\nrústicos',
@@ -291,6 +451,21 @@ def get_administrative_divisions_naming(cadaster_codes):
     return municipalities
 
 def kml_to_geojson(kml_url):
+    """Download a KML file and convert its placemarks to a GeoJSON string.
+
+    Handles Polygon and MultiPolygon geometries and copies each placemark's
+    extended-data attributes into the feature ``properties``.
+
+    Parameters
+    ----------
+    kml_url : str
+        URL of the KML resource.
+
+    Returns
+    -------
+    str
+        A serialised GeoJSON ``FeatureCollection``.
+    """
     r = requests.get(kml_url)
     r.raise_for_status()
 
@@ -354,6 +529,10 @@ def kml_to_geojson(kml_url):
 # ==========================================
 
 def unzip_directory(zip_directory, unzip_directory):
+    """Extract every ``.zip`` in ``zip_directory`` into ``unzip_directory``.
+
+    Corrupt archives (``BadZipFile``) are deleted rather than raising.
+    """
     for file in os.listdir(zip_directory):
         if file.endswith(".zip"):
             try:
@@ -364,7 +543,25 @@ def unzip_directory(zip_directory, unzip_directory):
 
 
 def untar_directory(tar_directory, untar_directory, files_to_extract):
+    """Extract tar members matching a glob pattern into a fresh directory.
 
+    ``untar_directory`` is recreated empty first. Members whose names match
+    ``files_to_extract`` (``fnmatch`` pattern) are written out with unique names;
+    unreadable archives are removed.
+
+    Parameters
+    ----------
+    tar_directory : str
+        Directory containing the tar archives.
+    untar_directory : str
+        Output directory (cleared before extraction).
+    files_to_extract : str
+        ``fnmatch`` glob selecting which members to extract.
+
+    Returns
+    -------
+    None
+    """
     # Create the extraction directory if it doesn't exist, or remove all the files
     if not os.path.exists(untar_directory):
         os.makedirs(untar_directory)
@@ -415,10 +612,12 @@ def untar_directory(tar_directory, untar_directory, files_to_extract):
 # ==========================================
 
 def make_valid(gdf):
+    """Repair invalid geometries in ``gdf`` in place and return it."""
     gdf.geometry = gdf.geometry.make_valid()
     return gdf
 
 def get_bbox(gdf):
+    """Return the overall bounding box of ``gdf`` as ``[minx, miny, maxx, maxy]``."""
     bbox_gdf = gdf.bounds
     lat_min, lon_min, lat_max, lon_max = (
         min(bbox_gdf['minx']), min(bbox_gdf['miny']),
@@ -428,6 +627,19 @@ def get_bbox(gdf):
 
 
 def concatenate_tiffs(input_dir, output_file):
+    """Mosaic all GeoTIFFs in ``input_dir`` into a single ``output_file`` raster.
+
+    Parameters
+    ----------
+    input_dir : str
+        Directory of input ``.tif`` tiles.
+    output_file : str
+        Path for the merged GeoTIFF.
+
+    Returns
+    -------
+    None
+    """
     # Open the files using rasterio
     src_files_to_mosaic = []
     for fp in os.listdir(input_dir):
@@ -484,6 +696,33 @@ def create_graph(gdf, geometry_name="building_part_geometry", buffer=0.5):
 def detect_close_buildings(gdf_building_parts, buffer_neighbours, neighbours_column_name,
                            neighbours_id_column_name = "single_building_reference",
                            geometry_variable="building_part_geometry"):
+    """Group touching/near building parts and record each one's neighbours.
+
+    Builds an adjacency graph of parts whose geometries lie within
+    ``buffer_neighbours`` of each other. When keyed by
+    ``single_building_reference`` the connected components define physically
+    distinct buildings (a ``single_building_reference`` is assigned). Each row's
+    ``neighbours_column_name`` is set to the comma-separated sorted set of
+    related references.
+
+    Parameters
+    ----------
+    gdf_building_parts : geopandas.GeoDataFrame
+        Building parts with geometry in ``geometry_variable``.
+    buffer_neighbours : float
+        Proximity buffer (metres) defining adjacency.
+    neighbours_column_name : str
+        Output column receiving the neighbour reference list.
+    neighbours_id_column_name : str, default "single_building_reference"
+        Identity column used as graph node id (and clustered when this default).
+    geometry_variable : str, default "building_part_geometry"
+        Geometry column to use.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        ``gdf_building_parts`` with the cluster id / neighbour columns added.
+    """
     G = create_graph(gdf_building_parts, geometry_name=geometry_variable, buffer = buffer_neighbours)
     clusters = list(nx.connected_components(G))
     cluster_map = {node: i for i, cluster in enumerate(clusters) for node in cluster}
@@ -517,6 +756,9 @@ def detect_close_buildings(gdf_building_parts, buffer_neighbours, neighbours_col
 
 def detect_close_geometries_chunk(chunk, buffer_neighbours, neighbours_column_name, neighbours_id_column_name,
                                   geometry_variable):
+    """Worker for :func:`detect_close_buildings_parallel`: run the adjacency /
+    neighbour detection on a single chunk of geometries and return it enriched
+    with the neighbour column (and cluster id when clustering is requested)."""
     G = create_graph(chunk, geometry_name=geometry_variable, buffer=buffer_neighbours)
 
     # Connected components are only needed when callers ask for the
@@ -558,6 +800,33 @@ def detect_close_geometries_chunk(chunk, buffer_neighbours, neighbours_column_na
 
 def detect_close_buildings_parallel(gdf_building_parts, buffer_neighbours, neighbours_column_name,
                           neighbours_id_column_name="single_building_reference", num_workers=4, column_name_to_split=None):
+    """Parallel version of :func:`detect_close_buildings`.
+
+    Splits ``gdf_building_parts`` into overlapping chunks (grouped by
+    ``column_name_to_split``, each padded by ``buffer_neighbours`` so cross-chunk
+    adjacencies aren't missed), runs :func:`detect_close_geometries_chunk` across
+    ``num_workers`` processes and recombines the results.
+
+    Parameters
+    ----------
+    gdf_building_parts : geopandas.GeoDataFrame
+        Building parts to analyse.
+    buffer_neighbours : float
+        Proximity buffer (metres).
+    neighbours_column_name : str
+        Output neighbour-list column.
+    neighbours_id_column_name : str, default "single_building_reference"
+        Identity column / clustering key.
+    num_workers : int, default 4
+        Number of parallel workers.
+    column_name_to_split : str, optional
+        Column used to partition the data into chunks (e.g. cadastral zone).
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        Parts enriched with the neighbour / cluster columns.
+    """
     # Split the data into chunks for parallel processing
     if column_name_to_split is not None:
 
@@ -605,6 +874,32 @@ def detect_close_buildings_parallel(gdf_building_parts, buffer_neighbours, neigh
 
 def detect_close_parcels_parallel(gdf_parcels, buffer_neighbours, neighbours_column_name,
                           neighbours_id_column_name="single_building_reference", num_workers=4, column_name_to_split=None):
+    """Parcel-level counterpart of :func:`detect_close_buildings_parallel`.
+
+    Detects, in parallel, which cadastral parcels lie within
+    ``buffer_neighbours`` of each other and records each parcel's neighbours in
+    ``neighbours_column_name``.
+
+    Parameters
+    ----------
+    gdf_parcels : geopandas.GeoDataFrame
+        Parcels to analyse.
+    buffer_neighbours : float
+        Proximity buffer (metres).
+    neighbours_column_name : str
+        Output neighbour-list column.
+    neighbours_id_column_name : str, default "single_building_reference"
+        Identity column used as node id.
+    num_workers : int, default 4
+        Number of parallel workers.
+    column_name_to_split : str, optional
+        Column used to partition the data into chunks.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        Parcels enriched with the neighbour column.
+    """
     # Split the data into chunks for parallel processing
     if column_name_to_split is not None:
 
@@ -911,6 +1206,21 @@ def calculate_floor_footprints(gdf, group_by=None, geometry_name="geometry", onl
     return gpd.GeoDataFrame(floor_footprints, crs=crs)
 
 def get_all_patios(geoseries):
+    """Extract all interior rings (patios/courtyards) as polygons.
+
+    Collects the holes of every Polygon/MultiPolygon in ``geoseries`` and returns
+    them as standalone Polygon geometries.
+
+    Parameters
+    ----------
+    geoseries : iterable of shapely geometries
+        Building footprints to inspect.
+
+    Returns
+    -------
+    list[shapely.geometry.Polygon]
+        One polygon per interior ring found.
+    """
     interiors = []
 
     for geom in geoseries:
@@ -1097,6 +1407,25 @@ def calculate_wall_outdoor_normal_orientation(segment, orientation_interval=None
     return angle_degrees
 
 def create_ray_from_centroid(centroid, angle, length=1000):
+    """Return a ``LineString`` ray from ``centroid`` at a compass ``angle``.
+
+    ``angle`` is measured in degrees clockwise from north (0° = +y). Used to cast
+    orientation/shadow rays.
+
+    Parameters
+    ----------
+    centroid : shapely.geometry.Point
+        Ray origin.
+    angle : float
+        Direction in degrees clockwise from north.
+    length : float, default 1000
+        Ray length in the coordinate units.
+
+    Returns
+    -------
+    shapely.geometry.LineString
+        The two-point ray.
+    """
     angle_rad = math.radians(angle)
     x = centroid.x + length * math.sin(angle_rad)
     y = centroid.y + length * math.cos(angle_rad)
@@ -1171,11 +1500,38 @@ def make_dem_sampler(dem_raster_dir, source_crs):
     dem_crs = rds.crs
     same_crs = (source_crs is None) or (str(source_crs) == str(dem_crs))
 
+    # Read the band once and bilinearly interpolate, so sampling a grid finer
+    # than (or comparable to) the DEM resolution yields a smooth surface rather
+    # than nearest-neighbour steps. Falls back to nearest sampling if the band
+    # cannot be held in memory.
+    _band = None
+    _inv = None
+    try:
+        from scipy.ndimage import map_coordinates as _map_coordinates
+        _band = rds.read(1, masked=True).astype('float64').filled(np.nan)
+        nodata = rds.nodata
+        if nodata is not None:
+            _band[_band == nodata] = np.nan
+        _inv = ~rds.transform   # (x, y) -> fractional (col, row)
+    except Exception:
+        _band = None
+
     def sampler(xs, ys):
         if not same_crs:
             xs_d, ys_d = warp_transform(source_crs, dem_crs, list(xs), list(ys))
         else:
             xs_d, ys_d = list(xs), list(ys)
+        if _band is not None:
+            xa = np.asarray(xs_d, dtype='float64')
+            ya = np.asarray(ys_d, dtype='float64')
+            # Inverse affine → fractional pixel coords; -0.5 shifts pixel-corner
+            # convention to pixel-centre (array-index) convention.
+            cols = _inv.a * xa + _inv.b * ya + _inv.c - 0.5
+            rows = _inv.d * xa + _inv.e * ya + _inv.f - 0.5
+            vals = _map_coordinates(
+                _band, [rows, cols], order=1, mode='nearest', cval=np.nan)
+            return list(vals)
+        # Fallback: nearest-neighbour sampling.
         return [v[0] for v in rds.sample(zip(xs_d, ys_d))]
 
     sampler.close = rds.close
@@ -1184,6 +1540,10 @@ def make_dem_sampler(dem_raster_dir, source_crs):
 
 # Function to convert MultiPolygon to a list of Polygons, or leave a Polygon unchanged
 def convert_to_polygons(geometry):
+    """Return a list of ``Polygon`` parts from a Polygon or MultiPolygon.
+
+    Raises ``TypeError`` for any other geometry type.
+    """
     if isinstance(geometry, MultiPolygon):
         return [poly for poly in geometry]
     elif isinstance(geometry, Polygon):
@@ -1193,6 +1553,10 @@ def convert_to_polygons(geometry):
 
 # Function to convert a geometry into one or more LinearRings
 def convert_to_linearrings(geom):
+    """Convert a Polygon/MultiPolygon/LineString/LinearRing into LinearRing(s).
+
+    Returns the exterior ring(s); raises ``ValueError`` for other types.
+    """
     if isinstance(geom, LinearRing):
         return geom
     if isinstance(geom, LineString):
@@ -1206,6 +1570,11 @@ def convert_to_linearrings(geom):
 
 # Function to convert a geometry into one or more LineStrings
 def convert_to_linestrings(geom):
+    """Convert a Polygon/MultiPolygon/LinearRing/LineString into LineString(s).
+
+    Polygon exteriors are oriented clockwise before conversion; raises for other
+    geometry types.
+    """
     if isinstance(geom, LineString):
         return [geom]
 
@@ -1995,7 +2364,28 @@ def compute_floor_shadow_region(building_geom, nearby_buildings,
 
 def get_streets_open_street_maps(open_street_dir, ine_code=None, cadaster_code=None, query_location=None,
                                       crs=None):
+    """Fetch (and cache) the OpenStreetMap street network for a municipality.
 
+    The municipality is resolved from ``ine_code``/``cadaster_code`` (or a free
+    ``query_location``); results are cached under ``open_street_dir`` so repeat
+    calls skip the network.
+
+    Parameters
+    ----------
+    open_street_dir : str
+        Cache directory for OSM downloads.
+    ine_code, cadaster_code : str, optional
+        Municipality selector (one of these or ``query_location`` is required).
+    query_location : str, optional
+        Free-text place query (e.g. ``"Barcelona, Spain"``).
+    crs : optional
+        Target CRS for the returned geometries.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        The street-network edges for the municipality.
+    """
     if not query_location:
         if not ine_code:
             if cadaster_code:
@@ -2069,6 +2459,12 @@ def get_streets_open_street_maps(open_street_dir, ine_code=None, cadaster_code=N
     return streets_gdf
 
 def build_osmnx_tags(osm_tags_structured):
+    """Flatten a structured POI tag tree into an osmnx ``tags`` dict.
+
+    Collapses the per-subgroup value lists of ``osm_tags_structured`` (e.g.
+    :data:`OSM_TAGS_STRUCTURED`) into ``{main_key: [all values]}`` suitable for
+    ``osmnx.features_from_*``.
+    """
     tags = {}
 
     for main_key, subgroups in osm_tags_structured.items():
@@ -2081,6 +2477,12 @@ def build_osmnx_tags(osm_tags_structured):
 
 
 def build_poi_columns(osm_tags_structured):
+    """Build a tag-value → POI column-name lookup from the structured tag tree.
+
+    Returns ``{main_key: {tag_value: "main_key.sub_key"}}`` (or just ``main_key``
+    when the subgroup is ``"all"``), used to bucket POIs into group/subgroup
+    columns.
+    """
     col_map = {}
 
     for main_key, subgroups in osm_tags_structured.items():
@@ -2093,6 +2495,131 @@ def build_poi_columns(osm_tags_structured):
                 col_map[main_key][v] = col_name
 
     return col_map
+
+# POI groups actually consumed downstream (see mergers.join_pois GROUPS_OF_INTEREST).
+# The heavy ``building``/``historic`` groups are intentionally not parsed: they
+# pull hundreds of thousands of polygons and are dropped downstream anyway.
+POI_SOURCE_KEYS = ["amenity", "emergency", "healthcare", "leisure", "office", "shop", "tourism"]
+
+# In-memory cache of parsed subregion POIs, keyed by (subregion_slug, crs_out),
+# so a whole province (231 municipalities in one extract) parses the PBF once.
+_SUBREGION_POI_CACHE = {}
+
+
+def _normalize_ccaa_name(name):
+    """Normalize an autonomous-community name for lookup (upper, collapse spaces)."""
+    return re.sub(r"\s+", " ", str(name).strip().upper())
+
+
+def cadaster_code_to_geofabrik_subregion(cadaster_code):
+    """Return the Geofabrik subregion slug covering a cadastral municipality code.
+
+    Resolves the municipality's autonomous community offline (from the bundled
+    INE↔INSPIRE table) and maps it to the matching Geofabrik OSM extract.
+    """
+    from hypercadaster_ES import downloaders
+    naming = get_administrative_divisions_naming([cadaster_code])
+    if naming.empty:
+        raise ValueError(f"Could not resolve autonomous community for cadaster code {cadaster_code}.")
+    ccaa = naming["autonomous_community_name"].iloc[0]
+    slug = downloaders.AUTONOMOUS_COMMUNITY_TO_GEOFABRIK.get(_normalize_ccaa_name(ccaa))
+    if slug is None:
+        raise ValueError(f"No Geofabrik OSM subregion mapped for autonomous community '{ccaa}'.")
+    return slug
+
+
+def _wanted_poi_attribute_columns():
+    """Set of OSM tag columns to retain for the parsed POI groups (from POIS_COLS)."""
+    cols = set(POIS_COLS["general"])
+    for group in POI_SOURCE_KEYS:
+        spec = POIS_COLS.get(group)
+        if not spec:
+            continue
+        cols.update(spec.get("general", []))
+        for sub_vals in spec.get("subgroups", {}).values():
+            cols.update(sub_vals)
+    return cols
+
+
+def load_subregion_pois(subregion_slug, pbf_path, open_street_dir, crs_out="EPSG:25831"):
+    """Parse (and cache) all POIs of interest for a whole Geofabrik subregion.
+
+    Reads the local ``.osm.pbf`` with pyrosm in a single pass over
+    :data:`POI_SOURCE_KEYS`, expands the leftover ``tags`` JSON into the columns
+    named in :data:`POIS_COLS`, and reduces each POI geometry to its centroid in
+    ``crs_out``. The result is memoised in-memory and persisted to a GeoParquet
+    file so repeated municipalities (and re-runs) skip the parse.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        One row per POI, geometry = centroid in ``crs_out``, with the group key
+        columns (``amenity``, ``shop`` …) plus retained attribute columns.
+    """
+    cache_key = (subregion_slug, crs_out)
+    if cache_key in _SUBREGION_POI_CACHE:
+        return _SUBREGION_POI_CACHE[cache_key]
+
+    parquet_dir = os.path.join(open_street_dir, "pbf_pois")
+    os.makedirs(parquet_dir, exist_ok=True)
+    parquet_path = os.path.join(parquet_dir, f"{subregion_slug.split('/')[-1]}.parquet")
+
+    if os.path.exists(parquet_path):
+        try:
+            gdf = gpd.read_parquet(parquet_path)
+            if gdf.crs is None or str(gdf.crs) != str(crs_out):
+                gdf = gdf.to_crs(crs_out)
+            _SUBREGION_POI_CACHE[cache_key] = gdf
+            return gdf
+        except Exception:
+            pass
+
+    from pyrosm import OSM
+
+    sys.stderr.write(f"Parsing POIs from OSM extract {subregion_slug} (one-time)...\n")
+    osm = OSM(pbf_path)
+    pois = osm.get_pois(custom_filter={k: True for k in POI_SOURCE_KEYS})
+
+    if pois is None or len(pois) == 0:
+        gdf = gpd.GeoDataFrame(
+            {k: [] for k in POI_SOURCE_KEYS}, geometry=[], crs=crs_out
+        )
+        _SUBREGION_POI_CACHE[cache_key] = gdf
+        return gdf
+
+    pois = pois[pois.geometry.notna()].copy()
+
+    # pyrosm exposes common tags as columns and leaves the rest in a ``tags``
+    # JSON string; expand the columns our schema needs but that pyrosm folded in.
+    wanted = _wanted_poi_attribute_columns() | set(POI_SOURCE_KEYS) | {"id", "name"}
+    if "tags" in pois.columns:
+        needed = [c for c in wanted if c not in pois.columns]
+        if needed:
+            parsed = pois["tags"].apply(
+                lambda s: json.loads(s) if isinstance(s, str) and s else {}
+            )
+            tags_df = pd.DataFrame(parsed.tolist(), index=pois.index)
+            add_cols = [c for c in needed if c in tags_df.columns]
+            if add_cols:
+                pois = pd.concat([pois, tags_df[add_cols]], axis=1)
+
+    if "osm_type" in pois.columns and "element" not in pois.columns:
+        pois["element"] = pois["osm_type"]
+
+    # Centroids in the output CRS (POIs are reduced to points downstream).
+    pois = pois.to_crs(crs_out)
+    pois["geometry"] = pois.geometry.centroid
+
+    keep = [c for c in (wanted | {"element", "geometry"}) if c in pois.columns]
+    gdf = gpd.GeoDataFrame(pois[keep], geometry="geometry", crs=crs_out)
+
+    try:
+        gdf.to_parquet(parquet_path)
+    except Exception as e:
+        sys.stderr.write(f"Warning: could not cache parsed POIs to {parquet_path}: {e}\n")
+
+    _SUBREGION_POI_CACHE[cache_key] = gdf
+    return gdf
 
 OSM_TAGS_STRUCTURED = {
         "amenity": {
@@ -2153,6 +2680,11 @@ OSM_TAGS_STRUCTURED = {
             "rental": ["bicycle_rental","boat_rental","car_rental"]
         }
     }
+
+OSM_TAGS_STRUCTURED = PrettyDict(OSM_TAGS_STRUCTURED)
+"""OpenStreetMap POI taxonomy consumed by the POI layer:
+``group → subgroup → [OSM tag values]``. Drives both the OSM query tags and the
+generated ``poi_{group}[_{subgroup}]`` output columns."""
 
 POIS_COLS = {
     "general": [
@@ -2438,6 +2970,10 @@ POIS_COLS = {
     }
 }
 
+POIS_COLS = PrettyDict(POIS_COLS)
+"""OSM attribute columns retained per category when parsing fetched POIs into
+GeoDataFrames."""
+
 # ------------------------------------------------------------
 # 6️⃣ MAIN PIPELINE
 # ------------------------------------------------------------
@@ -2451,101 +2987,96 @@ def get_pois_open_street_maps(
         buffer_m=200,
         crs_out="EPSG:25831"
 ):
+    """Read (and cache) OpenStreetMap POIs for a municipality, grouped by tag.
 
-    if not query_location:
-        if not ine_code:
-            if cadaster_code:
-                ine_code = cadaster_to_ine_codes([cadaster_code])[0]
-            else:
-                raise("One of these should be defined: ine_code, cadaster_code or query_location.")
-            mun = municipality_name(ine_code)
-            query_location=f"{mun}, Spain"
+    POIs are parsed locally with pyrosm from the Geofabrik ``.osm.pbf`` extract
+    covering the municipality's autonomous community (downloaded and parsed once
+    per subregion, then memoised) instead of being queried tag-by-tag from
+    Overpass. The parsed subregion POIs are clipped to the municipality's
+    cadastral extent (buffered by ``buffer_m``), bucketed into the group/subgroup
+    structure of :data:`OSM_TAGS_STRUCTURED`, and returned organised by
+    group/subgroup.
 
-    os.makedirs(f"{open_street_dir}/POIS_{query_location}", exist_ok=True)
+    Parameters
+    ----------
+    ine_code, cadaster_code, query_location : str, optional
+        Municipality selector (one is required).
+    geolocate_to_cadaster : bool, default True
+        Snap fetched POIs to the cadastral extent using ``cadaster_dir``.
+    cadaster_dir : str, optional
+        Cadastral data directory (used when ``geolocate_to_cadaster``).
+    open_street_dir : str, default "./osm_cache"
+        Cache directory for the downloaded ``.osm.pbf`` extracts (``pbf/``) and
+        the parsed per-subregion POIs (``pbf_pois/``).
+    buffer_m : int, default 200
+        Margin (metres) added around the municipality's cadastral extent when
+        clipping POIs, so edge buildings' proximity rings still capture them.
+    crs_out : str, default "EPSG:25831"
+        CRS of the returned geometries.
 
-    ox.settings.timeout = 300
-    ox.settings.overpass_endpoint = "https://overpass.kumi.systems/api/interpreter"
+    Returns
+    -------
+    dict
+        ``{group: GeoDataFrame}`` or ``{group: {subgroup: GeoDataFrame}}``.
+    """
+
+    # Resolve the cadastral code (needed both to pick the OSM extract and to
+    # derive the cadastral extent used to clip the POIs).
+    if not cadaster_code:
+        if ine_code:
+            cadaster_code = ine_to_cadaster_codes([ine_code])[0]
+        else:
+            raise ValueError("One of these must be defined: ine_code or cadaster_code.")
+
+    if not cadaster_dir:
+        raise ValueError("Cadaster directory (cadaster_dir) must be defined.")
+
+    from hypercadaster_ES import downloaders
+    from hypercadaster_ES.mergers import join_cadaster_parcel
 
     # ------------------------------------------------------------
-    # 1️⃣ GEOMETRY
+    # 1) LOCAL OSM EXTRACT -> subregion POIs (downloaded & parsed once)
     # ------------------------------------------------------------
-    gdf_place = ox.geocode_to_gdf(query_location)
-
-    gdf_place = gdf_place[gdf_place.geometry.notna()]
-    gdf_place.set_geometry("geometry")
-    gdf_place = gdf_place.to_crs(3857)
-
-    polygon = gdf_place.geometry.union_all()
-    polygon = polygon.buffer(buffer_m)
-
-    if polygon.is_empty:
-        raise ValueError("Polygon is empty")
-
-    polygon_wgs = gpd.GeoSeries([polygon], crs=3857).to_crs(4326).iloc[0]
+    subregion_slug = cadaster_code_to_geofabrik_subregion(cadaster_code)
+    pbf_path = downloaders.download_osm_pbf(open_street_dir, subregion_slug)
+    if pbf_path is None:
+        raise RuntimeError(f"Could not obtain OSM extract for subregion '{subregion_slug}'.")
+    sub_pois = load_subregion_pois(subregion_slug, pbf_path, open_street_dir, crs_out=crs_out)
 
     # ------------------------------------------------------------
-    # 2️⃣ ITERATE SUBGROUPS
+    # 2) MUNICIPALITY EXTENT (from cadastral parcels) + CLIP
     # ------------------------------------------------------------
+    parcels_gdf = join_cadaster_parcel(None, cadaster_dir, [cadaster_code], how="left")
+    parcels_gdf = parcels_gdf.set_geometry("parcel_geometry")
+    parcels_gdf = parcels_gdf.to_crs(crs_out)
+
+    if sub_pois.empty or parcels_gdf.empty:
+        clipped = sub_pois.iloc[0:0]
+    else:
+        # Clip to the municipality bounding box widened by ``buffer_m`` so edge
+        # buildings' proximity rings still see nearby POIs.
+        minx, miny, maxx, maxy = parcels_gdf.total_bounds
+        clipped = sub_pois.cx[minx - buffer_m: maxx + buffer_m,
+                              miny - buffer_m: maxy + buffer_m].copy()
+
+    # ------------------------------------------------------------
+    # 3) BUCKET INTO GROUP/SUBGROUP (local, vectorised)
+    # ------------------------------------------------------------
+    # A POI is assigned to every group whose tag it carries (e.g. an amenity that
+    # is also a shop lands in both), matching the previous per-tag Overpass runs.
+    col_map = build_poi_columns({k: OSM_TAGS_STRUCTURED[k] for k in POI_SOURCE_KEYS})
     results = {}
-    total_subgroups = sum(len(v) for v in OSM_TAGS_STRUCTURED.values())
-    bar = tqdm(total=total_subgroups, desc="Loading POI subgroups",
-               mininterval=1.0, leave=True, ncols=80)
-
-    for main_key, subgroups in OSM_TAGS_STRUCTURED.items():
-
-        for sub_key, values in subgroups.items():
-
-            subgroup_name = f"{main_key}.{sub_key}" if sub_key != "all" else main_key
-            fn = f"{open_street_dir}/POIS_{query_location}/{subgroup_name}.gpkg"
-
-            # ----------------------------------------------------
-            # LOAD CACHE
-            # ----------------------------------------------------
-            if os.path.exists(fn):
-                try:
-                    gdf = gpd.read_file(fn)
-                    results[subgroup_name] = gdf
-                    bar.update(1)
-                    continue
-                except Exception:
-                    pass
-
-            # ----------------------------------------------------
-            # QUERY
-            # ----------------------------------------------------
-            tags = {main_key: values}
-
-            try:
-                gdf = ox.features_from_polygon(polygon_wgs, tags=tags)
-
-                if gdf.empty:
-                    bar.update(1)
-                    continue
-
-                gdf = gdf.reset_index()
-                gdf = gdf[~gdf.geometry.isna()]
-
-                # Normalize geometry - transform to projected CRS before centroid calculation
-                gdf = gdf.to_crs(crs_out)
-                gdf["geometry"] = gdf.geometry.centroid
-
-                # Add metadata column
-                gdf["poi_subgroup"] = subgroup_name
-
-                # Save
-                gdf.to_file(fn, driver="GPKG")
-
-                results[subgroup_name] = gdf
-
-            except Exception as e:
-                # Surface genuine failures to stderr — they're rare and signal
-                # a real problem (network, tag config, etc.).
-                sys.stderr.write(f"[POI FAIL] {subgroup_name}: {e}\n")
-            finally:
-                bar.update(1)
-
-    bar.close()
-
+    for main_key, value_to_subgroup in col_map.items():
+        if main_key not in clipped.columns:
+            continue
+        mapped = clipped[main_key].map(value_to_subgroup)
+        valid = mapped.notna()
+        if not valid.any():
+            continue
+        for subgroup_name, grp in clipped[valid].groupby(mapped[valid], sort=False):
+            grp = grp.copy()
+            grp["poi_subgroup"] = subgroup_name
+            results[subgroup_name] = grp
 
     results = clean_pois(results)
 
@@ -2553,19 +3084,6 @@ def get_pois_open_street_maps(
     # GEOLOCATE TO CADASTRAL REFERENCES
     # -------------------
     if geolocate_to_cadaster:
-        if not cadaster_code or not ine_code:
-            if ine_code and not cadaster_code:
-                cadaster_code = ine_to_cadaster_codes([ine_code])[0]
-
-        if not cadaster_dir:
-            raise ValueError("Cadaster directory (cadaster_dir) must be defined.")
-
-        # Load parcels data
-        from hypercadaster_ES.mergers import join_cadaster_parcel
-
-        parcels_gdf = join_cadaster_parcel(None, cadaster_dir, [cadaster_code], how="left")
-        parcels_gdf = parcels_gdf.set_geometry("parcel_geometry")
-        parcels_gdf = parcels_gdf.to_crs(crs_out)
 
         def geolocate_leaf_gdf(poi_gdf, subgroup_name):
             """
@@ -2652,10 +3170,12 @@ def clean_pois(pois_gdf: dict) -> dict:
         except ValueError:
             subgroup = None
 
-        # Merge shared + specific
+        # Merge shared + specific. ``.get`` guards subgroups present in the tag
+        # taxonomy but absent from POIS_COLS (e.g. tourism.rental), which would
+        # otherwise raise and drop the whole municipality.
         target_cols = (POIS_COLS["general"] +
                        POIS_COLS[group]["general"] +
-                       POIS_COLS[group]["subgroups"][subgroup] if subgroup else [])
+                       POIS_COLS[group]["subgroups"].get(subgroup, []) if subgroup else [])
 
         # Keep only existing columns
         existing_cols = [c for c in target_cols if c in df.columns]
@@ -2673,6 +3193,20 @@ def clean_pois(pois_gdf: dict) -> dict:
 
 
 def detect_number_of_orientations(orientation_lengths: dict, threshold_ratio: float = 0.1):
+    """Count the orientations that carry a significant share of façade length.
+
+    Parameters
+    ----------
+    orientation_lengths : dict
+        ``{orientation_deg: facade_length}``.
+    threshold_ratio : float, default 0.1
+        Minimum fraction of the total length for an orientation to count.
+
+    Returns
+    -------
+    int
+        Number of orientations at or above the threshold.
+    """
     total_length = sum(orientation_lengths.values())
     if total_length == 0:
         return 0  # avoid division by zero
@@ -2717,6 +3251,10 @@ def is_segment_in_contact_with_street(segment, streets, orientation_discrete_int
 
 
 def split_linestring_to_segments(line: LineString):
+    """Split a ``LineString`` into its consecutive two-point segments.
+
+    Raises ``ValueError`` if ``line`` is not a LineString with ≥2 points.
+    """
     if not isinstance(line, LineString) or len(line.coords) < 2:
         raise ValueError("Input must be a LineString with at least two points.")
 
@@ -2728,6 +3266,11 @@ def split_linestring_to_segments(line: LineString):
     return segments
 
 def weighted_circular_mean(degrees, weights):
+    """Weighted circular mean of angles (degrees), returned in ``[0, 360)``.
+
+    Averages via the mean sine/cosine so the wrap-around at 360° is handled
+    correctly (e.g. the mean of 350° and 10° is 0°, not 180°).
+    """
     radians = np.deg2rad(degrees)
     sin_sum = np.sum(np.sin(radians) * weights)
     cos_sum = np.sum(np.cos(radians) * weights)
@@ -2736,6 +3279,7 @@ def weighted_circular_mean(degrees, weights):
     return mean_angle_deg
 
 def discrete_orientation(angle, bin_size=5):
+    """Snap an angle (degrees) to the nearest ``bin_size``-degree bin centre."""
     angle = angle % 360  # Normalize to [0, 360)
     centered_angle = (angle + bin_size / 2) % 360
     return int(centered_angle // bin_size) * bin_size
@@ -2908,6 +3452,13 @@ def plot_shapely_geometries(geometries, labels=None, clusters=None, ax=None, tit
     return ax
 
 def classify_above_ground_floor_names(floor):
+    """Map an above-ground cadastral floor code to a numeric level.
+
+    Interprets Spanish cadastral abbreviations (e.g. ``BJ``/``EN`` → ground,
+    ``PR`` → mezzanine fractions, ``AT``/``+n`` → attic levels, numeric floors as
+    themselves) and returns a float level (attics encoded as ``999+n``), or
+    ``NaN`` for unrecognised/common-area codes.
+    """
     floor = floor.upper()  # Ensure uppercase for consistency
 
     # Common areas
@@ -2974,6 +3525,12 @@ def classify_above_ground_floor_names(floor):
         return np.nan
 
 def classify_below_ground_floor_names(floor):
+    """Map a below-ground cadastral floor code to a negative numeric level.
+
+    Interprets basement/parking abbreviations (e.g. ``PK``/``ST`` → -0.5,
+    ``-n``/``PS n`` → -n). Returns a float level, or ``NaN`` when the code is not
+    a below-ground one.
+    """
     floor = floor.upper()  # Ensure uppercase for consistency
 
     # Parking
@@ -3011,6 +3568,11 @@ def classify_below_ground_floor_names(floor):
         return np.nan
 
 def classify_cadaster_floor_names(floor):
+    """Map any cadastral floor code to a numeric level.
+
+    Tries :func:`classify_above_ground_floor_names` first and falls back to
+    :func:`classify_below_ground_floor_names` for basement codes.
+    """
     agf = classify_above_ground_floor_names(floor)
     if agf is not np.nan:
         return agf
@@ -3021,44 +3583,205 @@ def classify_cadaster_floor_names(floor):
 # ADDRESS COMPACTION UTILITIES
 # ==========================================
 
+def _reorder_inverted_street_name(name):
+    """Un-invert a cadastral street name for human-readable output.
+
+    Spanish cadastre stores street names with the article/preposition moved to
+    the end after a comma (e.g. ``"MANRESA, DE"``, ``"TINTS, DELS"``). This
+    restores the natural reading order by reversing the comma-separated
+    segments: ``"MANRESA, DE" -> "DE MANRESA"``, ``"TINTS, DELS" -> "DELS TINTS"``.
+    Names without a comma are returned unchanged; non-strings pass through.
+    """
+    if not isinstance(name, str):
+        return name
+    parts = [p.strip() for p in name.split(',') if p.strip()]
+    if len(parts) <= 1:
+        return name.strip()
+    return ' '.join(reversed(parts))
+
+
+# Cadastral thoroughfare texts embed the aggregated municipality (pedanía) as an
+# ``AG.<NAME>`` marker somewhere inside the street name, delimited from the rest
+# by ``;``, ``-`` or whitespace, and the marker itself can sit at the start,
+# middle or end (e.g. ``CATRAN;AG.TREDOS``, ``NOU-AG.PALOUET``, ``AG.ESCAS MAJOR``,
+# ``DES;AG.BAGERGUE MARIES``). The municipality is taken as the single token that
+# follows ``AG.`` — best-effort, so a handful of multi-word pedanía names are
+# truncated to their first token.
+_AGGREGATED_MUNICIPALITY_RE = re.compile(r"[;\-\s]*AG\.\s*([^\s;,\-]+)", re.IGNORECASE)
+
+
+def _split_aggregated_municipality(name):
+    """Split a cadastral ``AG.<municipality>`` marker off a street name.
+
+    ``"CATRAN;AG.TREDOS" -> ("CATRAN", "TREDOS")``,
+    ``"AG.ESCAS MAJOR" -> ("MAJOR", "ESCAS")``. Returns ``(clean_name, None)``
+    when no marker is present; non-strings pass through as ``(name, None)``.
+    """
+    if not isinstance(name, str):
+        return name, None
+    m = _AGGREGATED_MUNICIPALITY_RE.search(name)
+    if not m:
+        return name.strip(), None
+    municipality = m.group(1).strip()
+    clean = re.sub(r"\s+", " ", (name[:m.start()] + " " + name[m.end():])).strip()
+    return clean, municipality
+
+
+def _aggregated_municipality_suffix(municipality):
+    """Trailing bracketed note for an aggregated municipality, or ``""``.
+
+    ``"TREDOS" -> " [TREDOS]"`` so ``"CALLE CATRAN;AG.TREDOS, 23"`` renders as
+    ``"CALLE CATRAN, 23 [TREDOS]"``.
+    """
+    return f" [{municipality}]" if municipality else ""
+
+
 def _create_full_street_names(gdf):
     """
     Helper function to create full street name combinations.
-    
+
     Creates the following columns if the required components exist:
     - street_full_label: "{street_type} {street_name}, {street_number_clean_label}"
     - street_full_clean: "{street_type} {street_name}, {street_number_clean}"
+
+    The ``street_type`` acronym is expanded to its full literal ("CR" ->
+    "CARRETERA") and the ``street_name`` component is un-inverted via
+    :func:`_reorder_inverted_street_name`, so ``"CR MANRESA, DE, 50"`` renders as
+    ``"CARRETERA DE MANRESA, 50"`` (matching ``br__building_spaces_postal_address``).
+    An aggregated-municipality (pedanía) ``AG.<NAME>`` marker is lifted out of the
+    name and appended as a bracketed trailing note, so ``"CALLE CATRAN;AG.TREDOS, 23"``
+    renders as ``"CALLE CATRAN, 23 [TREDOS]"``.
     """
+    from hypercadaster_ES import downloaders  # local import: downloaders imports utils
+    _type_map = downloaders.street_type_names
+
+    def _expand_street_type(t):
+        return _type_map.get(t, t) if isinstance(t, str) else t
+
+    def _clean_name(n):
+        # strip the AG.<municipality> marker, then un-invert the remainder
+        clean, _ = _split_aggregated_municipality(n)
+        return _reorder_inverted_street_name(clean)
+
+    def _agg_suffix(n):
+        return _aggregated_municipality_suffix(_split_aggregated_municipality(n)[1])
+
     gdf_result = gdf.copy()
-    
+
     # Define the combinations to create
     street_formats = {
         'street_full_labels': ['street_type', 'street_name', 'street_number_label'],
         'street_full_clean': ['street_type', 'street_name', 'street_number_clean']
     }
-    
+
     created_cols = []
-    
+
     for col_name, required_cols in street_formats.items():
         # Check if all required columns exist
         if all(col in gdf_result.columns for col in required_cols):
             try:
-                # Create the full street name
+                # Create the full street name: expand the street_type acronym
+                # ("CR" -> "CARRETERA") and un-invert the street_name so the
+                # article/preposition leads ("MANRESA, DE" -> "DE MANRESA").
                 gdf_result[col_name] = (
-                    gdf_result[required_cols[0]].fillna('').astype(str) + ' ' +
-                    gdf_result[required_cols[1]].fillna('').astype(str) + ', ' + 
+                    gdf_result[required_cols[0]].map(_expand_street_type).fillna('').astype(str) + ' ' +
+                    gdf_result[required_cols[1]].map(_clean_name).fillna('').astype(str) + ', ' +
                     gdf_result[required_cols[2]].fillna('').astype(str)
                 )
                 # Clean up extra spaces and commas
                 gdf_result[col_name] = gdf_result[col_name].str.replace(r'\s+', ' ', regex=True)
                 gdf_result[col_name] = gdf_result[col_name].str.replace(r',\s*$', '', regex=True)
                 gdf_result[col_name] = gdf_result[col_name].str.strip()
-                
+                # Append the aggregated-municipality note AFTER the number
+                gdf_result[col_name] = (
+                    gdf_result[col_name] + gdf_result[required_cols[1]].map(_agg_suffix).fillna('')
+                )
+
                 created_cols.append(col_name)
             except Exception:
                 pass  # Silently skip failed column creation
-    
+
     return gdf_result
+
+def flat_gdf_to_building_spaces_resolution(gdf, building_reference_col="building_reference"):
+    """Explode a building-level (Geo)DataFrame to one row per building space.
+
+    Each ``br__building_spaces_<name>`` column holds a ``{use_type: [values]}``
+    dict, with the lists aligned across all such columns (they are built
+    together, per building, in the CAT aggregation). This flattens them into a
+    long DataFrame with one row per individual building space, carrying:
+
+    - ``use_type`` — the space's inferred primary use,
+    - one column per ``<name>`` with the ``br__building_spaces_`` prefix rewritten
+      to ``building_space_`` (``building_space_reference``,
+      ``building_space_postal_address``, ``building_space_inner_address``,
+      ``building_space_floor_number``, ``building_space_floors``,
+      ``building_space_category``, ``building_space_effective_year``,
+      ``building_space_area_without_communal``, ``building_space_area_with_communal``,
+      ``building_space_economic_value``, ``building_space_detailed_use_type``, ...),
+    - **every other column of** ``gdf`` (building-level context: geometry, areas,
+      elevation, POIs, the scalar ``br__*`` aggregates, administrative names,
+      ...), replicated on each space row.
+
+    ``br__building_spaces_by_floor`` (a per-floor summary, not a per-space list)
+    is excluded from the exploded columns but, being building-level, is retained
+    as a context column. Buildings with no per-space data (e.g. undeveloped
+    parcels) contribute no rows.
+
+    Parameters
+    ----------
+    gdf : (Geo)DataFrame
+        Building-level frame produced by :func:`hypercadaster_ES.merge`.
+    building_reference_col : str, default "building_reference"
+        Building id column; kept as context and used to order the output.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per building space.
+    """
+    prefix = "br__building_spaces_"
+    out_prefix = "building_space_"
+    excluded_per_space = {"br__building_spaces_by_floor"}
+
+    def _is_per_space(v):
+        # per-space columns are {use_type: [values]} dicts; excludes scalars,
+        # NaN, and the {..: count} by-floor summary
+        return (isinstance(v, dict) and len(v) > 0
+                and all(isinstance(x, list) for x in v.values()))
+
+    candidate_cols = [
+        c for c in gdf.columns
+        if c.startswith(prefix) and c not in excluded_per_space
+    ]
+
+    records = []
+    for _, row in gdf.iterrows():
+        consumed = [c for c in candidate_cols if _is_per_space(row[c])]
+        if not consumed:
+            continue
+        exploded = {out_prefix + c[len(prefix):]: row[c] for c in consumed}
+        # building-level context = everything not exploded as a per-space column
+        context = {c: row[c] for c in gdf.columns if c not in consumed}
+        # All per-space columns share the same {use_type: [...]} shape; use the
+        # first as the reference for the use-type keys and per-use list lengths.
+        ref = exploded[next(iter(exploded))]
+        for use_type, values in ref.items():
+            for i in range(len(values)):
+                rec = dict(context)
+                rec["use_type"] = use_type
+                for name, by_use in exploded.items():
+                    seq = by_use.get(use_type)
+                    rec[name] = seq[i] if isinstance(seq, list) and i < len(seq) else None
+                records.append(rec)
+
+    result = pd.DataFrame(records)
+    if not result.empty:
+        lead = [c for c in (building_reference_col, "use_type") if c in result.columns]
+        rest = [c for c in result.columns if c not in lead]
+        result = result[lead + rest]
+    return result
+
 
 def normalize_street_number(series):
     """
@@ -3098,6 +3821,10 @@ def normalize_street_number(series):
     return pd.Series(labels), pd.Series(cleans)
 
 def is_valid_value(val):
+    """Return whether ``val`` is a meaningful (non-empty, non-NaN) value.
+
+    False for None, NaN floats and empty lists/arrays; True otherwise.
+    """
     if val is None:
         return False
 
@@ -3122,7 +3849,31 @@ def compact_addresses(
     ],
     create_full_street_names=True,
     use_unique_for_admin=True):
+    """Collapse multiple address rows per building into one row of lists.
 
+    Buildings with several addresses are reduced to a single row where the
+    address/geolocation columns become lists; administrative columns are kept as
+    single values when uniform (``use_unique_for_admin``). Optionally builds
+    combined ``street_full*`` labels.
+
+    Parameters
+    ----------
+    gdf : geopandas.GeoDataFrame
+        Address-level frame (one row per address).
+    building_reference_col : str, default "building_reference"
+        Column identifying the building to group by.
+    address_cols, geolocation_cols, admin_cols : list[str]
+        Columns treated as per-address, geolocation, and administrative.
+    create_full_street_names : bool, default True
+        Also emit combined ``street_full*`` label columns.
+    use_unique_for_admin : bool, default True
+        Keep a single value for administrative columns when uniform per building.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        One row per building with list-valued address columns.
+    """
     sys.stderr.write(f"\nCompacting the addresses (Polars optimized)\n")
 
     if gdf.empty:
@@ -3251,6 +4002,12 @@ def compact_addresses(
 # ==========================================
 # SHADOW VISUALIZATION
 # ==========================================
+
+# Half-width (m) of the square XY window used by the shadow-analysis spatial
+# panels. `plot_building_3d_geometry` reuses it so both views frame the same
+# ground area around the building.
+SHADOW_PLOT_EXTENT_R = 150.0
+
 
 def plot_building_shadows_analysis(gdf, building_reference, output_path=None, interactive=True,
                                    include_elevation=True, floor_height=None, wd=None):
@@ -3628,12 +4385,144 @@ def _draw_polygon_polar(ax, geom, centroid_xy, *, facecolor, edgecolor,
         ax.add_patch(patch)
 
 
-def _render_dem_panel(ax, terrain_grid, building_footprint_general, centroid_xy):
-    """Render the DEM contour map (bilinear-upsampled 5 m grid) on `ax`.
-    The general building footprint is overlaid (recentred on the centroid).
+def _terrain_point_cloud(elev, gx, gy):
+    """Flatten a DEM grid into an unstructured (x, y, z) point cloud of pixel
+    samples, dropping non-finite cells. The grid structure is discarded — the
+    samples are treated as scattered points."""
+    GX, GY = np.meshgrid(gx, gy)
+    xs = GX.ravel(); ys = GY.ravel(); zs = elev.ravel()
+    finite = np.isfinite(zs)
+    return xs[finite], ys[finite], zs[finite]
+
+
+def _build_terrain_tin(elev, gx, gy, adaptive=False, max_points=300, tol=0.20):
+    """Triangulated Irregular Network from the DEM treated as a **point cloud**.
+
+    The grid is flattened to scattered ``(x, y, z)`` samples and Delaunay-
+    triangulated in the XY plane (a terrain height field). Every vertex is a
+    real sample — planar facets, no fabricated undulation.
+
+    - ``adaptive=False`` (default): triangulate the *whole* point cloud.
+    - ``adaptive=True``: greedy point insertion keeps only the samples needed
+      to approximate the surface within `tol` metres (up to `max_points`),
+      giving a lighter, irregular mesh — dense where the terrain bends, sparse
+      where it is flat.
+
+    Returns ``(x, y, z, triangles)`` with ``triangles`` an (M, 3) int array of
+    vertex indices, or ``triangles=None`` on failure.
+    """
+    xs, ys, zs = _terrain_point_cloud(elev, gx, gy)
+    pts = np.column_stack([xs, ys])
+    n = len(zs)
+    if n < 3:
+        return xs, ys, zs, None
+
+    try:
+        from scipy.spatial import Delaunay
+        if not adaptive:
+            # Direct triangulation of the full point cloud.
+            return xs, ys, zs, Delaunay(pts).simplices
+
+        from scipy.interpolate import LinearNDInterpolator
+        # Seed with the four extreme (corner-most) samples.
+        seeds = []
+        for tx, ty in ((xs.min(), ys.min()), (xs.min(), ys.max()),
+                       (xs.max(), ys.min()), (xs.max(), ys.max())):
+            seeds.append(int(np.argmin((xs - tx) ** 2 + (ys - ty) ** 2)))
+        chosen = list(dict.fromkeys(seeds))
+        cap = min(max_points, n)
+        while len(chosen) < cap and len(chosen) >= 3:
+            interp = LinearNDInterpolator(pts[chosen], zs[chosen])
+            zi = interp(pts)
+            err = np.abs(zs - zi)
+            err[~np.isfinite(err)] = 0.0       # outside current hull
+            err[chosen] = 0.0
+            w = int(np.argmax(err))
+            if err[w] < tol:
+                break
+            chosen.append(w)
+        if len(chosen) < 3:
+            return xs, ys, zs, Delaunay(pts).simplices
+        return xs[chosen], ys[chosen], zs[chosen], Delaunay(pts[chosen]).simplices
+    except Exception:
+        try:
+            from scipy.spatial import Delaunay
+            return xs, ys, zs, Delaunay(pts).simplices
+        except Exception:
+            return xs, ys, zs, None
+
+
+def _smooth_terrain_surface(elev, gx, gy, upsample=4, smoothing=0.0):
+    """Interpolate a DEM pixel grid into a smooth fine surface.
+
+    Each pixel value is treated as a sample located at the pixel centroid
+    ``(gx[i], gy[j])`` and a **thin-plate-spline RBF** is fitted through them.
+    A TPS minimises bending energy, so it produces a smooth, generalistic
+    surface without the grid-aligned planes of linear interpolation or the
+    oscillation waves of tensor-product cubic splines. For large grids the
+    fit is done locally (k nearest centroids per query) to stay fast.
+
+    Returns ``(gx_fine, gy_fine, elev_fine)``. Falls back to a cubic
+    ``RectBivariateSpline`` and finally the raw grid if SciPy is unavailable.
+    """
+    ny, nx = elev.shape
+    # Cap the fine resolution so the RBF query count (and the browser mesh)
+    # stay responsive on large grids while remaining visually smooth.
+    _MAX_FINE = 140
+    nxf = min(max(nx * upsample, 2), _MAX_FINE)
+    nyf = min(max(ny * upsample, 2), _MAX_FINE)
+    gx_fine = np.linspace(gx[0], gx[-1], nxf)
+    gy_fine = np.linspace(gy[0], gy[-1], nyf)
+
+    # Preferred: thin-plate-spline radial basis function over pixel centroids.
+    try:
+        from scipy.interpolate import RBFInterpolator
+        GX, GY = np.meshgrid(gx, gy)
+        pts = np.column_stack([GX.ravel(), GY.ravel()])
+        vals = elev.ravel()
+        finite = np.isfinite(vals)
+        pts, vals = pts[finite], vals[finite]
+        n = pts.shape[0]
+        if n >= 4:
+            neighbors = None if n <= 500 else min(n, 64)
+            rbf = RBFInterpolator(
+                pts, vals, kernel='thin_plate_spline',
+                neighbors=neighbors, smoothing=smoothing)
+            GXf, GYf = np.meshgrid(gx_fine, gy_fine)
+            elev_fine = rbf(np.column_stack([GXf.ravel(), GYf.ravel()])
+                            ).reshape(GXf.shape)
+            return gx_fine, gy_fine, elev_fine
+    except Exception:
+        pass
+
+    # Fallback: cubic tensor-product spline.
+    try:
+        from scipy.interpolate import RectBivariateSpline
+        kx = min(3, nx - 1); ky = min(3, ny - 1)
+        if kx >= 1 and ky >= 1:
+            sp = RectBivariateSpline(gy, gx, elev, kx=ky, ky=kx)
+            return gx_fine, gy_fine, sp(gy_fine, gx_fine)
+    except Exception:
+        pass
+
+    return gx, gy, elev
+
+
+def _render_dem_panel(ax, terrain_grid, building_footprint_general, centroid_xy,
+                      interp='tin'):
+    """Render the DEM map on `ax`, the building footprint overlaid (recentred).
+
+    `interp` selects the surface model:
+      - ``'tin'``      : triangulate the DEM as a point cloud (default) —
+                         every sample a vertex, faithful planar facets.
+      - ``'adaptive'`` : decimated irregular network (vertices where the
+                         terrain bends; lighter).
+      - ``'tps'``      : smooth thin-plate-spline through the pixel centroids.
+    (``'linear'`` is accepted as an alias of ``'tin'``.)
     Returns True if anything was drawn.
     """
     import matplotlib.pyplot as plt
+    from matplotlib.tri import Triangulation
     if not (terrain_grid and terrain_grid.get('elev')):
         return False
     try:
@@ -3646,28 +4535,28 @@ def _render_dem_panel(ax, terrain_grid, building_footprint_general, centroid_xy)
         gx = np.arange(nx) * cell - cx_off
         gy = np.arange(ny) * cell - cy_off
 
-        # Interpolate a smooth surface treating each pixel value as a sample
-        # located at that pixel's centroid (gx[i], gy[j]); evaluate a cubic
-        # spline on a fine grid spanning the centroid hull.
-        grid_x_fine, grid_y_fine, elev_fine = gx, gy, elev
-        try:
-            from scipy.interpolate import RectBivariateSpline
-            up = 5
-            grid_x_fine = np.linspace(gx[0], gx[-1], nx * up)
-            grid_y_fine = np.linspace(gy[0], gy[-1], ny * up)
-            kx = min(3, nx - 1); ky = min(3, ny - 1)
-            if kx >= 1 and ky >= 1:
-                spline = RectBivariateSpline(gy, gx, elev, kx=ky, ky=kx)
-                elev_fine = spline(grid_y_fine, grid_x_fine)
-        except ImportError:
-            pass
-
-        # Smooth continuous surface (Gouraud shading on the upsampled grid)
-        # matches the appearance of the 3D go.Surface plot.
-        pm = ax.pcolormesh(grid_x_fine, grid_y_fine, elev_fine,
-                           cmap='terrain', shading='gouraud', alpha=0.88)
-        ax.contour(grid_x_fine, grid_y_fine, elev_fine, levels=10,
-                   colors='saddlebrown', linewidths=0.4, alpha=0.6)
+        if interp in ('tin', 'linear', 'adaptive'):
+            # Treat the DEM as a point cloud and Delaunay-triangulate it.
+            tx, ty, tz, tris = _build_terrain_tin(
+                elev, gx, gy, adaptive=(interp == 'adaptive'))
+            mtri = (Triangulation(tx, ty, tris) if tris is not None
+                    else Triangulation(tx, ty))
+            title_mode = (f'adaptive TIN ({len(tx)} pts)'
+                          if interp == 'adaptive' else f'point-cloud TIN ({len(tx)} pts)')
+            pm = ax.tripcolor(mtri, tz, cmap='terrain',
+                              shading='gouraud', alpha=0.88)
+            ax.tricontour(mtri, tz, levels=10,
+                          colors='saddlebrown', linewidths=0.4, alpha=0.6)
+        else:
+            # Smooth thin-plate-spline surface through the pixel centroids
+            # (no planes, no waves).
+            grid_x_fine, grid_y_fine, elev_fine = _smooth_terrain_surface(
+                elev, gx, gy, upsample=5)
+            pm = ax.pcolormesh(grid_x_fine, grid_y_fine, elev_fine,
+                               cmap='terrain', shading='gouraud', alpha=0.88)
+            ax.contour(grid_x_fine, grid_y_fine, elev_fine, levels=10,
+                       colors='saddlebrown', linewidths=0.4, alpha=0.6)
+            title_mode = 'thin-plate spline ×5'
         plt.colorbar(pm, ax=ax, fraction=0.04, pad=0.02, label='Elev (m)')
 
         # General building footprint (recentred) — blue so it reads
@@ -3684,8 +4573,7 @@ def _render_dem_panel(ax, terrain_grid, building_footprint_general, centroid_xy)
         ax.set_xlabel('East offset (m)')
         ax.set_ylabel('North offset (m)')
         ax.set_title(
-            f'DEM  ({cell:.0f} m grid, ±{nx * cell / 2:.0f} m, '
-            f'centroid spline ×5)'
+            f'DEM  ({cell:.0f} m grid, ±{nx * cell / 2:.0f} m, {title_mode})'
         )
         return True
     except Exception:
@@ -3807,7 +4695,7 @@ def _build_multipoly_shadow_page(shadow_data, building_reference, floor_height):
 
     cx, cy = (general_footprint.centroid.x, general_footprint.centroid.y) \
         if general_footprint is not None else (0.0, 0.0)
-    extent_r = 150.0
+    extent_r = SHADOW_PLOT_EXTENT_R
 
     n_cols = 4
     n_rows_polars = math.ceil(n_floors_plot / n_cols)
@@ -4053,6 +4941,40 @@ def _extract_shadow_data(building_row):
 # ==========================================
 # NEIGHBORING MUNICIPALITIES
 # ==========================================
+_PREPARED_CENSUS_CACHE = {}
+
+
+def _load_prepared_census(census_file):
+    """Load ``validated_census`` once and cache the prepared frame.
+
+    Returns a GeoDataFrame with ``CUMUN`` as ``str`` and geometry in a metric
+    CRS (EPSG:3857 when the source is geographic), or ``None`` if the schema is
+    invalid. The cache is keyed by (path, mtime) so an updated file is picked up.
+    """
+    try:
+        key = (census_file, os.path.getmtime(census_file))
+    except OSError:
+        key = (census_file, None)
+    cached = _PREPARED_CENSUS_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    census_gdf = gpd.read_file(census_file)
+    if census_gdf.empty:
+        _PREPARED_CENSUS_CACHE[key] = census_gdf
+        return census_gdf
+    if "CUMUN" not in census_gdf.columns:
+        raise ValueError("CUMUN column not found in census data")
+    census_gdf["CUMUN"] = census_gdf["CUMUN"].astype(str)
+    if census_gdf.crs is None:
+        raise ValueError("Census CRS is undefined")
+    if census_gdf.crs.is_geographic:
+        census_gdf = census_gdf.to_crs(3857)
+
+    _PREPARED_CENSUS_CACHE[key] = census_gdf
+    return census_gdf
+
+
 def get_neighboring_cadaster_codes(
     cadaster_codes,
     census_tracts_dir,
@@ -4090,7 +5012,7 @@ def get_neighboring_cadaster_codes(
         cadaster_codes = [cadaster_codes]
 
     # ------------------------------------------------------------
-    # 2️⃣ Load census tracts
+    # 2️⃣ Load census tracts (cached, reprojected)
     # ------------------------------------------------------------
     census_file = f"{census_tracts_dir}//validated_census_{year}.gpkg"
 
@@ -4098,28 +5020,16 @@ def get_neighboring_cadaster_codes(
         print("[WARN] Census file not found")
         return cadaster_codes if include_original else []
 
-    census_gdf = gpd.read_file(census_file)
+    # This function is called once per municipality inside the batch loop, so
+    # re-reading/re-projecting the (national) census file every call dominates
+    # the loop's fixed overhead. Cache the prepared frame — CUMUN normalised to
+    # str and reprojected to a metric CRS — keyed by path. Callers below only
+    # filter/union/intersect it, never mutate, so sharing the object is safe.
+    census_gdf = _load_prepared_census(census_file)
 
-    if census_gdf.empty:
+    if census_gdf is None or census_gdf.empty:
         print("[WARN] Census GeoDataFrame is empty")
         return cadaster_codes if include_original else []
-
-    # ------------------------------------------------------------
-    # 3️⃣ Validate schema
-    # ------------------------------------------------------------
-    if "CUMUN" not in census_gdf.columns:
-        raise ValueError("CUMUN column not found in census data")
-
-    census_gdf["CUMUN"] = census_gdf["CUMUN"].astype(str)
-
-    # ------------------------------------------------------------
-    # 4️⃣ CRS fix (buffer requires projected CRS)
-    # ------------------------------------------------------------
-    if census_gdf.crs is None:
-        raise ValueError("Census CRS is undefined")
-
-    if census_gdf.crs.is_geographic:
-        census_gdf = census_gdf.to_crs(3857)
 
     # ------------------------------------------------------------
     # 5️⃣ Convert cadaster → INE
@@ -4241,14 +5151,26 @@ def agg_op(df, funcs, grouping, variable, multiplier=1, divider=1):
 
     grouped_result = grouped.apply(lambda x: apply_funcs(x, funcs)).reset_index()
 
-    # Build nested dictionary
+    # Build the (possibly nested) dictionary. ``grouped_result`` is already
+    # sorted by the grouping columns (pandas groupby sorts by default), so a
+    # single insertion pass reproduces the same sorted key order the old
+    # recursive groupby-per-level builder produced — but without the
+    # per-group DataFrame.drop() that dominated the runtime on large inputs.
     def build_nested_dict(df, group_cols, value_col):
         if len(group_cols) == 1:
             return dict(zip(df[group_cols[0]], df[value_col]))
-        result = {}
-        for key, group_df in df.groupby(group_cols[0]):
-            result[key] = build_nested_dict(group_df.drop(columns=group_cols[0]), group_cols[1:], value_col)
-        return result
+        # Index via numpy arrays (not .tolist()) so key/value scalar types match
+        # the old recursive builder exactly (e.g. np.int32 floor keys).
+        key_cols = [df[c].to_numpy() for c in group_cols]
+        values = df[value_col].to_numpy()
+        root = {}
+        last = len(group_cols) - 1
+        for i in range(len(values)):
+            node = root
+            for lvl in range(last):
+                node = node.setdefault(key_cols[lvl][i], {})
+            node[key_cols[last][i]] = values[i]
+        return root
 
     return build_nested_dict(grouped_result, grouping, '_adjusted_value')
 
@@ -4276,10 +5198,44 @@ def _read_inferred_indicators_from_db(cadaster_code, wd, table):
 
 
 def read_br_inferred_indicators(cadaster_code, wd):
+    """Read the building-reference inference table (``br_results``) from the DB.
+
+    Excludes the heavy BLOB columns (fetch those with
+    :func:`get_heavy_columns_for_building`).
+
+    Parameters
+    ----------
+    cadaster_code : str
+        Municipality cadastral code.
+    wd : str
+        Working directory passed to ``hc.merge``.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per building with the ``br__*`` indicators.
+    """
     return _read_inferred_indicators_from_db(cadaster_code, wd, "br_results")
 
 
 def read_sbr_inferred_indicators(cadaster_code, wd):
+    """Read the space/single-building inference table (``sbr_results``) from the DB.
+
+    Excludes the heavy BLOB columns (fetch those with
+    :func:`get_heavy_columns_for_building`, ``table="sbr_results"``).
+
+    Parameters
+    ----------
+    cadaster_code : str
+        Municipality cadastral code.
+    wd : str
+        Working directory passed to ``hc.merge``.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per single-building-reference with the ``sbr__*`` indicators.
+    """
     return _read_inferred_indicators_from_db(cadaster_code, wd, "sbr_results")
 
 
@@ -4376,6 +5332,8 @@ def read_addresses_indicators(cadaster_code, wd):
 # ==========================================
 
 def plot_points_with_indices(points, pdf_file):
+    """Plot an ordered sequence of ``(x, y)`` points, labelling each by index,
+    and save the figure to ``pdf_file`` (debugging aid)."""
     x, y = zip(*points)
     plt.figure(figsize=(8, 6))
     plt.plot(x, y, marker='o', linestyle='-', color='blue', label='Path')
@@ -4392,6 +5350,12 @@ def plot_points_with_indices(points, pdf_file):
 
 
 def plot_polygons_group(poly_list, poly2, pdf_file, color1='skyblue', color2='lightcoral'):
+    """Plot a group of polygons plus one highlighted polygon and save to PDF.
+
+    ``poly_list`` is drawn in ``color1`` and the reference ``poly2`` in
+    ``color2`` (debugging/visualisation aid). All inputs must be shapely
+    ``Polygon``s.
+    """
     fig, ax = plt.subplots(figsize=(8, 6))
 
     # Plot each polygon in the list
@@ -4466,6 +5430,20 @@ def cut(line: LineString, start_dist: float, end_dist: float) -> LineString:
 LineString.cut = cut
 
 def shorten_linestring(line: LineString, percent: float) -> LineString:
+    """Trim a ``LineString`` by ``percent`` of its length at each end.
+
+    Parameters
+    ----------
+    line : shapely.geometry.LineString
+        Line to trim (must have ≥2 points).
+    percent : float
+        Fraction (0–0.5) of the total length to remove from each end.
+
+    Returns
+    -------
+    shapely.geometry.LineString
+        The trimmed line.
+    """
     if not isinstance(line, LineString) or len(line.coords) < 2:
         raise ValueError("Input must be a LineString with at least two points.")
 
@@ -4479,6 +5457,11 @@ def shorten_linestring(line: LineString, percent: float) -> LineString:
     return line.cut(trim_start, trim_end)
 
 def plot_linestrings_and_polygons(linestrings, polygons=None, pdf_file=None):
+    """Plot a mix of LineStrings and (optional) polygons on one axis.
+
+    Debugging/visualisation aid; saves to ``pdf_file`` when given, otherwise
+    shows the figure.
+    """
     fig, ax = plt.subplots(figsize=(10, 8))
 
     # Plot LineStrings
@@ -4676,7 +5659,8 @@ _WALL_TYPE_DEFAULT = '#AAAAAA'
 # Horizontal structural slab/roof surfaces (br__structural_floors). Kept
 # visually distinct from the (vertical) wall palette above.
 _STRUCTURAL_FLOOR_COLOURS = {
-    'adiabatic': '#884EA0',   # slab between two floors (purple)
+    'interior':  '#884EA0',   # slab between two stacked zones (purple)
+    'adiabatic': '#884EA0',   # legacy alias for 'interior'
     'roof':      '#C0392B',   # top exposed to air (red)
     'floor':     '#16A085',   # underside exposed to air / overhang (teal)
     'terrain':   '#7E5109',   # on/under ground (dark brown)
@@ -4720,8 +5704,629 @@ def _triangulate_polygon_xy(poly):
     return verts, tris
 
 
-def plot_building_dem(gdf, building_reference, output_path=None, wd=None, dpi=150):
+def open_patio_voids_by_floor(footprint_by_floor, patio_voids,
+                              coverage_threshold=0.5):
+    """Per floor, the courtyard voids that are still OPEN (not yet roofed over).
+
+    A patio is an interior courtyard open to the sky. Per-floor geometry
+    analysis can miss it on an upper floor whose footprint failed to close the
+    interior ring, so this works from the building-wide set of detected
+    courtyards (`patio_voids`) instead of any single floor. A courtyard is
+    "open" at a floor while that floor's footprint does not cover it, and
+    "capped" (the first roof) at the first floor that builds over it — above
+    which it is no longer a patio.
+
+    Parameters
+    ----------
+    footprint_by_floor : dict[int, shapely geometry]
+        Union of the building's footprint per floor index.
+    patio_voids : iterable[shapely Polygon]
+        All courtyard void polygons detected anywhere in the building.
+    coverage_threshold : float, default 0.5
+        A courtyard counts as covered (roofed) at a floor once this fraction of
+        its area is overlapped by that floor's footprint.
+
+    Returns
+    -------
+    dict[int, list[shapely Polygon]]
+        floor index -> list of courtyard voids open at that floor. Floors with
+        no open courtyard are omitted.
+    """
+    voids = [p for p in (patio_voids or [])
+             if p is not None and not getattr(p, 'is_empty', True)
+             and getattr(p, 'area', 0.0) > 0.0]
+    if not voids:
+        return {}
+    out = {}
+    for fl, fp in footprint_by_floor.items():
+        if fp is None or getattr(fp, 'is_empty', True):
+            continue
+        open_here = []
+        for v in voids:
+            try:
+                covered = v.intersection(fp).area
+            except Exception:
+                covered = 0.0
+            if covered < coverage_threshold * v.area:
+                open_here.append(v)
+        if open_here:
+            out[fl] = open_here
+    return out
+
+
+def _split_polygon_by_area_fraction(poly, frac):
+    """Cut `poly` into two pieces (a, b) where `a` carries ~`frac` of the area,
+    by a straight line perpendicular to the longest bounding-box axis (binary
+    search on the cut position). Returns (a, b) or (None, None) on failure."""
+    from shapely.geometry import box
+    try:
+        minx, miny, maxx, maxy = poly.bounds
+        w, h = maxx - minx, maxy - miny
+        if w <= 0 or h <= 0:
+            return None, None
+        target = poly.area * frac
+        if w >= h:
+            lo, hi = minx, maxx
+            for _ in range(30):
+                c = (lo + hi) / 2.0
+                if poly.intersection(box(minx, miny, c, maxy)).area < target:
+                    lo = c
+                else:
+                    hi = c
+            c = (lo + hi) / 2.0
+            return (poly.intersection(box(minx, miny, c, maxy)),
+                    poly.intersection(box(c, miny, maxx, maxy)))
+        lo, hi = miny, maxy
+        for _ in range(30):
+            c = (lo + hi) / 2.0
+            if poly.intersection(box(minx, miny, maxx, c)).area < target:
+                lo = c
+            else:
+                hi = c
+        c = (lo + hi) / 2.0
+        return (poly.intersection(box(minx, miny, maxx, c)),
+                poly.intersection(box(minx, c, maxx, maxy)))
+    except Exception:
+        return None, None
+
+
+def _subdivide_polygon_weighted(poly, weights):
+    """Partition `poly` into ``len(weights)`` sub-polygons whose areas are
+    proportional to `weights`, by recursive area-balanced bisection. Returns a
+    list aligned with `weights` (entries may be None if a split fails)."""
+    n = len(weights)
+    if n == 0:
+        return []
+    if n == 1 or poly is None or getattr(poly, 'is_empty', True):
+        return [poly]
+    total = float(sum(weights)) or 1.0
+    target = total / 2.0
+    cum, m = 0.0, 1
+    for idx in range(n):
+        cum += weights[idx]
+        if cum >= target:
+            m = idx + 1
+            break
+    m = max(1, min(n - 1, m))
+    frac = sum(weights[:m]) / total
+    a, b = _split_polygon_by_area_fraction(poly, frac)
+    if a is None:
+        return [poly] + [None] * (n - 1)
+    return (_subdivide_polygon_weighted(a, weights[:m])
+            + _subdivide_polygon_weighted(b, weights[m:]))
+
+
+def _principal_axis_angle(poly):
+    """Angle (degrees) of the building's principal axis — the long edge of its
+    minimum rotated rectangle. Used to orient zone partition cuts along the
+    building's own directions rather than world X/Y."""
+    try:
+        mrr = poly.minimum_rotated_rectangle
+        coords = list(mrr.exterior.coords)
+        best_len, best_ang = -1.0, 0.0
+        for i in range(len(coords) - 1):
+            x0, y0 = coords[i][:2]
+            x1, y1 = coords[i + 1][:2]
+            length = math.hypot(x1 - x0, y1 - y0)
+            if length > best_len:
+                best_len, best_ang = length, math.degrees(math.atan2(y1 - y0, x1 - x0))
+        return best_ang
+    except Exception:
+        return 0.0
+
+
+def _subdivide_polygon_weighted_oriented(poly, weights, angle=0.0, origin=(0.0, 0.0)):
+    """Like `_subdivide_polygon_weighted` but with the bisection cuts aligned to
+    the building's principal axes: the polygon is rotated by ``-angle`` about
+    ``origin`` (so the principal axis lands on X/Y), subdivided, and the pieces
+    are rotated back."""
+    if abs(angle) < 1e-9:
+        return _subdivide_polygon_weighted(poly, weights)
+    from shapely.affinity import rotate as _rot
+    rp = _rot(poly, -angle, origin=origin)
+    pieces = _subdivide_polygon_weighted(rp, weights)
+    out = []
+    for p in pieces:
+        if p is None or getattr(p, 'is_empty', True):
+            out.append(p)
+        else:
+            out.append(_rot(p, angle, origin=origin))
+    return out
+
+
+def _subdivide_ring_angular(ring, center, weights, start_angle=0.0):
+    """Partition an annular ``ring`` (a region surrounding ``center``) into
+    contiguous angular WEDGES whose areas are proportional to ``weights``, by
+    sweeping the polar angle around ``center``. Returns a list aligned with
+    ``weights``.
+
+    Used to tile the floor area around a central communal core: unlike straight
+    recursive bisection — which cuts an annulus into pieces that become
+    DISCONNECTED across the central hole (their minor lobe then gets dropped) —
+    each angular wedge stays connected for a ring that is star-shaped about
+    ``center`` (the typical building floor around a central stair/lift core).
+    Sweep starts at ``start_angle`` (radians, CCW from +x) so the ordering can
+    be aligned to the building's main axis.
+    """
+    n = len(weights)
+    if n == 0:
+        return []
+    if n == 1 or ring is None or getattr(ring, "is_empty", True):
+        return [ring] + [None] * (n - 1)
+    total_area = ring.area
+    if total_area <= 0:
+        return [ring] + [None] * (n - 1)
+    cx, cy = center
+    minx, miny, maxx, maxy = ring.bounds
+    R = 2.0 * max(maxx - cx, cx - minx, maxy - cy, cy - miny, 1.0) + 10.0
+    total_w = float(sum(weights)) or 1.0
+
+    def _sector(a0, a1):
+        """Fan polygon from ``center`` covering angles [a0, a1] (radius R)."""
+        steps = max(2, int(math.degrees(a1 - a0) / 5.0) + 1)
+        pts = [(cx, cy)]
+        for k in range(steps + 1):
+            a = a0 + (a1 - a0) * k / steps
+            pts.append((cx + R * math.cos(a), cy + R * math.sin(a)))
+        return Polygon(pts)
+
+    out = []
+    cursor = start_angle
+    for i in range(n):
+        if i == n - 1:
+            a_end = start_angle + 2.0 * math.pi
+        else:
+            target = total_area * (sum(weights[: i + 1]) / total_w)
+            lo, hi = cursor, start_angle + 2.0 * math.pi
+            for _ in range(30):
+                mid = (lo + hi) / 2.0
+                try:
+                    a = ring.intersection(_sector(start_angle, mid)).area
+                except Exception:
+                    a = 0.0
+                if a < target:
+                    lo = mid
+                else:
+                    hi = mid
+            a_end = (lo + hi) / 2.0
+        try:
+            piece = ring.intersection(_sector(cursor, a_end))
+        except Exception:
+            piece = None
+        out.append(piece)
+        cursor = a_end
+    return out
+
+
+def _carve_central_rect(poly, target_area, angle=0.0, origin=(0.0, 0.0)):
+    """Carve a CENTRAL, axis-aligned (in the frame rotated by ``-angle``)
+    RECTANGLE of area ≈ ``target_area`` from ``poly``, centred on ``poly``'s
+    centroid and matching the footprint's aspect ratio. Returns (core,
+    remainder). Unlike ``_carve_central_eroded`` (which yields a ROUNDED core and
+    hence rounded-corner slivers in the surrounding ring), this gives a clean
+    rectangular core so the perimeter bands of ``_subdivide_ring_rectangular``
+    tile the ring exactly. Size is binary-searched so the clipped area matches."""
+    from shapely.affinity import rotate as _rot
+    from shapely.geometry import box as _box
+    if poly is None or getattr(poly, "is_empty", True) or target_area <= 0:
+        return None, poly
+    if target_area >= poly.area:
+        return poly, None
+    rp = _rot(poly, -angle, origin=origin)
+    c = rp.centroid
+    cx, cy = c.x, c.y
+    minx, miny, maxx, maxy = rp.bounds
+    W, H = maxx - minx, maxy - miny
+    aspect = (W / H) if H > 1e-9 else 1.0
+    rh0 = (target_area / aspect) ** 0.5 if aspect > 0 else target_area ** 0.5
+    rw0 = aspect * rh0
+    lo, hi = 0.0, 2.0
+    for _ in range(30):
+        s = (lo + hi) / 2.0
+        rect = _box(cx - s * rw0 / 2, cy - s * rh0 / 2,
+                    cx + s * rw0 / 2, cy + s * rh0 / 2)
+        try:
+            a = rp.intersection(rect).area
+        except Exception:
+            a = 0.0
+        if a < target_area:
+            lo = s
+        else:
+            hi = s
+    s = (lo + hi) / 2.0
+    rect = _box(cx - s * rw0 / 2, cy - s * rh0 / 2,
+                cx + s * rw0 / 2, cy + s * rh0 / 2)
+    try:
+        core_r = rp.intersection(rect)
+        rem_r = rp.difference(rect)
+    except Exception:
+        return None, poly
+    core = _rot(core_r, angle, origin=origin)
+    rem = _rot(rem_r, angle, origin=origin)
+    return core, rem
+
+
+def _subdivide_ring_rectangular(ring, core, weights, angle=0.0, origin=(0.0, 0.0)):
+    """Partition an annular ``ring`` (floor minus a central ``core``) into
+    RECTANGULAR blocks whose areas are proportional to ``weights``.
+
+    Robust against the annular-cut fragility: rather than cutting straight across
+    the ring (which splits a zone into disconnected lobes across the central
+    hole), the ring is first divided into FOUR simply-connected perimeter bands
+    around the core's bounding box (left / top / right / bottom, in the frame
+    rotated by ``-angle`` so the core is axis-aligned). Each band is a hole-free
+    rectangle-like region, so guillotine subdivision (``_subdivide_polygon_
+    weighted``) of it yields rectangular rooms with no disconnected pieces. Bands
+    tile the ring exactly; a band with no assigned zone is merged into the next
+    (cyclically) so no area is left ungapped. Returns a list aligned to
+    ``weights``.
+    """
+    from shapely.affinity import rotate as _rot
+    from shapely.geometry import box as _box
+    from shapely.ops import unary_union as _uu
+    n = len(weights)
+    if n == 0:
+        return []
+    if ring is None or getattr(ring, "is_empty", True):
+        return [None] * n
+    if n == 1:
+        return [ring]
+    rp = _rot(ring, -angle, origin=origin)
+    rc = _rot(core, -angle, origin=origin)
+    cxmin, cymin, cxmax, cymax = rc.bounds
+    fxmin, fymin, fxmax, fymax = rp.bounds
+    cymid = (cymin + cymax) / 2.0
+    # Four perimeter bands that EXACTLY tile the ring (union = ring): left/right
+    # full-height columns beside the core, top/bottom caps split at the core's
+    # mid-height. Each is `ring ∩ box` → hole-free.
+    try:
+        bands = [
+            rp.intersection(_box(fxmin, fymin, cxmin, fymax)),   # left
+            rp.intersection(_box(cxmin, cymid, cxmax, fymax)),   # top
+            rp.intersection(_box(cxmax, fymin, fxmax, fymax)),   # right
+            rp.intersection(_box(cxmin, fymin, cxmax, cymid)),   # bottom
+        ]
+    except Exception:
+        return [None] * n
+    band_area = [b.area if (b is not None and not b.is_empty) else 0.0 for b in bands]
+    tot_band = sum(band_area) or 1.0
+    tot_w = float(sum(weights)) or 1.0
+    # Cumulative band-area fraction boundaries; assign each zone (in order) to the
+    # band containing its cumulative-weight midpoint.
+    cum, acc = [], 0.0
+    for a in band_area:
+        acc += a / tot_band
+        cum.append(acc)
+    groups = [[] for _ in bands]
+    cw = 0.0
+    for i, w in enumerate(weights):
+        mid = (cw + w / 2.0) / tot_w
+        cw += w
+        b = 0
+        while b < len(cum) - 1 and mid > cum[b]:
+            b += 1
+        groups[b].append((i, w))
+    # Merge any band that received no zone into the next band that did (cyclic),
+    # so its area is not left as a gap.
+    band_polys = list(bands)
+    for b in range(len(band_polys)):
+        if not groups[b] and band_polys[b] is not None and not band_polys[b].is_empty:
+            for d in range(1, len(band_polys)):
+                t = (b + d) % len(band_polys)
+                if groups[t]:
+                    try:
+                        band_polys[t] = _uu([band_polys[t], band_polys[b]])
+                    except Exception:
+                        pass
+                    break
+    result = [None] * n
+    for band, grp in zip(band_polys, groups):
+        if not grp or band is None or getattr(band, "is_empty", True):
+            continue
+        gw = [w for _i, w in grp]
+        pieces = _subdivide_polygon_weighted(band, gw)
+        for (idx, _w), piece in zip(grp, pieces):
+            if piece is not None and not getattr(piece, "is_empty", True):
+                result[idx] = _rot(piece, angle, origin=origin)
+    return result
+
+
+def _split_vertical(poly, frac):
+    """Split `poly` with a single vertical line so the LEFT piece carries ~`frac`
+    of the area. Returns (left, right) or (None, None)."""
+    from shapely.geometry import box
+    try:
+        minx, miny, maxx, maxy = poly.bounds
+        if maxx - minx <= 0:
+            return None, None
+        target = poly.area * frac
+        lo, hi = minx, maxx
+        for _ in range(30):
+            c = (lo + hi) / 2.0
+            if poly.intersection(box(minx, miny, c, maxy)).area < target:
+                lo = c
+            else:
+                hi = c
+        c = (lo + hi) / 2.0
+        return (poly.intersection(box(minx, miny, c, maxy)),
+                poly.intersection(box(c, miny, maxx, maxy)))
+    except Exception:
+        return None, None
+
+
+def _subdivide_vertical(poly, weights):
+    """Subdivide `poly` into pieces with areas ∝ `weights`, always cutting
+    vertically, returned LEFT→RIGHT (so weights[0] is the leftmost piece)."""
+    n = len(weights)
+    if n == 0:
+        return []
+    if n == 1 or poly is None or getattr(poly, 'is_empty', True):
+        return [poly]
+    total = float(sum(weights)) or 1.0
+    target = total / 2.0
+    cum, m = 0.0, 1
+    for idx in range(n):
+        cum += weights[idx]
+        if cum >= target:
+            m = idx + 1
+            break
+    m = max(1, min(n - 1, m))
+    a, b = _split_vertical(poly, sum(weights[:m]) / total)
+    if a is None:
+        return [poly] + [None] * (n - 1)
+    return _subdivide_vertical(a, weights[:m]) + _subdivide_vertical(b, weights[m:])
+
+
+def _subdivide_polygon_weighted_directional(poly, weights, stack_angle, origin=(0.0, 0.0)):
+    """Subdivide `poly` into pieces with areas ∝ `weights`, **stacked along the
+    `stack_angle` direction** (degrees, math convention: 0°=E, 90°=N). Cuts are
+    perpendicular to that direction; pieces are returned ordered from the
+    negative end of the direction to the positive end — so with
+    ``stack_angle`` pointing North, ``weights[0]`` lands on the SOUTH side."""
+    from shapely.affinity import rotate as _rot
+    n = len(weights)
+    if n <= 1 or poly is None or getattr(poly, 'is_empty', True):
+        return [poly]
+    # Rotate so the stacking direction maps to +X; cut vertically; rotate back.
+    rp = _rot(poly, -stack_angle, origin=origin)
+    pieces = _subdivide_vertical(rp, weights)
+    return [(_rot(p, stack_angle, origin=origin)
+             if p is not None and not getattr(p, 'is_empty', True) else p)
+            for p in pieces]
+
+
+def _stack_angle_towards_north(principal_angle):
+    """Of the building's two principal axes (`principal_angle`, +90°), return
+    the one most aligned with North–South, oriented to point North (+Y). Used
+    to stack thermal zones from south (high priority) to north."""
+    best_a, best_v = principal_angle, -1.0
+    for a in (principal_angle, principal_angle + 90.0):
+        v = abs(math.sin(math.radians(a)))   # how N–S the axis is
+        if v > best_v:
+            best_v, best_a = v, a
+    a = best_a % 360.0
+    if math.sin(math.radians(a)) < 0:         # flip to point North
+        a = (a + 180.0) % 360.0
+    return a
+
+
+# Thermal-zone south-placement priority (lower rank → more southern). The rest
+# (people living/working) sit between tertiary and the parking/storage group.
+_ZONE_USE_PRIORITY = (
+    (('residential', 'housing', 'dwelling'), 0),
+    (('commercial', 'retail', 'shop'), 1),
+    (('office', 'tertiary'), 2),
+    (('parking', 'warehouse', 'storage', 'garage'), 9),
+)
+
+
+def _zone_south_priority(zone):
+    """Rank a thermal zone for south placement (0 = most southern). Communal
+    cores are interior and not ranked here."""
+    txt = ' '.join(str(zone.get(k, '')) for k in ('use_type',)).lower()
+    det = zone.get('detailed_use_types') or []
+    txt += ' ' + ' '.join(str(d) for d in det).lower()
+    for keys, rank in _ZONE_USE_PRIORITY:
+        if any(k in txt for k in keys):
+            return rank
+    return 5   # the rest (people living/working) — before parking/storage
+
+
+def _carve_central_eroded(poly, target_area):
+    """Carve the **interior** of `poly` whose area ≈ `target_area` by inward
+    erosion (negative buffer). Returns (core_region, remainder).
+
+    The core is the floor footprint shrunk inward until it reaches the target
+    (communal) area, so it always sits in the inner part of the building and
+    follows the building's own shape, with the occupied zones forming the
+    surrounding ring (``poly`` minus the core). The erosion distance is found
+    by binary search; area decreases monotonically with erosion, so ``lo``
+    always holds area > target and ``hi`` area < target.
+    """
+    if poly is None or poly.is_empty or target_area <= 0:
+        return None, poly
+    if target_area >= poly.area:
+        return poly, None
+    minx, miny, maxx, maxy = poly.bounds
+    dmax = max(maxx - minx, maxy - miny) / 2.0   # enough to fully erode
+    lo, hi = 0.0, dmax
+    for _ in range(30):
+        d = (lo + hi) / 2.0
+        try:
+            a = poly.buffer(-d).area
+        except Exception:
+            a = 0.0
+        if a > target_area:
+            lo = d        # still too big → erode more
+        else:
+            hi = d        # too small → erode less
+    d = (lo + hi) / 2.0
+    try:
+        core = poly.buffer(-d)
+        if core.is_empty:
+            core = poly.buffer(-lo)
+    except Exception:
+        return None, poly
+    try:
+        remainder = poly.difference(core)
+    except Exception:
+        remainder = None
+    return core, remainder
+
+
+def _carve_square_block(poly, target_area, direction=None):
+    """Carve a compact, ~square block of area ``target_area`` out of ``poly``,
+    hugging the side indicated by ``direction`` (a unit (dx, dy), e.g. toward a
+    street). Returns (block, remainder).
+
+    Used for non-occupied zones (parking/warehouse) that read better as a
+    square block against the street-facing edge than as a thin strip. The
+    square side is grown by binary search until its clipped area matches; if it
+    can't stay square (footprint too narrow on that side) it degrades to a
+    strip of the available width, which is still compact.
+    """
+    from shapely.geometry import box
+    if poly is None or getattr(poly, 'is_empty', True) or target_area <= 0:
+        return None, poly
+    if target_area >= poly.area:
+        return poly, None
+    minx, miny, maxx, maxy = poly.bounds
+    try:
+        c = poly.centroid
+        cx, cy = c.x, c.y
+    except Exception:
+        cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
+
+    side = 'NE'
+    if direction is not None:
+        dx, dy = direction
+        if abs(dx) >= abs(dy):
+            side = 'E' if dx >= 0 else 'W'
+        else:
+            side = 'N' if dy >= 0 else 'S'
+
+    def _sq(s):
+        if side == 'E':
+            return box(maxx - s, cy - s / 2, maxx, cy + s / 2)
+        if side == 'W':
+            return box(minx, cy - s / 2, minx + s, cy + s / 2)
+        if side == 'N':
+            return box(cx - s / 2, maxy - s, cx + s / 2, maxy)
+        if side == 'S':
+            return box(cx - s / 2, miny, cx + s / 2, miny + s)
+        return box(maxx - s, maxy - s, maxx, maxy)  # NE corner default
+
+    diag = math.hypot(maxx - minx, maxy - miny)
+    lo, hi = 0.0, diag
+    for _ in range(30):
+        s = (lo + hi) / 2.0
+        try:
+            a = poly.intersection(_sq(s)).area
+        except Exception:
+            a = 0.0
+        if a < target_area:
+            lo = s
+        else:
+            hi = s
+    sq = _sq((lo + hi) / 2.0)
+    try:
+        block = poly.intersection(sq)
+        remainder = poly.difference(sq)
+    except Exception:
+        return None, poly
+    return block, remainder
+
+
+def _thermal_zone_render_kind(z):
+    """Classify a thermal-zone dict for rendering: 'communal', 'non_occupied'
+    or 'occupied'. Trusts an explicit ``kind`` when present, else falls back to
+    use-type/detailed heuristics so older data (without the kind) still renders
+    parking/warehouse and pools as non-occupied."""
+    if not isinstance(z, dict):
+        return 'occupied'
+    k = z.get('kind')
+    if k in ('communal', 'non_occupied', 'occupied'):
+        return k
+    ut = str(z.get('use_type', '')).lower()
+    if any(t in ut for t in ('parking', 'warehouse', 'storage', 'garage')):
+        return 'non_occupied'
+    det = ' '.join(str(d) for d in (z.get('detailed_use_types') or [])).lower()
+    if 'pool' in det or z.get('source') == 'other_construction':
+        return 'non_occupied'
+    return 'occupied'
+
+
+def _append_prism_mesh(bucket, region, z_bot, z_top, ox, oy):
+    """Append a closed extruded prism of `region` (between z_bot and z_top) to
+    a Mesh3d vertex/face `bucket` (dict of x/y/z/i/j/k lists), offset by ox/oy.
+    Builds top + bottom faces (triangulated) and vertical side walls."""
+    if region is None or getattr(region, 'is_empty', True):
+        return
+    verts, tris = _triangulate_polygon_xy(region)
+    if verts and tris:
+        for zlevel in (z_bot, z_top):
+            base = len(bucket['x'])
+            for (vx, vy) in verts:
+                bucket['x'].append(vx - ox); bucket['y'].append(vy - oy)
+                bucket['z'].append(zlevel)
+            for (a, b, c) in tris:
+                bucket['i'].append(base + a)
+                bucket['j'].append(base + b)
+                bucket['k'].append(base + c)
+    polys = list(region.geoms) if hasattr(region, 'geoms') else [region]
+    for p in polys:
+        if not hasattr(p, 'exterior'):
+            continue
+        for ring in [p.exterior] + list(p.interiors):
+            cc = list(ring.coords)
+            for ci in range(len(cc) - 1):
+                x0, y0 = cc[ci][:2]; x1, y1 = cc[ci + 1][:2]
+                rx0, ry0 = x0 - ox, y0 - oy
+                rx1, ry1 = x1 - ox, y1 - oy
+                b0 = len(bucket['x'])
+                bucket['x'].extend([rx0, rx1, rx1, rx0])
+                bucket['y'].extend([ry0, ry1, ry1, ry0])
+                bucket['z'].extend([z_bot, z_bot, z_top, z_top])
+                bucket['i'].extend([b0,     b0])
+                bucket['j'].extend([b0 + 1, b0 + 2])
+                bucket['k'].extend([b0 + 2, b0 + 3])
+
+
+_THERMAL_ZONE_PALETTE = [
+    '#1F77B4', '#FF7F0E', '#2CA02C', '#D62728', '#9467BD',
+    '#17BECF', '#BCBD22', '#E377C2', '#8C564B', '#7F7F7F',
+]
+_THERMAL_ZONE_COMMUNAL_COLOUR = '#8B5A2B'
+_THERMAL_ZONE_NON_OCCUPIED_COLOUR = '#7F7F7F'  # parking / warehouse / pools
+
+
+def plot_building_dem(gdf, building_reference, output_path=None, wd=None, dpi=150,
+                      terrain_interp='tin'):
     """Standalone DEM contour map for a single building.
+
+    ``terrain_interp``: ``'tin'`` (default — triangulate the DEM as a point
+    cloud), ``'adaptive'`` (decimated irregular network), or ``'tps'`` (smooth
+    thin-plate spline).
 
     Uses the ``br__terrain_grid`` heavy column (auto-fetched from DuckDB
     when *wd* is supplied).  The building's general footprint is overlaid
@@ -4780,7 +6385,7 @@ def plot_building_dem(gdf, building_reference, output_path=None, wd=None, dpi=15
     cy = bfg.centroid.y if bfg is not None else 0.0
 
     fig, ax = plt.subplots(figsize=(8, 7))
-    drawn = _render_dem_panel(ax, terrain_grid, bfg, (cx, cy))
+    drawn = _render_dem_panel(ax, terrain_grid, bfg, (cx, cy), interp=terrain_interp)
     if not drawn:
         print(f"Could not render DEM for building {building_reference}")
         plt.close(fig)
@@ -4993,7 +6598,8 @@ def plot_building_geometry(gdf, building_reference, output_path=None, wd=None, d
 
 
 def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None,
-                               floor_height=3.0):
+                               floor_height=3.0, show_thermal_zones=True,
+                               terrain_interp='tin'):
     """Interactive 3-D view of a building's geometry with terrain and neighbour shadows.
 
     Renders three layers in a single plotly scene:
@@ -5024,6 +6630,13 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
         (``br__wall_segments``, ``br__shadows``, ``br__terrain_grid``).
     floor_height : float, default 3.0
         Height of each storey in metres.
+
+    Notes
+    -----
+    Patio walls and the "no slab over an open patio" rule are resolved during
+    building inference (see ``building_inference`` patio-void handling), so this
+    function simply renders ``br__wall_segments`` / ``br__structural_floors`` as
+    produced. Re-run inference to pick up changes to that logic.
     """
     import plotly.graph_objects as go
 
@@ -5035,7 +6648,7 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
 
     # ---- Auto-fetch heavy columns from DuckDB ---------------------------------
     heavy_cols = ['br__wall_segments', 'br__shadows', 'br__terrain_grid',
-                  'br__building_footprint_by_floor']
+                  'br__building_footprint_by_floor', 'br__thermal_zones']
     missing = [c for c in heavy_cols
                if c not in row.index or row.get(c) is None]
     if wd is not None and missing:
@@ -5105,8 +6718,10 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
 
     traces = []
     all_x, all_y, all_z = [], [], []   # relative coords for range calc
+    tz_trace_info = []                  # [(trace_index, label)] for the zone menu
+    terrain_trace_idx = None            # index of the terrain surface trace
 
-    # ---- Layer 1: Terrain DEM surface (bicubic-upsampled, no pixels) ---------
+    # ---- Layer 1: Terrain DEM surface (smooth thin-plate spline, no pixels) --
     terrain_grid = row.get('br__terrain_grid')
     if isinstance(terrain_grid, dict) and terrain_grid.get('elev'):
         try:
@@ -5121,41 +6736,54 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
             lx = np.arange(tnx) * cell - cx_off
             ly = np.arange(tny) * cell - cy_off
 
-            # Smooth surface by interpolating each pixel value as a sample at
-            # its centroid (lx[i], ly[j]) with a cubic spline on a fine grid.
-            try:
-                from scipy.interpolate import RectBivariateSpline
-                up = 4
-                lx_f = np.linspace(lx[0], lx[-1], tnx * up)
-                ly_f = np.linspace(ly[0], ly[-1], tny * up)
-                kx = min(3, tnx - 1); ky = min(3, tny - 1)
-                if kx >= 1 and ky >= 1:
-                    _sp = RectBivariateSpline(ly, lx, elev, kx=ky, ky=kx)
-                    elev_f = _sp(ly_f, lx_f)
-                else:
-                    elev_f, lx_f, ly_f = elev, lx, ly
-            except ImportError:
-                elev_f, lx_f, ly_f = elev, lx, ly
-
             # Use terrain centre elevation as ground_z fallback
             if ground_z is None:
                 ground_z = float(elev[tny // 2, tnx // 2])
-
             oz = ground_z
-            elev_rel = elev_f - oz           # height above building ground
 
-            GX, GY = np.meshgrid(lx_f, ly_f)
-            traces.append(go.Surface(
-                x=GX, y=GY, z=elev_rel,
-                colorscale='earth', showscale=True,
-                colorbar=dict(title='Height above ground (m)', thickness=12, len=0.5, x=1.02),
-                opacity=0.85,
-                name='Terrain',
-                hovertemplate='ΔX=%{x:.1f} m<br>ΔY=%{y:.1f} m<br>h=%{z:.1f} m<extra></extra>',
-            ))
-            all_x.extend([float(lx_f[0]), float(lx_f[-1])])
-            all_y.extend([float(ly_f[0]), float(ly_f[-1])])
-            all_z.extend([float(elev_rel.min()), float(elev_rel.max())])
+            # DEM height legend along the BOTTOM of the plot.
+            _terrain_cbar = dict(title='Height above ground (m)',
+                                 orientation='h', thickness=12, len=0.6,
+                                 x=0.5, xanchor='center', y=0.0, yanchor='top')
+
+            if terrain_interp in ('tin', 'linear', 'adaptive'):
+                # Treat the DEM as a point cloud and Delaunay-triangulate it
+                # into a TIN — faithful planar facets, every vertex a real
+                # sample, no fabricated undulation.
+                tx, ty, tz, tris = _build_terrain_tin(
+                    elev, lx, ly, adaptive=(terrain_interp == 'adaptive'))
+                zs = tz - oz
+                mesh_kw = (dict(i=tris[:, 0], j=tris[:, 1], k=tris[:, 2])
+                           if tris is not None else dict(delaunayaxis='z'))
+                traces.append(go.Mesh3d(
+                    x=tx, y=ty, z=zs,
+                    intensity=zs, colorscale='earth', showscale=True,
+                    colorbar=_terrain_cbar,
+                    opacity=0.85, name='Terrain', flatshading=True,
+                    hovertemplate='ΔX=%{x:.1f} m<br>ΔY=%{y:.1f} m<br>h=%{z:.1f} m<extra></extra>',
+                    **mesh_kw,
+                ))
+                terrain_trace_idx = len(traces) - 1
+                all_x.extend([float(tx.min()), float(tx.max())])
+                all_y.extend([float(ty.min()), float(ty.max())])
+                all_z.extend([float(np.nanmin(zs)), float(np.nanmax(zs))])
+            else:
+                # Smooth thin-plate-spline surface through the pixel centroids.
+                lx_f, ly_f, elev_f = _smooth_terrain_surface(elev, lx, ly, upsample=4)
+                elev_rel = elev_f - oz       # height above building ground
+                GX, GY = np.meshgrid(lx_f, ly_f)
+                traces.append(go.Surface(
+                    x=GX, y=GY, z=elev_rel,
+                    colorscale='earth', showscale=True,
+                    colorbar=_terrain_cbar,
+                    opacity=0.85,
+                    name='Terrain',
+                    hovertemplate='ΔX=%{x:.1f} m<br>ΔY=%{y:.1f} m<br>h=%{z:.1f} m<extra></extra>',
+                ))
+                terrain_trace_idx = len(traces) - 1
+                all_x.extend([float(lx_f[0]), float(lx_f[-1])])
+                all_y.extend([float(ly_f[0]), float(ly_f[-1])])
+                all_z.extend([float(np.nanmin(elev_rel)), float(np.nanmax(elev_rel))])
         except Exception:
             pass  # terrain is nice-to-have
 
@@ -5170,24 +6798,39 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
     shadows_geom = row.get('br__shadows')
     if isinstance(shadows_geom, dict) and shadows_geom:
         try:
-            # Determine buffer radius: max distance of any shadow vertex from origin
-            shadow_radius = 0.0
+            # Distances of every shadow vertex from the centroid.
+            _radii = []
             for poly in shadows_geom.values():
                 if poly is None or (hasattr(poly, 'is_empty') and poly.is_empty):
                     continue
                 for g in (list(poly.geoms) if hasattr(poly, 'geoms') else [poly]):
                     if hasattr(g, 'exterior'):
                         for xp, yp, *_ in g.exterior.coords:
-                            d = math.sqrt((xp - ox) ** 2 + (yp - oy) ** 2)
-                            shadow_radius = max(shadow_radius, d)
-            # Segments are on the circle if both endpoints are within 2 % of radius
-            circle_tol = shadow_radius * 0.02 if shadow_radius > 0 else 0.0
+                            _radii.append(math.hypot(xp - ox, yp - oy))
+            shadow_radius = max(_radii) if _radii else 0.0
+
+            # In open-sky directions the shadow polygon runs all the way out to
+            # the analysis buffer, forming a dense outer band near the search
+            # radius that is separated from the real, blocker-cast shadows by a
+            # radial gap. Find the largest gap in the outer region (> 0.85 R)
+            # and cut there, so the buffer-circle band AND the spokes reaching
+            # it are dropped entirely; fall back to trimming the outer 2 %.
+            cut_radius = shadow_radius * 0.98 if shadow_radius > 0 else 0.0
+            if shadow_radius > 0:
+                _outer = sorted(r for r in _radii if r > 0.85 * shadow_radius)
+                _best_gap, _best_at = 0.0, None
+                for _i in range(len(_outer) - 1):
+                    _g = _outer[_i + 1] - _outer[_i]
+                    if _g > _best_gap:
+                        _best_gap, _best_at = _g, _outer[_i]
+                if _best_at is not None and _best_gap >= 3.0:
+                    cut_radius = _best_at + 1e-6
 
             def _on_circle(x0, y0, x1, y1):
-                d0 = math.sqrt((x0 - ox) ** 2 + (y0 - oy) ** 2)
-                d1 = math.sqrt((x1 - ox) ** 2 + (y1 - oy) ** 2)
-                return (d0 >= shadow_radius - circle_tol and
-                        d1 >= shadow_radius - circle_tol)
+                # A segment is a buffer-circle artefact if EITHER endpoint lies
+                # beyond the cut radius (drops both the arc and its spokes).
+                return (math.hypot(x0 - ox, y0 - oy) > cut_radius or
+                        math.hypot(x1 - ox, y1 - oy) > cut_radius)
 
             shade_colours = ['#7F8C8D', '#95A5A6', '#BDC3C7', '#909090',
                              '#808B96', '#778899', '#A9A9A9', '#696969']
@@ -5237,9 +6880,17 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
             pass  # shades are nice-to-have
 
     # ---- Layer 3: Wall segments (centroid-relative X/Y, ground-relative Z) ---
+    # Draw the SHRUNK wall segments (free façades moved inward to the CAT built
+    # area, party/adiabatic anchored) so the plotted envelope coincides with the
+    # thermal zones (Layer 5) and the EnergyPlus model — one single volumetry.
+    try:
+        from hypercadaster_ES import energy as _energy
+        wall_segments_draw = _energy.shrunk_wall_segments(row) or wall_segments
+    except Exception:
+        wall_segments_draw = wall_segments
     type_verts = {}
     _wall_x, _wall_y, _wall_z = [], [], []   # wall-only coords for scene span
-    for seg in wall_segments:
+    for seg in wall_segments_draw:
         if not isinstance(seg, dict):
             continue
         geom = seg.get('geometry')
@@ -5290,13 +6941,29 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
             name=label, showlegend=True, flatshading=True,
         ))
 
-    # ---- Layer 4: Structural floor/roof slabs (br__structural_floors) --------
-    # Reconstruct the horizontal slab surfaces from the per-floor footprints
-    # and classify each region with the same interface logic used during
-    # inference:  terrain (floor-0 base), adiabatic (slab between two floors),
-    # roof (top exposed to air), floor (overhang underside exposed to air).
+    # ---- Layer 4: Structural floor/roof slabs -------------------------------
+    # Classify each horizontal slab region by the SHRUNK thermal-zone volumetry
+    # (the single geometry shared with the EnergyPlus model), NOT the gross
+    # footprint: terrain (lowest base), interior (slab between two stacked zones),
+    # roof (top with no zone above → exposed to air), floor (underside with no
+    # zone below → exposed to air). Using the zones is what makes air-contact
+    # slabs show correctly instead of being lumped into the interior ("adiabatic")
+    # category. The zones are computed ONCE here and reused by Layer 5.
+    try:
+        from hypercadaster_ES import energy as _energy
+        _space_zones = _energy.synthesize_space_geometry(row)
+    except Exception:
+        _space_zones = []
+    _zone_floor_union = {}
+    for _z in _space_zones:
+        if _z.get('is_pool'):
+            continue                                   # pools are not enclosed slabs
+        for _fl, _poly in (_z.get('floor_polys') or {}).items():
+            if _poly is not None and not getattr(_poly, 'is_empty', True):
+                _zone_floor_union.setdefault(int(_fl), []).append(_poly)
+
     fp_by_floor = row.get('br__building_footprint_by_floor')
-    if isinstance(fp_by_floor, list) and fp_by_floor:
+    if _zone_floor_union or (isinstance(fp_by_floor, list) and fp_by_floor):
         try:
             from shapely.ops import unary_union as _uu_floor
             from shapely import wkb as _swkb_floor
@@ -5309,25 +6976,34 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
                         return None
                 return g
 
-            # Group footprints by floor index → union geometry per floor.
+            # Per-floor union from the thermal zones (single volumetry); fall back
+            # to the gross footprint only if no zones were synthesized.
             floor_union = {}
-            for rec in fp_by_floor:
-                try:
-                    # records are [group, floor, geometry]
-                    _fl = int(rec[1]); _g = _decode_floor_geom(rec[2])
-                except Exception:
-                    continue
-                if _g is None or getattr(_g, 'is_empty', True):
-                    continue
-                floor_union.setdefault(_fl, []).append(_g)
-            for _fl in list(floor_union):
-                try:
-                    floor_union[_fl] = _uu_floor(floor_union[_fl])
-                except Exception:
-                    floor_union[_fl] = None
+            if _zone_floor_union:
+                for _fl, _polys in _zone_floor_union.items():
+                    try:
+                        floor_union[_fl] = _uu_floor(_polys)
+                    except Exception:
+                        floor_union[_fl] = _polys[0] if _polys else None
+            else:
+                for rec in fp_by_floor:
+                    try:
+                        # records are [group, floor, geometry]
+                        _fl = int(rec[1]); _g = _decode_floor_geom(rec[2])
+                    except Exception:
+                        continue
+                    if _g is None or getattr(_g, 'is_empty', True):
+                        continue
+                    floor_union.setdefault(_fl, []).append(_g)
+                for _fl in list(floor_union):
+                    try:
+                        floor_union[_fl] = _uu_floor(floor_union[_fl])
+                    except Exception:
+                        floor_union[_fl] = None
 
             above_floors = [f for f in floor_union if f >= 0]
             max_floor = max(above_floors) if above_floors else -1
+            min_floor = min(floor_union) if floor_union else 0
 
             # region (polygon), type, z-elevation
             struct_regions = []
@@ -5344,27 +7020,36 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
                 except Exception:
                     return None
 
-            # Terrain: base of floor 0 at ground level (z = 0).
-            base0 = floor_union.get(0)
-            if base0 is not None and not base0.is_empty:
-                struct_regions.append((base0, 'terrain', 0.0))
+            # Terrain: base of the lowest floor (slab on/under ground). For a
+            # building with basements this is the deepest underground floor;
+            # otherwise floor 0 at ground level (z = 0).
+            base_lowest = floor_union.get(min_floor)
+            if base_lowest is not None and not base_lowest.is_empty:
+                struct_regions.append((base_lowest, 'terrain', min_floor * floor_height))
 
-            for _f in range(0, max_floor + 1):
+            # Iterate every interface from the lowest floor up to the roof,
+            # below-ground floors included.
+            for _f in range(min_floor, max_floor + 1):
                 a = floor_union.get(_f)
                 if a is None or a.is_empty:
                     continue
                 z_top = (_f + 1) * floor_height        # top-of-floor slab level
                 above = floor_union.get(_f + 1)
                 if above is None or above.is_empty:
-                    struct_regions.append((a, 'roof', z_top))
+                    # Topmost present floor — its top is roof (above ground) or
+                    # the ground slab to floor 0 (below ground).
+                    stype = 'terrain' if _f < 0 else 'roof'
+                    struct_regions.append((a, stype, z_top))
                     continue
                 inter = _safe_inter(a, above)
                 roof_reg = _safe_diff(a, above)        # not covered above → roof
                 over_reg = _safe_diff(above, a)        # overhang underside → floor
                 if inter is not None and not inter.is_empty:
-                    struct_regions.append((inter, 'adiabatic', z_top))
+                    struct_regions.append((inter, 'interior', z_top))
                 if roof_reg is not None and not roof_reg.is_empty:
-                    struct_regions.append((roof_reg, 'roof', z_top))
+                    # Below ground a "not covered above" slab is still earth-
+                    # covered, so it is terrain rather than sky-facing roof.
+                    struct_regions.append((roof_reg, 'terrain' if _f < 0 else 'roof', z_top))
                 if over_reg is not None and not over_reg.is_empty:
                     struct_regions.append((over_reg, 'floor', z_top))
 
@@ -5397,51 +7082,160 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
                     name=label, showlegend=True, flatshading=True,
                     hovertemplate=f'{label}<extra></extra>',
                 ))
+
+            # ---- Layer 5: Thermal zones (one per building space) ------------
+            # Render the exact per-space 3-D zones that feed the EnergyPlus model
+            # (energy.synthesize_space_geometry, computed once above): one prism
+            # per (space, floor). Pools → shallow basin from their real footprint;
+            # parking/warehouse → grey end block; communal core → brown; occupied
+            # → palette. Zones start hidden and are toggled via the checkbox menu.
+            if show_thermal_zones:
+                for _zi, _zone in enumerate(_space_zones):
+                    _kind = _zone.get('kind', 'occupied')
+                    if _kind == 'communal':
+                        colour = _THERMAL_ZONE_COMMUNAL_COLOUR
+                    elif _kind == 'non_occupied':
+                        colour = _THERMAL_ZONE_NON_OCCUPIED_COLOUR
+                    else:
+                        colour = _THERMAL_ZONE_PALETTE[_zi % len(_THERMAL_ZONE_PALETTE)]
+                    bkt = {'x': [], 'y': [], 'z': [], 'i': [], 'j': [], 'k': []}
+                    is_pool = bool(_zone.get('is_pool'))
+                    for _fl, _poly in sorted(_zone.get('floor_polys', {}).items()):
+                        if is_pool:                       # water surface at floor level
+                            _zt = _fl * floor_height
+                            _append_prism_mesh(bkt, _poly, _zt - 1.2, _zt, ox, oy)
+                        else:
+                            _append_prism_mesh(bkt, _poly,
+                                               _fl * floor_height,
+                                               (_fl + 1) * floor_height, ox, oy)
+                    if not bkt['x']:
+                        continue
+                    label = f"Zone: {_zone.get('use_type')}|{_zone.get('reference', '')}"
+                    traces.append(go.Mesh3d(
+                        x=bkt['x'], y=bkt['y'], z=bkt['z'],
+                        i=bkt['i'], j=bkt['j'], k=bkt['k'],
+                        color=colour, opacity=0.45,
+                        name=label, showlegend=True, flatshading=True,
+                        visible='legendonly',   # start hidden; toggle via menu
+                        hovertemplate=f'{label}<extra></extra>',
+                    ))
+                    all_x.extend(bkt['x']); all_y.extend(bkt['y']); all_z.extend(bkt['z'])
+                    tz_trace_info.append((len(traces) - 1, label))
         except Exception:
             pass  # structural slabs are nice-to-have
 
-    # ---- 1:1:1 aspect — XY up to 4× building span (or available data) --------
-    # Z is sized to the building; XY expands to show terrain/shadow context
-    # up to 4× the building footprint or the terrain extent, whichever is less.
-    if _wall_x and _wall_z:
-        wx_span = max(_wall_x) - min(_wall_x)
-        wy_span = max(_wall_y) - min(_wall_y)
-        wz_span = max(_wall_z) - min(_wall_z)
-        bldg_xy = max(wx_span, wy_span, 1.0)
-        wcx     = (min(_wall_x) + max(_wall_x)) / 2
-        wcy     = (min(_wall_y) + max(_wall_y)) / 2
-        wcz     = (min(_wall_z) + max(_wall_z)) / 2
-        # XY: expand to 4× building footprint, capped by available all_x/y data
-        target_xy = bldg_xy * 4.0
-        if all_x:
-            data_xy = max(max(all_x) - min(all_x), max(all_y) - min(all_y))
-            xy_span = min(target_xy, data_xy)
-        else:
-            xy_span = target_xy
-        # Z: building height with small padding
-        z_span  = max(wz_span, 1.0) * 1.3
-        # Use the larger of xy/z so the cube satisfies 1:1:1
-        span    = max(xy_span, z_span)
-        x_range = [wcx - span / 2, wcx + span / 2]
-        y_range = [wcy - span / 2, wcy + span / 2]
-        z_range = [wcz - span / 2, wcz + span / 2]
+    # ---- XY window matched to plot_building_shadows_analysis -----------------
+    # Use the SAME fixed ±extent window the shadow-analysis spatial panels draw
+    # (SHADOW_PLOT_EXTENT_R), centred on the building footprint centroid. Scene
+    # coords are already centroid-relative, so the centre is (0, 0). Z spans the
+    # building height; aspectmode 'data' (set below) keeps a TRUE 1:1:1 metre
+    # scale across X/Y/Z regardless of how the ranges differ.
+    if _wall_z:
+        half = SHADOW_PLOT_EXTENT_R
+        x_range = [-half, half]
+        y_range = [-half, half]
+        # Z must span EVERYTHING drawn (terrain dips well below the building's
+        # base across the 150 m window, plus shadow panels and the building
+        # itself), otherwise the terrain surface is clipped at low altitudes.
+        _zs = all_z if all_z else _wall_z
+        zmin, zmax = min(_zs), max(_zs)
+        zpad = max((zmax - zmin) * 0.05, 0.5)
+        z_range = [zmin - zpad, zmax + zpad]
     else:
-        x_range = y_range = z_range = [-1, 1]
+        x_range = y_range = z_range = [-SHADOW_PLOT_EXTENT_R, SHADOW_PLOT_EXTENT_R]
+
+    # ---- Title: building ref + first 3 (unique) full addresses --------------
+    # Street labels live per-address; after address compaction the cell holds a
+    # list (e.g. ['CL LLOBERA, 47', 'CL NOU, 40', ...]). Keep the COMPLETE
+    # address (street + house number), de-duplicate, take the first 3.
+    _street_names = []
+    for _scol in ('street_full_labels', 'street_full_clean'):
+        if _scol in building_data.columns:
+            for _v in building_data[_scol].dropna():
+                for _it in (_v if isinstance(_v, (list, tuple)) else [_v]):
+                    if _it is None:
+                        continue
+                    _s = str(_it).strip()
+                    if _s and _s not in _street_names:
+                        _street_names.append(_s)
+            if _street_names:
+                break
+    _title = f'3-D building geometry — {building_reference}'
+    if _street_names:
+        _title += '<br>' + ' · '.join(_street_names[:3])
 
     fig = go.Figure(data=traces)
     fig.update_layout(
-        title=f'3-D building geometry — {building_reference}',
+        title=_title,
         scene=dict(
             xaxis=dict(title='ΔX (m)', range=x_range),
             yaxis=dict(title='ΔY (m)', range=y_range),
             zaxis=dict(title='Height above ground (m)', range=z_range),
-            aspectmode='manual',
-            aspectratio=dict(x=1, y=1, z=1),
+            # 'data' keeps a true 1:1:1 metre scale derived from the (possibly
+            # unequal) X/Y/Z ranges, so the XY frame matches the 2-D plot while
+            # the Z axis still spans the full building height.
+            aspectmode='data',
             camera=dict(eye=dict(x=1.5, y=-1.5, z=1.0)),
         ),
         legend=dict(title='Layer', x=0.01, y=0.99),
-        margin=dict(l=0, r=0, b=0, t=40),
+        margin=dict(l=0, r=0, b=60, t=40),
     )
+
+    updatemenus = []
+    annotations = []
+
+    # ---- Terrain visibility toggle ------------------------------------------
+    # Single checkbox-style button: first click hides the terrain surface,
+    # next click shows it again (args / args2 alternate).
+    if terrain_trace_idx is not None:
+        updatemenus.append(dict(
+            type='buttons', direction='down', showactive=True,
+            x=1.02, xanchor='left', y=0.98, yanchor='top',
+            pad={'r': 4, 't': 4, 'b': 4, 'l': 4},
+            bgcolor='#FFFFFF', bordercolor='#CCCCCC', borderwidth=1,
+            font=dict(size=10),
+            buttons=[dict(
+                label='Terrain on/off', method='restyle',
+                args=[{'visible': False}, [terrain_trace_idx]],
+                args2=[{'visible': True}, [terrain_trace_idx]],
+            )],
+        ))
+
+    # ---- Thermal-zone checkbox menu -----------------------------------------
+    # Each zone gets a toggle button: `args` shows it, `args2` hides it again
+    # (Plotly applies args/args2 on alternating clicks → checkbox behaviour).
+    if tz_trace_info:
+        zone_buttons = [dict(
+            label=label,
+            method='restyle',
+            args=[{'visible': True}, [idx]],
+            args2=[{'visible': 'legendonly'}, [idx]],
+        ) for idx, label in tz_trace_info]
+        all_idx = [idx for idx, _ in tz_trace_info]
+        zone_buttons = [
+            dict(label='✓ Show all zones', method='restyle',
+                 args=[{'visible': True}, all_idx]),
+            dict(label='✗ Hide all zones', method='restyle',
+                 args=[{'visible': 'legendonly'}, all_idx]),
+        ] + zone_buttons
+        updatemenus.append(dict(
+            type='buttons', direction='down', showactive=False,
+            x=1.02, xanchor='left', y=0.85, yanchor='top',
+            pad={'r': 4, 't': 4, 'b': 4, 'l': 4},
+            bgcolor='#FFFFFF', bordercolor='#CCCCCC', borderwidth=1,
+            font=dict(size=10),
+            buttons=zone_buttons,
+        ))
+        annotations.append(dict(
+            x=1.02, y=0.87, xref='paper', yref='paper',
+            xanchor='left', yanchor='bottom', showarrow=False,
+            text='<b>Thermal zones</b>', font=dict(size=11),
+        ))
+
+    if updatemenus:
+        fig.update_layout(updatemenus=updatemenus)
+    if annotations:
+        fig.update_layout(annotations=annotations)
 
     if output_path:
         ext = output_path.rsplit('.', 1)[-1].lower() if '.' in output_path else ''

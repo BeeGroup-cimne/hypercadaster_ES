@@ -41,17 +41,17 @@ overall_start = time.time()
 
 try:
     print("Discovering municipalities within bounding box...")
-    ine_codes = hc.get_ine_codes_from_bounding_box(wd, bbox)
+    ine_codes = hc.utils.get_ine_codes_from_bounding_box(wd, bbox)
     print(f"Found {len(ine_codes)} municipalities in bounding box")
     
-    names = hc.municipality_name(ine_codes)
+    names = hc.utils.municipality_name(ine_codes)
     print("Municipalities:")
     pp.pprint(names[:20], compact=True)  # Show first 20 
     if len(names) > 20:
         print(f"... and {len(names)-20} more")
 
     # Convert INE codes to cadastral codes
-    all_cadaster_codes = hc.ine_to_cadaster_codes(ine_codes)
+    all_cadaster_codes = hc.utils.ine_to_cadaster_codes(ine_codes)
     print(f"\nTotal cadastral codes to process: {len(all_cadaster_codes)}")
     
     # Process in batches

@@ -1,483 +1,125 @@
-# Library Structure Documentation
+# Library Structure
 
-This document provides comprehensive documentation of the hypercadaster_ES library structure, including detailed descriptions of all modules, functions, and their capabilities.
+A conceptual map of the package. For the **exhaustive, always-current function
+and class reference**, build the HTML API docs from the docstrings:
 
-## 📁 Core Modules Overview
+```bash
+pip install pdoc
+./scripts/build_api_docs.sh      # writes docs/api/index.html
+```
+
+## 📁 Module map
 
 ```
 hypercadaster_ES/
-├── 📋 __init__.py              # Main package interface
-├── 🎮 functions.py             # Primary entry points (download, merge)
-├── 🔗 mergers.py              # Data joining and merging operations
-├── 📥 downloaders.py          # Data download functionality
-├── 🛠️ utils.py                # Utility functions and helpers
-├── 🏗️ building_inference.py   # Advanced building analysis
-├── 🔌 interoperability.py     # External system integrations
-└── 🗄️ _db.py                  # DuckDB persistence layer (internal)
+├── functions.py         # Primary entry points: download(), merge()
+├── downloaders.py       # Data acquisition (Catastro, INE, DEM, Barcelona open data)
+├── mergers.py           # Joins all sources into one GeoDataFrame; grid/H3 aggregation
+├── building_inference.py# Geometric/space inference (br__* columns, shadows, footprints)
+├── energy.py            # Per-space 3-D thermal model → EnergyPlus IDF
+├── weather.py           # ERA5-Land → climate stats + EPW files
+├── utils.py             # Geometry, codes, plotting and DB read helpers
+├── interoperability.py  # Dataset builders for external tools (e.g. IREC)
+└── _db.py               # DuckDB persistence layer (internal)
 ```
 
-## 🗄️ _db.py — DuckDB Persistence Layer
-
-Internal module providing the DuckDB-based storage backend that replaced pickle
-artifacts in v1.1.0. Owns connection lifecycle, schema DDL, CRS sidecar, and
-GeoDataFrame ↔ DuckDB round-trip helpers.
-
-### Core Functions
-
-| Function | Description |
-|----------|-------------|
-| ``open_db(results_dir)`` | Open central DB (auto-loads spatial extension) |
-| ``ensure_schema(con)`` | Create ``_meta`` and ``zone_status`` tables |
-| ``write_gdf(con, table, gdf)`` | Persist GeoDataFrame (geometry → native GEOMETRY) |
-| ``read_gdf(con, table)`` | Read table back as GeoDataFrame (GEOMETRY → shapely) |
-| ``write_df_safe(con, table, df)`` | DataFrame → DuckDB with lossless round-trip (dict/list → BLOB) |
-| ``read_df_safe(con, table)`` | Inverse of ``write_df_safe`` (BLOB → pickle.loads) |
-| ``read_df_safe_chunks(con, table)`` | Streaming variant — yields pandas chunks |
-| ``get_blob_for_building(results_dir, code, ref)`` | Fetch heavy per-building BLOBs on demand |
-
-### ResultsHandle
-
-``hc.ResultsHandle(db_path, cadaster_code)`` — lightweight wrapper around the
-central DuckDB. Opens a short-lived read-only connection per query.
-
-| Method | Returns |
-|--------|---------|
-| ``.sbr_relation()`` | Lazy DuckDB relation for sbr_results |
-| ``.br_relation()`` | Lazy DuckDB relation for br_results |
-| ``.sbr_iter_batches(n)`` | Iterator of pandas chunks |
-| ``.br_iter_batches(n)`` | Iterator of pandas chunks |
-| ``.sbr_to_pandas()`` | Full sbr DataFrame (escape hatch) |
-| ``.br_to_pandas()`` | Full br DataFrame (escape hatch) |
-| ``.sbr_count()`` | Row count for sbr_results |
-| ``.br_count()`` | Row count for br_results |
-
-### Database Schema
-
-**Structural tables** (created automatically):
-
-| Table | Purpose |
-|-------|---------|
-| ``_meta`` | Key-value store (CRS per table) |
-| ``zone_status`` | Progress ledger (replaces per-zone pickle existence check) |
-
-**Domain tables** (created lazily by writers):
-
-| Table | Source |
-|-------|--------|
-| ``sbr_results`` | Single-building-reference inference output (per-zone shards) |
-| ``br_results`` | Building-reference inference output (per-zone shards) |
-| ``aux_building_parts`` | Per-municipality building parts + proximity flags |
-| ``aux_footprints`` | Per-municipality floor footprints |
-| ``buildings`` | Final merged building GeoDataFrame per municipality |
-
-## 🎮 functions.py - Main Entry Points
-
-The primary interface providing the two main functions users interact with:
-
-### Main Functions
-
-#### `download(wd, province_codes=None, ine_codes=None, cadaster_codes=None, ...)`
-
-Downloads all required datasets for specified geographic areas.
-
-**Parameters:**
-- `wd` (str): Working directory path
-- `province_codes` (list): 2-digit province codes
-- `ine_codes` (list): 5-digit INE municipality codes  
-- `cadaster_codes` (list): Municipal cadastral codes
-- `neighborhood_layer` (bool): Include Barcelona neighborhoods
-- `postal_code_layer` (bool): Include postal code boundaries
-- `census_layer` (bool): Include census tract data
-- `elevation_layer` (bool): Include elevation data
-- `open_data_layers` (bool): Include Barcelona open data
-- `force` (bool): Force re-download existing files
-
-**Features:**
-- Supports province-level, municipality-level, or cadastral code-based selection
-- Configurable data layers (neighborhoods, postal codes, census, elevation, etc.)
-- Automatic directory structure creation
-- Progress tracking and error handling
-
-#### `merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None, ...)`
-
-Processes and merges all downloaded data into unified GeoDataFrame.
-
-**Parameters:**
-- All download parameters plus:
-- `building_parts_inference` (bool): Enable advanced building analysis
-- `building_parts_plots` (bool): Generate visualization plots
-- `use_CAT_files` (bool): Use detailed CAT format files
-- `CAT_files_rel_dir` (str): CAT files directory path
-- `pois_layer` (bool): Fetch POIs from OpenStreetMap and join proximity indicators (default `False`)
-- `compact_addresses` (bool): Collapse multiple address rows per building into lists (default `False`)
-
-**Features:**
-- Optional advanced building inference and analysis
-- Configurable output complexity and detail level
-- Duplicate removal and data quality assurance
-- Memory-efficient processing options
-- POI proximity analysis with caching for OpenStreetMap data
-
-## 🔗 mergers.py - Data Integration Engine
-
-Comprehensive data joining and integration functionality.
-
-### Cadastral Data Integration
-
-#### `join_cadaster_data()`
-Main orchestrator for all cadastral data joins. Coordinates the integration of buildings, addresses, zones, and parcels.
-
-#### `get_cadaster_address()` 
-Extract and process address information with multiple sources:
-- Street names and types
-- Building numbers and specifications
-- Coordinate information
-- Administrative context
-
-#### `join_cadaster_building()`
-Building geometry, attributes, and space classification:
-- Building footprint polygons
-- Construction years and status
-- Usage types and dwelling counts
-- Floor information and areas
-
-#### `join_cadaster_zone()`
-Cadastral zoning and administrative boundary integration:
-- Zone references and classifications
-- Urban vs. disseminated areas
-- Administrative boundaries
-
-#### `join_cadaster_parcel()`
-Parcel geometry and property boundary data:
-- Parcel polygons and centroids
-- Property boundaries
-- Ownership context
-
-#### `join_adm_div_naming()`
-Administrative division names and metadata:
-- Municipality, province, and autonomous community names
-- Official naming and codes
-
-### External Data Integration
-
-#### `join_DEM_raster()`
-Digital Elevation Model height extraction:
-- Ground elevation extraction
-- Terrain analysis preparation
-- Elevation-based calculations
-
-#### `join_by_census_tracts()`
-INE census tract demographic and administrative data:
-- Census boundaries
-- Demographic indicators
-- Statistical context
-
-#### `join_by_neighbourhoods()`
-Barcelona-specific neighborhood boundary integration:
-- Neighborhood boundaries
-- District relationships
-- Local administrative context
-
-#### `join_by_postal_codes()`
-Spanish postal code boundary and routing information:
-- Postal delivery areas
-- Address validation
-- Geographic routing context
-
-### POI Integration
-
-#### `join_pois(gdf, open_street_dir, cadaster_dir, cadaster_codes)`
-Joins Points of Interest (POI) indicators from OpenStreetMap to each building. Called automatically when `pois_layer=True` is passed to `merge()`.
-
-**Process:**
-1. For each cadaster code, fetches POIs via `utils.get_pois_open_street_maps()` with a 200 m boundary buffer.
-2. Organises POIs by group and subgroup (e.g. `amenity / food`, `shop / clothing`).
-3. Adds **direct assignment** columns: how many POIs of each category are located on the building itself.
-4. Adds **proximity count** columns: how many POIs of each category fall within 100 m, 250 m, and 500 m of the building centroid (using a metric CRS for accurate buffering).
-5. Results across multiple municipalities are concatenated before joining, so multi-municipality calls produce a single consistent dataset.
-
-**Output columns per POI group/subgroup** (where `{prefix}` = `poi_{group}` or `poi_{group}_{subgroup}`):
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `{prefix}_count` | Integer | POIs directly assigned to the building |
-| `{prefix}_ids` | List | OSM identifiers of those POIs |
-| `{prefix}_100m` | Integer | POI count within 100 m |
-| `{prefix}_250m` | Integer | POI count within 250 m |
-| `{prefix}_500m` | Integer | POI count within 500 m |
-
-**Groups covered:** `amenity`, `emergency`, `healthcare`, `leisure`, `office`, `shop`, `tourism`
-
-**Caching:** raw OSM query results are cached as GeoPackage files under `open_street/POIS_{municipality}/` so subsequent runs skip the network requests.
-
-### Utility Functions
-
-#### `make_valid()`
-Fix invalid geometries in GeoDataFrames for robust spatial operations.
-
-## 📥 downloaders.py - Data Acquisition
-
-Manages downloading from various Spanish government and open data sources.
-
-### Core Download Infrastructure
-
-#### `download_file()`
-Generic HTTP file downloader with progress tracking:
-- Resume incomplete downloads
-- Progress bars and status reporting
-- Error handling and retry logic
-
-#### `cadaster_downloader()`
-Spanish Cadastral Service (Catastro) data acquisition:
-- Building, parcel, and address data
-- Multiple data formats (SHP, GML)
-- Batch processing for multiple areas
-
-#### `download_postal_codes()`
-Spanish postal code boundary downloads:
-- National postal code coverage
-- Boundary polygons
-- Delivery area information
-
-#### `download_census_tracts()`
-INE census tract boundary and demographic data:
-- Census section boundaries
-- Statistical data integration
-- Administrative hierarchy
-
-#### `download_DEM_raster()`
-National Geographic Institute elevation raster data:
-- Digital elevation models
-- Terrain analysis data
-- Multi-resolution options
-
-### Barcelona Open Data Integration
-
-#### `load_and_transform_barcelona_ground_premises()`
-Commercial establishment data processing:
-- Business location data
-- Activity type classification
-- Ground floor commercial analysis
-
-**Additional Barcelona Features:**
-- Automatic neighborhood and district boundary processing
-- Street addressing and location reference integration
-- Enhanced building context data
-
-### Advanced CAT File Processing
-
-#### `parse_CAT_file()`
-Parse Spanish cadastral CAT format files:
-- Horizontal property divisions
-- Detailed space information
-- Building usage classification
-- Area calculations by space type
-
-**CAT File Capabilities:**
-- Process horizontal property divisions (condominiums)
-- Extract individual unit information and characteristics
-- Building space usage type classification
-- Floor-by-floor area calculations and distributions
-
-## 🛠️ utils.py - Utility Functions & Helpers
-
-Comprehensive collection of utility functions organized by functional category.
-
-### Parallel Processing Utilities
-
-#### `tqdm_joblib()`
-Context manager for progress tracking in parallel operations, enabling efficient processing of large datasets.
-
-### Directory Management
-
-#### Path Generation Functions
-- `create_dirs()`: Create complete directory structure
-- `cadaster_dir_()`, `results_dir_()`: Specialized path generators
-- `open_street_dir_()`, `DEM_raster_dir_()`: Component-specific paths
-- `postal_codes_dir_()`, `neighborhoods_dir_()`: Data layer paths
-
-### Data Conversion & Code Mapping
-
-#### Municipality and Code Management
-- `list_municipalities()`: Available municipalities from cadastral service
-- `ine_to_cadaster_codes()`: Convert INE codes to cadastral codes
-- `cadaster_to_ine_codes()`: Convert cadastral codes to INE codes
-- `municipality_name()`: Official municipality names
-- `get_administrative_divisions_naming()`: Administrative metadata
-
-### File Operations
-
-#### Archive and Format Processing
-- `unzip_directory()`: Batch ZIP file extraction
-- `untar_directory()`: TAR archive extraction with filtering
-- `kml_to_geojson()`: KML to GeoJSON conversion
-
-### Geometric Utilities
-
-#### Basic Geometric Operations
-- `get_bbox()`: Calculate bounding boxes from GeoDataFrames
-- `make_valid()`: Fix invalid geometric objects
-- `concatenate_tiffs()`: Merge multiple GeoTIFF files
-- `create_graph()`: Build spatial relationship graphs
-
-### Spatial Analysis Functions
-
-#### Building Proximity Analysis
-- `detect_close_buildings()`: Identify spatially proximate buildings
-- `detect_close_buildings_parallel()`: Parallel processing version
-- `detect_close_parcels_parallel()`: Parcel proximity analysis
-
-#### Advanced Geometric Processing
-- `union_geoseries_with_tolerance()`: Geometric union with gap filling
-- `calculate_floor_footprints()`: Floor-by-floor geometric calculations
-- `get_all_patios()`: Extract interior courtyards and patios
-- `patios_in_the_building()`: Determine patio-building relationships
-
-#### Geometric Cleaning and Standardization
-- `remove_duplicate_points()`: Clean coordinate sequences
-- `normalize_polygon()`: Standardize polygon vertex ordering
-- `unique_polygons()`: Remove duplicate geometries
-
-### Building Analysis Functions
-
-#### Orientation and Facade Analysis
-- `calculate_wall_outdoor_normal_orientation()`: Building facade orientation
-- `create_ray_from_centroid()`: Generate directional rays
-- `segment_intersects_with_tolerance()`: Geometric intersection analysis
-- `distance_from_points_to_polygons_by_orientation()`: Directional distances
-- `distance_from_centroid_to_polygons_by_orientation()`: Building relationships
-
-### Street & Infrastructure Analysis
-
-#### OpenStreetMap Integration
-- `get_municipality_open_street_maps()`: OSM street network data integration
-- `get_pois_open_street_maps()`: Fetch and cache POIs by municipality; queries OSM via `osmnx` and stores results as GeoPackage files
-- `detect_number_of_orientations()`: Analyze building orientation complexity
-- `is_segment_in_contact_with_street()`: Building-street relationships
-- `split_linestring_to_segments()`: Linear geometry processing
-
-### Data Processing & Classification
-
-#### Statistical and Classification Functions
-- `weighted_circular_mean()`: Circular statistics for orientation
-- `discrete_orientation()`: Discretize continuous orientations
-- `classify_above_ground_floor_names()`: Spanish floor naming
-- `classify_below_ground_floor_names()`: Basement classification
-- `classify_cadaster_floor_names()`: Complete floor standardization
-- `agg_op()`: Advanced aggregation operations
-
-### Result Management
-
-#### Data Loading Functions
-- `read_br_inferred_indicators()`: Building-level analysis results
-- `read_sbr_inferred_indicators()`: Space-level analysis results
-- `read_addresses_indicators()`: Address-level analysis results
-
-### Visualization Utilities
-
-#### Comprehensive Plotting Functions
-- `plot_shapely_geometries()`: Geometric plotting with clustering
-- `plot_points_with_indices()`: Point visualization with labels
-- `plot_polygons_group()`: Multi-polygon comparisons
-- `plot_linestrings_and_polygons()`: Mixed geometry visualization
-
-#### Advanced Geometric Operations
-- `cut()`: Slice LineString geometries between distances
-- `shorten_linestring()`: Trim LineStrings by percentage
-
-## 🏗️ building_inference.py - Advanced Building Analysis
-
-Computationally intensive building analysis and inference pipeline.
-
-### Main Building Analysis Pipeline
-
-#### `process_building_parts()`
-Primary building analysis orchestrator providing:
-- Comprehensive geometric analysis and space inference
-- Building proximity detection and clustering analysis
-- Multi-scale spatial relationship detection
-- Floor footprint calculation and validation
-- Shadow pattern analysis and environmental assessment
-
-### Zone-Level Processing Functions
-
-#### `process_zone()`
-Detailed analysis for individual cadastral zones:
-- Building orientation analysis with street relationship detection
-- Parcel geometry analysis and space optimization
-- Shadow pattern calculation for all floor levels
-- Environmental context analysis (sunlight, wind patterns)
-- Building type classification and usage inference
-
-### CAT File Processing & Analysis
-
-#### `parse_horizontal_division_buildings_CAT_files()`
-Extract detailed building data from CAT format:
-- Process horizontal property divisions (condominiums)
-- Extract individual unit information and characteristics
-- Building space usage type classification
-- Floor-by-floor area calculations and distributions
-
-#### `aggregate_CAT_file_building_spaces()`
-Building space aggregation and summary:
-- Aggregate individual spaces by building reference
-- Calculate usage type percentages and distributions
-- Generate floor-level summaries and statistics
-- Infer missing building characteristics from space data
-
-## 🔌 interoperability.py - External System Integration
-
-Bridges to external analysis and simulation tools.
-
-### Energy Simulation Integration
-
-#### `input_files_for_IREC_simulations()`
-Creates the needed input dataset for IREC's building energy simulations:
-- Building type classification (single-family, multi-family, etc.)
-- Usage percentage calculations (residential, commercial, office, parking)
-- Construction year analysis and renovation detection
-- Floor distribution analysis for energy modeling
-- Location and climate zone assignment
-
-### Visualization & Analysis Support
-
-#### Specialized Plotting Functions
-- `plot_weather_stations()`: Weather cluster visualization for climate analysis
-- `converter_()`: Data structure mapping utilities for external tool compatibility
-
-## 🔄 Data Flow Architecture
-
-### Typical Processing Pipeline
-
-1. **Download Phase** (`functions.download()`)
-   - `downloaders.py` handles all data acquisition
-   - `utils.py` manages directory structure and file operations
-
-2. **Merge Phase** (`functions.merge()`)
-   - `mergers.py` integrates all data sources
-   - `utils.py` provides geometric and processing utilities
-
-3. **Analysis Phase** (optional, `building_parts_inference=True`)
-   - `building_inference.py` performs advanced analysis
-   - `utils.py` provides specialized analysis functions
-
-4. **Export Phase** (optional)
-   - `interoperability.py` prepares data for external tools
-   - `utils.py` provides visualization and export utilities
-
-## 🎯 Usage Patterns
-
-### Basic Usage (Address-focused)
-Uses primarily `functions.py`, `downloaders.py`, and `mergers.py` for straightforward data integration.
-
-### Advanced Analysis
-Adds `building_inference.py` for comprehensive building analysis with geometric inference.
-
-### Energy Simulation Workflow
-Incorporates `interoperability.py` for preparing datasets compatible with building energy simulation tools.
-
-### Custom Analysis
-Leverages `utils.py` functions directly for specialized spatial analysis and visualization workflows.
+The public API is what `import hypercadaster_ES as hc` exposes (see
+`__init__.py`); everything else is internal and may change.
+
+## 🎮 functions.py — entry points
+
+- **`download(wd, ...)`** — fetches every requested layer into `wd`. Select the
+  area with `cadaster_codes`, `ine_codes`, or `province_codes` (combinable).
+  Toggle layers with `neighborhood_layer`, `postal_code_layer`, `census_layer`,
+  `elevation_layer`, `open_data_layers`.
+- **`merge(wd, ...)`** — joins the downloaded layers into a single GeoDataFrame
+  and persists it to the central DuckDB. Key switches:
+  - `building_parts_inference` — run the geometric inference engine
+    (single municipality only; memory-intensive).
+  - `use_CAT_files` — pull detailed space classification from official CAT files.
+  - `pois_layer` — attach OpenStreetMap POI proximity indicators.
+  - `compact_addresses` — collapse multi-address buildings into one row of lists.
+  - `sociodemographic_layer`, `floor_height`, `ground_floor_height`, `num_workers`.
+
+## 🔗 mergers.py — integration & aggregation
+
+Joins buildings, addresses, parcels, zones, census tracts, postal codes,
+neighborhoods (Barcelona), DEM elevation and POIs. Also provides the public
+spatial-aggregation helpers:
+
+- **`aggregate_to_grid(gdf, cell_size_m=100, ...)`** — buildings → regular
+  square grid cells.
+- **`aggregate_to_h3(gdf, resolution=10, ...)`** — buildings → H3 hexagons.
+
+Both take a metric-CRS building GeoDataFrame and a column→aggregation mapping
+(defaults in `DEFAULT_BUILDING_AGGS`).
+
+## 🏗️ building_inference.py — geometric inference
+
+The heavy analysis behind `building_parts_inference=True`: floor footprints,
+adiabatic/party walls, patios, orientation, street relationships, and
+per-floor shadow patterns. Outputs the `br__*` (building-reference) and
+`sbr__*` (space-reference) indicator families consumed by `energy.py`.
+
+## ⚡ energy.py — EnergyPlus model generation
+
+Turns the `br__*` inference columns into a 3-D, per-space thermal model and
+exports an EnergyPlus **IDF** via `eppy` + `geomeppy` (both MIT — no AGPL
+coupling). Public entry points:
+
+- **`build_energy_model(gdf, building_reference, ...)`** → `geomeppy.IDF`
+  (optionally attaches real weather via `weather_year`).
+- **`plot_idf_geometry(idf_path, ...)`** — 3-D viewer for a generated IDF.
+- **`configure(path)` / `get_config()`** — load/read the YAML defaults
+  (`energy_config.yaml`).
+- **`building_archetype(...)`**, **`building_wwr(...)`** — Spanish archetype
+  envelopes and window-to-wall-ratio prediction.
+
+## 🌤️ weather.py — climate data → EPW
+
+Nearest-cell ERA5-Land extraction (with coastal fallback) feeding degree-day
+statistics and cached per-year EPW files:
+
+- **`get_municipality_weather(era5_dir, lat, lon, year, ...)`** — station-style
+  hourly timeseries for the closest cell with data.
+- **`weather_statistics(df_station, hdd_base=18, cdd_base=21, ...)`** — HDD/CDD
+  and temperature/humidity/wind/solar summaries.
+- **`municipality_epw(era5_dir, epw_dir, lat, lon, year, ...)`** — path to a
+  cached EnergyPlus EPW file (built on demand).
+
+## 🗄️ _db.py — DuckDB persistence (internal)
+
+The DuckDB backend that replaced pickle artifacts in v1.1.0: connection
+lifecycle, schema DDL, CRS sidecar, and GeoDataFrame ↔ DuckDB round-trips.
+
+**Tables** written under `results/building_results.duckdb`:
+
+| Table | Contents |
+|-------|----------|
+| `buildings` | Final merged building GeoDataFrame per municipality |
+| `br_results` | Building-reference inference output (shadows, wall segments) |
+| `sbr_results` | Space-reference inference output |
+| `aux_building_parts` | Building parts + proximity flags |
+| `aux_footprints` | Floor footprints |
+| `_meta`, `zone_status` | CRS store and per-zone progress ledger |
+
+**Reading results** (see also `README.md`):
+
+- `hc.utils.read_br_inferred_indicators(cadaster_code, wd)` → pandas DataFrame.
+- `hc.utils.get_heavy_columns_for_building(wd, code, ref, table=...)` — fetch the
+  huge BLOB columns one building at a time (they are excluded from `merge()`
+  output to keep memory bounded).
+- `hc.ResultsHandle(db_path, cadaster_code)` — lazy relations / batch iterators
+  / `.sbr_to_pandas()` / `.br_to_pandas()` escape hatches.
+- `hc._db.open_db(results_dir, read_only=True)` — raw connection for custom SQL.
+
+## 🔄 Data flow
+
+```
+download()  →  merge()  →  [building_parts_inference]  →  energy.py + weather.py
+ (downloaders)  (mergers)      (building_inference)          (IDF + EPW)
+       └──────────────── DuckDB persistence (_db.py) ───────────────┘
+```
 
 ---
 

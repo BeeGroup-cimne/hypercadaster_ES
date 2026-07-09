@@ -3,6 +3,7 @@ import gzip
 import zipfile
 import geopandas as gpd
 import os
+from ._pretty import PrettyDict, PrettyList
 import requests
 import pandas as pd
 import fiona
@@ -12,30 +13,203 @@ from charset_normalizer import from_path
 import time
 import numpy as np
 from tqdm import tqdm
-from joblib import Parallel, delayed
-from joblib.externals.loky import get_reusable_executor
 import rasterio
 from rasterio.merge import merge
 import math
 
-def download_file(dir, url, file):
-    """Download a file from URL to directory if it doesn't exist."""
+def download_file(dir, url, file, *, skip_if_exists=True, chunk_size=1024, timeout=60,
+                  max_retries=3):
+    """Stream-download ``url`` to ``dir/file``, robustly.
+
+    Creates ``dir`` if needed and downloads in chunks (so large files don't have
+    to fit in memory). The download streams to a temporary ``.part`` file that is
+    atomically renamed only on success, so an interrupted transfer never leaves a
+    truncated file behind. Transient failures (dropped connections, timeouts,
+    HTTP 429/5xx) are retried with exponential backoff. On persistent failure the
+    error is logged to stderr rather than raised, so a bulk loop (e.g. a whole
+    province) continues past a dead resource; the missing file is then skipped
+    downstream.
+
+    Parameters
+    ----------
+    dir : str
+        Destination directory (created if missing).
+    url : str
+        Source URL.
+    file : str
+        Output file name within ``dir``.
+    skip_if_exists : bool, default True
+        Return immediately when ``dir/file`` already exists.
+    chunk_size : int, default 1024
+        Streaming chunk size in bytes.
+    timeout : int, default 60
+        Per-request timeout in seconds.
+    max_retries : int, default 3
+        Number of attempts before giving up on transient failures.
+
+    Returns
+    -------
+    None
+    """
     file_path = os.path.join(dir, file)
-    if not os.path.exists(file_path):
+    if skip_if_exists and os.path.exists(file_path):
+        return
+    os.makedirs(dir, exist_ok=True)
+    part_path = file_path + ".part"
+    for attempt in range(1, max_retries + 1):
         try:
-            response = requests.get(url, timeout=30)
-            if response.status_code == 200:
-                with open(file_path, 'wb') as archivo:
-                    archivo.write(response.content)
-            else:
+            response = requests.get(url, stream=True, timeout=timeout)
+            if response.status_code in (429, 500, 502, 503, 504):
+                raise requests.exceptions.RequestException(f"transient status {response.status_code}")
+            if response.status_code != 200:
                 sys.stderr.write(f"Error downloading {file}: Status {response.status_code}\n")
+                return
+            with open(part_path, 'wb') as archivo:
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        archivo.write(chunk)
+            os.replace(part_path, file_path)
+            return
         except requests.exceptions.RequestException as e:
-            sys.stderr.write(f"Error downloading {file}: {e}\n")
+            if os.path.exists(part_path):
+                try:
+                    os.remove(part_path)
+                except OSError:
+                    pass
+            if attempt == max_retries:
+                sys.stderr.write(f"Error downloading {file} after {max_retries} attempts: {e}\n")
+                return
+            time.sleep(min(2 ** attempt, 30))
         except Exception as e:
+            if os.path.exists(part_path):
+                try:
+                    os.remove(part_path)
+                except OSError:
+                    pass
             sys.stderr.write(f"Unexpected error downloading {file}: {e}\n")
+            return
+
+
+# ---------------------------------------------------------------------------
+# OpenStreetMap PBF extracts (Geofabrik)
+# ---------------------------------------------------------------------------
+# POIs are read locally from a Geofabrik ``.osm.pbf`` extract with pyrosm rather
+# than queried tag-by-tag from Overpass: a whole province used to fire thousands
+# of Overpass requests (one per POI subgroup per municipality) and took many
+# hours; a single local extract is parsed once instead.
+#
+# pyrosm's own ``get_data()`` cannot be used for Spain — its subregion table
+# builds URLs from accented display names (e.g. ".../Cataluña-latest.osm.pbf")
+# that Geofabrik answers with an HTML 404 page. The ASCII slugs below are the
+# real files (all verified to return application/octet-stream).
+OSM_PBF_BASE_URL = "https://download.geofabrik.de"
+
+# Autonomous-community name (as spelled in the bundled ine_inspire_codes.xlsx,
+# see :func:`utils.get_administrative_divisions_naming`) -> Geofabrik path.
+AUTONOMOUS_COMMUNITY_TO_GEOFABRIK = {
+    "ANDALUCIA": "europe/spain/andalucia",
+    "ARAGON": "europe/spain/aragon",
+    "ASTURIAS": "europe/spain/asturias",
+    "CANARIAS": "africa/canary-islands",
+    "CANTABRIA": "europe/spain/cantabria",
+    "CASTILLA LA MANCHA": "europe/spain/castilla-la-mancha",
+    "CASTILLA LEON": "europe/spain/castilla-y-leon",
+    "CATALUÑA": "europe/spain/cataluna",
+    "CEUTA": "europe/spain/ceuta",
+    "EXTREMADURA": "europe/spain/extremadura",
+    "GALICIA": "europe/spain/galicia",
+    "ILLES BALEARS": "europe/spain/islas-baleares",
+    "LA RIOJA": "europe/spain/la-rioja",
+    "MADRID": "europe/spain/madrid",
+    "MELILLA": "europe/spain/melilla",
+    "MURCIA": "europe/spain/murcia",
+    "NAVARRA": "europe/spain/navarra",
+    "PAIS VASCO": "europe/spain/pais-vasco",
+    "VALENCIA": "europe/spain/valencia",
+}
+
+
+def download_osm_pbf(open_street_dir, subregion_slug, skip_if_exists=True):
+    """Download (and cache) a Geofabrik OSM PBF extract.
+
+    Parameters
+    ----------
+    open_street_dir : str
+        Directory where ``.osm.pbf`` extracts are cached.
+    subregion_slug : str
+        Geofabrik path without the ``-latest.osm.pbf`` suffix, e.g.
+        ``"europe/spain/cataluna"`` (see :data:`AUTONOMOUS_COMMUNITY_TO_GEOFABRIK`).
+    skip_if_exists : bool, default True
+        Reuse an already-downloaded extract instead of re-fetching.
+
+    Returns
+    -------
+    str
+        Absolute path to the local ``.osm.pbf`` file.
+    """
+    pbf_dir = os.path.join(open_street_dir, "pbf")
+    file_name = f"{subregion_slug.split('/')[-1]}-latest.osm.pbf"
+    file_path = os.path.join(pbf_dir, file_name)
+
+    if skip_if_exists and os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+        return file_path
+
+    os.makedirs(pbf_dir, exist_ok=True)
+    url = f"{OSM_PBF_BASE_URL}/{subregion_slug}-latest.osm.pbf"
+    part_path = file_path + ".part"
+
+    sys.stderr.write(f"Downloading OSM extract {subregion_slug} from Geofabrik...\n")
+    for attempt in range(1, 4):
+        try:
+            response = requests.get(url, stream=True, timeout=120)
+            if response.status_code in (429, 500, 502, 503, 504):
+                raise requests.exceptions.RequestException(f"transient status {response.status_code}")
+            if response.status_code != 200:
+                sys.stderr.write(f"Error downloading {file_name}: Status {response.status_code}\n")
+                return None
+            total = int(response.headers.get("Content-Length", 0))
+            with open(part_path, "wb") as fh, tqdm(
+                total=total, unit="B", unit_scale=True, unit_divisor=1024,
+                desc=file_name, leave=False,
+            ) as bar:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        fh.write(chunk)
+                        bar.update(len(chunk))
+            os.replace(part_path, file_path)
+            return file_path
+        except requests.exceptions.RequestException as e:
+            if os.path.exists(part_path):
+                try:
+                    os.remove(part_path)
+                except OSError:
+                    pass
+            if attempt == 3:
+                sys.stderr.write(f"Error downloading {file_name} after 3 attempts: {e}\n")
+                return None
+            time.sleep(min(2 ** attempt, 30))
 
 
 def download_postal_codes(postal_codes_dir, province_codes=None):
+    """Download and assemble Spanish postal-code boundary polygons.
+
+    Fetches per-province KML from codigospostales.com, converts each to GeoJSON
+    under ``{postal_codes_dir}/raw/``, then validates and concatenates them into
+    ``{postal_codes_dir}/postal_codes.geojson``. Already-downloaded provinces are
+    skipped. Individual province failures are logged and skipped rather than
+    raised.
+
+    Parameters
+    ----------
+    postal_codes_dir : str
+        Output directory (a ``raw/`` subfolder must exist for intermediates).
+    province_codes : list[str], optional
+        2-digit province codes; defaults to all 52 Spanish provinces.
+
+    Returns
+    -------
+    None
+    """
     sys.stderr.write('\nDownloading postal codes from Spain\n')
     if province_codes is None:
         province_codes = ["{:02d}".format(i) for i in range(1, 53)]
@@ -81,6 +255,24 @@ def download_postal_codes(postal_codes_dir, province_codes=None):
 
 
 def download_census_tracts(census_tracts_dir, year):
+    """Download and validate INE census-tract (sección censal) geometries.
+
+    Downloads the national ``seccionado_{year}`` archive from ine.es, extracts
+    the shapefile, repairs geometries and writes
+    ``{census_tracts_dir}/validated_census_{year}.gpkg``. No-ops if that file
+    already exists. Network/zip errors are logged and the function returns early.
+
+    Parameters
+    ----------
+    census_tracts_dir : str
+        Output directory for the archive, extraction and the validated GPKG.
+    year : int
+        Census cartography year (e.g. 2022).
+
+    Returns
+    -------
+    None
+    """
     sys.stderr.write(f"\nDownloading census tract geometries for year: {year}\n")
     output_file = f"{census_tracts_dir}/validated_census_{year}.gpkg"
     
@@ -129,7 +321,26 @@ def download_census_tracts(census_tracts_dir, year):
 
 
 def cadaster_downloader(cadaster_dir, cadaster_codes=None):
+    """Download INSPIRE-harmonised cadastral data from the Spanish Catastro.
 
+    Fetches the three INSPIRE layers — parcels, addresses and buildings — for
+    each requested municipality, saving per-municipality zips under
+    ``{cadaster_dir}/{layer}/zip/`` and unzipping them to ``.../unzip/``.
+    Municipalities already present are skipped, so re-runs only fetch what is
+    missing.
+
+    Parameters
+    ----------
+    cadaster_dir : str
+        Root directory for the downloaded cadastral layers.
+    cadaster_codes : list[str], optional
+        Cadastral municipality codes to download; when None, every municipality
+        in the derived provinces is fetched.
+
+    Returns
+    -------
+    None
+    """
     inspire_dict = {
         "parcels": "https://www.catastro.hacienda.gob.es/INSPIRE/CadastralParcels/ES.SDGC.CP.atom.xml",
         "address": "https://www.catastro.hacienda.gob.es/INSPIRE/Addresses/ES.SDGC.AD.atom.xml",
@@ -151,8 +362,9 @@ def cadaster_downloader(cadaster_dir, cadaster_codes=None):
                 sys.stderr.flush()
                 sys.stderr.write(f"\r\t{municipality['name']}")
                 sys.stderr.flush()
-                download(municipality['url'], f"{municipality['url'].split('.')[-2]}.zip",
-                         f"{cadaster_dir}/{k}/zip/")
+                download_file(dir=f"{cadaster_dir}/{k}/zip/",
+                              url=municipality['url'],
+                              file=f"{municipality['url'].split('.')[-2]}.zip")
         sys.stderr.write("\r" + " " * 60)
         if nf:
             utils.unzip_directory(f"{cadaster_dir}/{k}/zip/", f"{cadaster_dir}/{k}/unzip/")
@@ -192,10 +404,47 @@ def get_dataspace_token(client_id, client_secret):
     return response.json()["access_token"]
 
 
-def download_DEM_raster(raster_dir, bbox, instance="COPERNICUS_30", max_pixels=2500):
+def _is_readable_raster(path):
+    """Return True if ``path`` is a raster whose pixel data can be fully read.
+
+    Opening a GeoTIFF succeeds even when its strips are truncated; the corruption
+    only surfaces on read, so this actually reads the first band to validate it.
     """
-    Download Copernicus DEM using a global tile grid.
-    Tiles are cached and always merged into DEM.tif.
+    try:
+        with rasterio.open(path) as ds:
+            ds.read(1)
+        return True
+    except Exception:
+        return False
+
+
+def download_DEM_raster(raster_dir, bbox, instance="COPERNICUS_30", max_pixels=2500):
+    """Download the Copernicus DEM for ``bbox`` as a mosaic of grid tiles.
+
+    Tiles are fetched from the Copernicus dataspace process API (requires
+    ``~/.dataspaces`` credentials), cached under ``{raster_dir}/tiles`` and
+    merged into ``{raster_dir}/DEM.tif``. Each tile is streamed to a temporary
+    ``.part`` file, verified to be a readable GeoTIFF and atomically renamed on
+    success, and transient failures (dropped connections, HTTP 429/5xx, corrupt
+    payloads) are retried with exponential backoff. Cached tiles are re-validated
+    on every run and re-downloaded if corrupt — so a flaky download can never
+    leave (or keep) a bad tile that breaks the merge.
+
+    Parameters
+    ----------
+    raster_dir : str
+        Output directory (``tiles/`` subfolder + merged ``DEM.tif``).
+    bbox : sequence[float]
+        Area of interest ``[min_lon, min_lat, max_lon, max_lat]``.
+    instance : str, default "COPERNICUS_30"
+        DEM instance (e.g. 30 m Copernicus GLO-30).
+    max_pixels : int, default 2500
+        Target tile size in pixels, controlling the global grid resolution.
+
+    Returns
+    -------
+    str
+        Path to the merged ``DEM.tif``.
     """
     os.makedirs(raster_dir, exist_ok=True)
     tiles_dir = os.path.join(raster_dir, "tiles")
@@ -247,6 +496,16 @@ def download_DEM_raster(raster_dir, bbox, instance="COPERNICUS_30", max_pixels=2
         tile_name = f"{t_bbox[1]:.6f}_{t_bbox[0]:.6f}_{t_bbox[3]:.6f}_{t_bbox[2]:.6f}.tif"
         tile_path = os.path.join(tiles_dir, tile_name)
 
+        # Reuse a cached tile only if it is a fully readable GeoTIFF; a corrupt
+        # or truncated tile (e.g. left by an interrupted earlier run) is dropped
+        # and re-downloaded rather than crashing the later merge.
+        if os.path.exists(tile_path) and not _is_readable_raster(tile_path):
+            sys.stderr.write(f"\r  DEM tile {tile_name}: cached file corrupt, re-downloading\n")
+            try:
+                os.remove(tile_path)
+            except OSError:
+                pass
+
         if not os.path.exists(tile_path):
             request_payload = {
                 "input": {
@@ -261,13 +520,47 @@ def download_DEM_raster(raster_dir, bbox, instance="COPERNICUS_30", max_pixels=2
                 "evalscript": evalscript
             }
 
-            response = requests.post(url, json=request_payload, headers=headers, stream=True)
-            if response.status_code != 200:
-                raise RuntimeError(f"DEM request failed ({response.status_code}): {response.text}")
-
-            with open(tile_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
+            # Stream to a temporary file, verify it is a readable GeoTIFF, then
+            # atomically rename — so an interrupted or corrupt download never
+            # leaves a bad tile that a later run would blindly reuse. Retry
+            # transient failures (dropped connections, 429/5xx, corrupt payload)
+            # with exponential backoff.
+            part_path = tile_path + ".part"
+            max_retries = 4
+            for attempt in range(1, max_retries + 1):
+                try:
+                    response = requests.post(url, json=request_payload, headers=headers,
+                                             stream=True, timeout=120)
+                    if response.status_code in (429, 500, 502, 503, 504):
+                        raise requests.exceptions.RequestException(
+                            f"transient DEM status {response.status_code}")
+                    if response.status_code != 200:
+                        raise RuntimeError(
+                            f"DEM request failed ({response.status_code}): {response.text[:200]}")
+                    with open(part_path, "wb") as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    if not _is_readable_raster(part_path):
+                        raise requests.exceptions.RequestException(
+                            "downloaded tile is not a readable GeoTIFF")
+                    os.replace(part_path, tile_path)
+                    break
+                except requests.exceptions.RequestException as e:
+                    if os.path.exists(part_path):
+                        try:
+                            os.remove(part_path)
+                        except OSError:
+                            pass
+                    if attempt == max_retries:
+                        raise RuntimeError(
+                            f"DEM tile {tile_name} failed after {max_retries} attempts: {e}"
+                        ) from e
+                    sleep_s = min(2 ** attempt, 30)
+                    sys.stderr.write(
+                        f"\r  DEM tile {tile_name}: {type(e).__name__}, retry "
+                        f"{attempt}/{max_retries - 1} in {sleep_s}s\n")
+                    time.sleep(sleep_s)
 
         tile_files.append(tile_path)
 
@@ -287,27 +580,23 @@ def download_DEM_raster(raster_dir, bbox, instance="COPERNICUS_30", max_pixels=2
     sys.stderr.write(f"DEM merged and saved to {merged_path}\n")
     return merged_path
 
-def download(url, name, save_path):
-    """Download a file with streaming for large files."""
-    try:
-        get_response = requests.get(url, stream=True, timeout=60)
-        if get_response.status_code == 200:
-            file_name = os.path.join(save_path, name)
-            os.makedirs(save_path, exist_ok=True)
-            
-            with open(file_name, 'wb') as f:
-                for chunk in get_response.iter_content(chunk_size=1024):
-                    if chunk:
-                        f.write(chunk)
-        else:
-            sys.stderr.write(f"Error downloading {url}: Status {get_response.status_code}\n")
-    except requests.exceptions.RequestException as e:
-        sys.stderr.write(f"Error downloading {url}: {e}\n")
-    except Exception as e:
-        sys.stderr.write(f"Unexpected error downloading {url}: {e}\n")
-
-
 def load_and_transform_barcelona_ground_premises(open_data_layers_dir):
+    """Load and normalise the Barcelona ground-floor commercial premises dataset.
+
+    Reads ``barcelona_ground_premises.csv`` from ``open_data_layers_dir``
+    (auto-detecting the encoding) and expands the ``Nom_Activitat`` activity
+    labels into multilingual ``ca/es/en`` tagged strings for downstream joins.
+
+    Parameters
+    ----------
+    open_data_layers_dir : str
+        Directory holding the downloaded Barcelona open-data CSVs.
+
+    Returns
+    -------
+    pandas.DataFrame
+        The premises table with normalised activity labels.
+    """
     ground_premises = pd.read_csv(
         filepath_or_buffer=f"{open_data_layers_dir}/barcelona_ground_premises.csv",
         encoding=from_path(f"{open_data_layers_dir}/barcelona_ground_premises.csv").best().encoding,
@@ -411,7 +700,17 @@ def load_and_transform_barcelona_ground_premises(open_data_layers_dir):
 # Estructura de los ficheros .CAT
 # Transposicion literal de la especificacion (salvo error u omision):
 # https://www.catastro.hacienda.gob.es/documentos/formatos_intercambio/catastro_fin_cat_2006.pdf
-catstruct = {}
+catstruct = PrettyDict()
+"""Fixed-width field layout of the Spanish cadastral **CAT** file, keyed by
+record type.
+
+Each record type maps to a list of field descriptors
+``[start_column, length, kind, field_name, polars_dtype]`` where ``kind`` is
+``'N'`` (numeric) or ``'X'`` (text). Record types: ``1`` header, ``11`` parcel,
+``13`` unit, ``14`` construction/space, ``15`` real-estate unit, ``16``/``17``
+cultivation, ``46``/``47`` addresses, ``90`` trailer. Consumed by
+:func:`parse_CAT_file`.
+"""
 catstruct[1] = [
     [3, 1, 'X', 'tipo_entidad_generadora',pl.Utf8],
     [4, 9, 'N', 'codigo_entidad_generadora',pl.Utf8],
@@ -709,6 +1008,10 @@ building_space_detailed_use_types = {
   "ZSO": "Other provincial union",
   "ZVR": "Landfill"
 }
+
+building_space_detailed_use_types = PrettyDict(building_space_detailed_use_types)
+"""Cadastral **detailed** space use-type code → English label (the short CAT
+codes such as ``"A"`` → ``"Storage"``)."""
 
 building_space_typologies = { #https://www.boe.es/buscar/act.php?id=BOE-A-1993-19265
     "PDEP": {
@@ -1217,6 +1520,10 @@ building_space_typologies = { #https://www.boe.es/buscar/act.php?id=BOE-A-1993-1
     }
 }
 
+building_space_typologies = PrettyDict(building_space_typologies)
+"""Cadastral construction **typology** codes → valuation parameters, per the
+Spanish cadastral valuation norm (BOE-A-1993-19265)."""
+
 building_space_age_value = [
     {
         "Age": [0, 4],
@@ -1334,6 +1641,11 @@ building_space_age_value = [
     }
 ]
 
+building_space_age_value = PrettyList(building_space_age_value)
+"""Cadastral **age-depreciation** coefficient table. One entry per age band
+(``"Age"`` = ``[min, max]`` years) giving the depreciation factors for each use
+category (``"1"``–``"3"``) across the nine valuation categories."""
+
 # 15 - Registro de Inmueble
 catstruct[15] = [
     [24, 2, 'N', 'delegation_meh_code', pl.Utf8],
@@ -1403,6 +1715,85 @@ building_space_use_types = {
     "J": "Agricultural industrial",
     "Z": "Agricultural"
 }
+
+building_space_use_types = PrettyDict(building_space_use_types)
+"""Cadastral **primary** use-type code → English label."""
+
+street_type_names = {
+    "AL": "ALAMEDA",
+    "AD": "ALDEA",
+    "AP": "APARTAMENTOS",
+    "AY": "ARROYO",
+    "AV": "AVENIDA",
+    "BJ": "BAJADA",
+    "BR": "BARRANCO",
+    "BO": "BARRIO",
+    "BL": "BLOQUE",
+    "CL": "CALLE",
+    "CJ": "CALLEJA",
+    "CM": "CAMINO",
+    "CR": "CARRETERA",
+    "CS": "CASERIO",
+    "CH": "CHALET",
+    "CG": "COLEGIO",
+    "CO": "COLONIA",
+    "CN": "CONJUNTO",
+    "CT": "CUESTA",
+    "ED": "EDIFICIO",
+    "EN": "ENTRADA",
+    "ES": "ESCALINATA",
+    "EX": "EXPLANADA",
+    "EM": "EXTRAMUROS",
+    "ER": "EXTRARRADIO",
+    "FC": "FERROCARRIL",
+    "GL": "GLORIETA",
+    "GV": "GRAN VÍA",
+    "GR": "GRUPO",
+    "HT": "HUERTA",
+    "JR": "JARDINES",
+    "LD": "LADO",
+    "LG": "LUGAR",
+    "MZ": "MANZANA",
+    "MS": "MASÍA",
+    "MC": "MERCADO",
+    "MT": "MONTE",
+    "ML": "MUELLE",
+    "MN": "MUNICIPIO",
+    "PA": "PARCELA",
+    "PQ": "PARQUE",
+    "PI": "PARROQUIA",
+    "PD": "PARTIDA",
+    "PJ": "PASAJE",
+    "PS": "PASEO",
+    "PZ": "PLAZA",
+    "PB": "POBLADO",
+    "PG": "POLIGONO",
+    "PR": "PROLONGACION",
+    "PT": "PUENTE",
+    "PU": "PUERTA",
+    "QT": "QUINTA",
+    "RM": "RAMAL",
+    "RB": "RAMBLA",
+    "RP": "RAMPA",
+    "RR": "RIERA",
+    "RC": "RINCÓN",
+    "RD": "RONDA",
+    "RU": "RÚA",
+    "SA": "SALIDA",
+    "SC": "SECTOR/SECCIÓN",
+    "SD": "SENDA",
+    "SL": "SOLAR/SALÓN",
+    "SB": "SUBIDA",
+    "TN": "TERRENOS",
+    "TO": "TORRENTE",
+    "TR": "TRAVESIA",
+    "UR": "URBANIZACION",
+    "VI": "VÍA",
+    "VP": "VÍA PÚBLICA",
+    "AR": "ÁREA/ARRABAL",
+}
+street_type_names = PrettyDict(street_type_names)
+"""Cadastral two-letter street-type acronym → full Spanish literal."""
 
 # 16 - Registro de reparto de elementos comunes
 catstruct[16] = [
@@ -1534,7 +1925,28 @@ catstruct[90] = [
 
 
 def parse_CAT_file(cadaster_code, CAT_files_dir, allowed_dataset_types = [14, 15]):
+    """Parse a Spanish cadastral CAT (alphanumeric) file into per-type tables.
 
+    CAT files are fixed-width records keyed by a 2-digit record type. This reads
+    the municipality's ``.CAT`` file, slices each line according to the
+    ``catstruct`` field layout, and writes one Parquet per selected record type
+    under ``CAT_files_dir``. Record type 14 = building spaces (construcciones),
+    15 = real-estate units (bienes inmuebles).
+
+    Parameters
+    ----------
+    cadaster_code : str
+        Cadastral municipality code identifying the CAT file to parse.
+    CAT_files_dir : str
+        Directory containing the raw CAT file and receiving the Parquet outputs.
+    allowed_dataset_types : list[int], default [14, 15]
+        Record types to extract.
+
+    Returns
+    -------
+    None
+        Parsed tables are written to Parquet under ``CAT_files_dir``.
+    """
     # Function to parse a single line into a dictionary for each record type
     def process_line(line, allowed_dataset_types):
         parsed_row = {}
@@ -1607,12 +2019,15 @@ def parse_CAT_file(cadaster_code, CAT_files_dir, allowed_dataset_types = [14, 15
             if decompressed_path and os.path.exists(decompressed_path):
                 os.remove(decompressed_path)
 
-        # Process each line in parallel
-        with utils.tqdm_joblib(tqdm(desc="Reading the CAT file...", total=len(lines))):
-            parsed_rows = Parallel(n_jobs=-1)(
-                delayed(process_line)(line, allowed_dataset_types) for line in lines
-            )
-        get_reusable_executor().shutdown(wait=True)
+        # Parse each line serially. ``process_line`` is cheap fixed-width string
+        # slicing, so a plain pass is faster than dispatching every line to a
+        # joblib/loky worker: the per-task pickling + fresh-interpreter import
+        # overhead dominated the actual parsing (and could crash workers while
+        # they re-imported heavy optional deps such as networkx/osmnx).
+        parsed_rows = [
+            process_line(line, allowed_dataset_types)
+            for line in tqdm(lines, desc="Reading the CAT file...")
+        ]
 
         # Combine all parsed rows into DataFrames
         combined_dfs = combine_dataframes(parsed_rows)

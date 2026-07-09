@@ -357,7 +357,32 @@ def create_parcel_address_map(result_gdf, target_parcel_ref='6161378DF2766A'):
     return m
 
 def input_files_for_IREC_simulations(gdf):
+    """Build the per-building input table for IREC building-energy simulations.
 
+    Keeps one row per residential building (requires the CAT + inference
+    columns ``br__building_spaces``, ``br__area_*``, ``br__mean_building_space_*``)
+    and derives the fields IREC's models expect:
+
+    - ``BuildingType`` — ``SF`` (single-family), ``MFI``/``MFNI`` (multi-family
+      isolated / not isolated) or ``NR`` (non-residential), from the dwelling
+      count and ``br__detached``.
+    - Use-type area percentages (residential/commercial/offices/parking/other).
+    - Floor lists per use, number of floors above/below ground.
+    - Orientation and street-width (main + all orientations).
+    - Construction year with retrofit inference (``BuildingWasRetroffited``,
+      ``YearOfRetroffiting``) from the mean effective year of the spaces.
+
+    Parameters
+    ----------
+    gdf : geopandas.GeoDataFrame
+        Merged output of ``hc.merge(..., building_parts_inference=True,
+        use_CAT_files=True)``.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per residential building with the IREC schema columns above.
+    """
     gdf_filt = gdf.drop_duplicates(subset="building_reference")
     gdf_filt = gdf_filt[gdf_filt["br__building_spaces"].apply(lambda d: isinstance(d, dict) and "Residential" in d)]
 
@@ -444,6 +469,19 @@ def input_files_for_IREC_simulations(gdf):
     return new_df
 
 def converter_():
+    """Return the nested category template for INE household-survey indicators.
+
+    Maps each sociodemographic dimension (age, sex, household income, dwelling
+    surface, building type, construction year, nationality, …) to its Spanish
+    category labels as empty sub-dicts. Used as a scaffold to bin/aggregate
+    census-linked building data into the survey's category structure for
+    external tools; ``None`` marks dimensions that are not expanded.
+
+    Returns
+    -------
+    dict
+        Nested mapping ``{dimension: {category: {}} | None}``.
+    """
     return {
         'Edad': {
             'Menos de 30 años': {},
@@ -507,6 +545,21 @@ def converter_():
     }
 
 def plot_weather_stations(gdf, weather_clusters_column, filename):
+    """Plot buildings coloured by their assigned weather cluster and save to file.
+
+    Parameters
+    ----------
+    gdf : geopandas.GeoDataFrame
+        Buildings/points to plot (any CRS matplotlib can render).
+    weather_clusters_column : str
+        Categorical column holding the cluster label per feature.
+    filename : str
+        Output image path passed to ``matplotlib.pyplot.savefig``.
+
+    Returns
+    -------
+    None
+    """
     fig, ax = plt.subplots(figsize=(15, 12))
 
     # Correct GeoPandas plotting syntax

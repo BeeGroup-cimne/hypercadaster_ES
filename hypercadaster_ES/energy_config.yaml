@@ -1,0 +1,241 @@
+# =========================================================================== #
+# hypercadaster_ES — EnergyPlus model default configuration
+# =========================================================================== #
+# Every default value used when building/running the per-building EnergyPlus
+# models lives here. Edit this file (or point HC_ENERGY_CONFIG at your own copy,
+# or call energy.configure(path=...)) to tune the simulations without touching
+# code. Values are merged over the built-in defaults, so you may delete any key
+# you do not want to override.
+
+# --- Storey heights -------------------------------------------------------- #
+floors:
+  floor_height: 3.0            # regular storey height (m)
+  ground_floor_height: 5.0     # taller ground floor (m) ...
+  ground_floor_min_floors: 5   # ...applied only when floors_above_ground >= this
+
+# --- Footprint vs CAT built area ------------------------------------------- #
+geometry:
+  cat_area_shrink: true        # align walls to the CAT built area: when the CAT
+                               # area (pools excluded) is lower than the footprint
+                               # geometry, erode the footprint (negative buffer)
+                               # to match it; the leftover footprint ring becomes
+                               # shading and the walled block is shifted
+                               # |buffer|/2 north (so walls stay inside the plot)
+  buffer_distance: 6.0         # m; cap on the inward erosion (and hence the shift)
+
+# --- Windows --------------------------------------------------------------- #
+windows:
+  default_wwr: 0.2             # fallback window-to-wall ratio
+  wwr_bounds: [0.05, 0.95]     # clamp for any WWR (predictor or manual)
+  area_per_window: 3.0         # m² of glazing per window; count = WWR·wall/area
+  sill_height: 0.9             # height of the window sill above the floor (m)
+  head_margin: 0.3             # clearance from window head to ceiling (m)
+  edge_gap: 0.4                # min gap to wall ends / doors / between windows (m)
+  min_size: 0.4               # smallest square window side worth creating (m)
+  reveal_depth: 0.3            # m; recess/reveal shade around each window AND door
+                               # perimeter (Spanish glazing aligns to the inner
+                               # wall face); 0 disables
+  # Air infiltration of the conditioned zones, driven by the window technology
+  # of each Spanish construction period (glazing + frame type). Applied as the
+  # zone design infiltration (air changes per hour) for CONDITIONED zones;
+  # non-conditioned zones (parking/communal/sports) keep loads.*.infil_ach.
+  infiltration:
+    "pre1980":   {type: "single glazing, old wood openable frame",      air_changes_per_hour: 1.4}
+    "1980_2006": {type: "double glazing, aluminium sliding frame",      air_changes_per_hour: 1.1}
+    "2007_2013": {type: "double glazing, aluminium RPT openable frame", air_changes_per_hour: 0.55}
+    "post2013":  {type: "double glazing, PVC openable frame",           air_changes_per_hour: 0.35}
+
+# --- Doors ----------------------------------------------------------------- #
+doors:
+  main:    {width: 1.0, height: 2.5}   # main pedestrian entrance
+  parking: {width: 4.0, height: 2.5}   # parking vehicle door (>= this)
+
+# --- Opaque materials ------------------------------------------------------ #
+# name: [roughness, thickness_m, conductivity_W/mK, density_kg/m3, cp_J/kgK]
+materials:
+  HC_Concrete200:  [MediumRough, 0.20,  1.95, 2240, 900]
+  HC_Plaster15:    [Smooth,      0.015, 0.40, 1000, 1000]
+  HC_Brick115:     [MediumRough, 0.115, 0.71, 1920, 790]
+  HC_Screed50:     [MediumRough, 0.05,  1.40, 2000, 900]
+  HC_Gypsum13:     [Smooth,      0.013, 0.25, 900,  1000]
+  HC_Waterproof10: [Rough,       0.01,  0.17, 1100, 1000]
+  HC_DoorWood40:   [MediumSmooth, 0.040, 0.15, 700, 1600]
+  HC_DoorMetal:    [Smooth,      0.050, 0.045, 90,  1000]
+
+# --- Insulation + surface films -------------------------------------------- #
+insulation:
+  conductivity: 0.034          # tunable insulation layer k (W/mK)
+  rsi: {wall: 0.13, roof: 0.10, floor: 0.17}   # inside film resistance
+  rse: {wall: 0.04, roof: 0.04, floor: 0.04}   # outside film resistance
+
+# --- Construction recipes -------------------------------------------------- #
+# u_class null = untuned; otherwise a layer named INS is solved to hit the
+# archetype target U for that class.
+constructions:
+  HC_ExtWall:      {u_class: wall,  layers: [HC_Plaster15, HC_Brick115, INS, HC_Gypsum13]}
+  HC_GroundWall:   {u_class: wall,  layers: [HC_Concrete200, INS, HC_Gypsum13]}
+  HC_PartyWall:    {u_class: null,  layers: [HC_Gypsum13, HC_Brick115, HC_Gypsum13]}
+  HC_IntWall:      {u_class: null,  layers: [HC_Gypsum13, HC_Brick115, HC_Gypsum13]}
+  HC_GroundFloor:  {u_class: floor, layers: [HC_Concrete200, INS, HC_Screed50]}
+  HC_IntFloor:     {u_class: null,  layers: [HC_Concrete200, HC_Screed50]}
+  HC_ExposedFloor: {u_class: floor, layers: [HC_Screed50, INS, HC_Concrete200]}
+  HC_Roof:         {u_class: roof,  layers: [HC_Waterproof10, INS, HC_Concrete200]}
+  HC_MainDoor:     {u_class: null,  layers: [HC_DoorWood40]}
+  HC_ParkingDoor:  {u_class: null,  layers: [HC_DoorMetal]}
+
+# --- Spanish thermal-code archetype envelopes ------------------------------ #
+# period: target U-values (W/m²K) + window optics by year of construction.
+archetype_envelope:
+  "pre1980":   {wall_U: 1.69, roof_U: 1.90, floor_U: 1.20, window_U: 5.70, window_shgc: 0.82, window_vt: 0.80}
+  "1980_2006": {wall_U: 0.95, roof_U: 0.75, floor_U: 0.85, window_U: 3.50, window_shgc: 0.75, window_vt: 0.75}
+  "2007_2013": {wall_U: 0.66, roof_U: 0.38, floor_U: 0.49, window_U: 3.00, window_shgc: 0.65, window_vt: 0.70}
+  "post2013":  {wall_U: 0.27, roof_U: 0.22, floor_U: 0.34, window_U: 2.00, window_shgc: 0.55, window_vt: 0.65}
+
+# --- Internal loads, setpoints (°C) and conditioning, per use category ----- #
+# ``occ`` names the internal-gains usage fraction schedule (see schedules.occupancy
+# below) that drives People/Lights/Equipment for the category. heat/cool (+ _sb
+# setback) are fallback scalars used to build the setpoint schedules when no
+# explicit schedules.setpoints.<category> profile is given.
+loads:
+  residential: {ppl_per_m2: 0.028, lights: 4.4,  equip: 4.0,  infil_ach: 0.5, heat: 20, heat_sb: 17, cool: 25, cool_sb: 27, activity: 110, conditioned: true,  occ: OCC_RESIDENTIAL}
+  office:      {ppl_per_m2: 0.11,  lights: 10.0, equip: 12.0, infil_ach: 0.4, heat: 21, heat_sb: 16, cool: 24, cool_sb: 28, activity: 120, conditioned: true,  occ: OCC_OFFICE}
+  commercial:  {ppl_per_m2: 0.15,  lights: 14.0, equip: 10.0, infil_ach: 0.5, heat: 21, heat_sb: 16, cool: 24, cool_sb: 28, activity: 130, conditioned: true,  occ: OCC_COMMERCIAL}
+  other:       {ppl_per_m2: 0.05,  lights: 8.0,  equip: 8.0,  infil_ach: 0.5, heat: 20, heat_sb: 17, cool: 25, cool_sb: 27, activity: 120, conditioned: true,  occ: OCC_OFFICE}
+  parking:     {ppl_per_m2: 0.0,   lights: 2.0,  equip: 0.0,  infil_ach: 1.0, conditioned: false, occ: OCC_LOW}
+  communal:    {ppl_per_m2: 0.0,   lights: 3.0,  equip: 0.0,  infil_ach: 0.5, conditioned: false, occ: OCC_LOW}
+  sports:      {ppl_per_m2: 0.0,   lights: 0.0,  equip: 0.0,  infil_ach: 2.0, conditioned: false, occ: OCC_LOW}
+
+# --- Schedules: internal-gains usage + temperature setpoints, per use ------ #
+# Each profile is a list of [until "HH:MM", value] steps applied For: AllDays,
+# OR a {weekdays: [...], weekends: [...]} split. Editable per use category here
+# so gains and setpoints differ by building-space use without touching code.
+schedules:
+  # Internal-gains usage fraction (0..1) driving People/Lights/Equipment. Keyed
+  # by the ``occ`` name referenced in loads.* above.
+  occupancy:
+    OCC_RESIDENTIAL: [["07:00", 1.0], ["16:00", 0.3], ["23:00", 0.9], ["24:00", 1.0]]
+    OCC_OFFICE:
+      weekdays: [["08:00", 0.0], ["18:00", 0.9], ["24:00", 0.1]]
+      weekends: [["24:00", 0.05]]
+    OCC_COMMERCIAL: [["09:00", 0.0], ["21:00", 0.8], ["24:00", 0.1]]
+    OCC_LOW: [["24:00", 0.1]]
+  # Heating / cooling setpoint (°C) day profiles per CONDITIONED category. When a
+  # category is omitted the profile is built from its loads.* heat/heat_sb (and
+  # cool/cool_sb) scalars with a 07:00–23:00 occupied band.
+  setpoints:
+    residential:
+      heating: [["07:00", 17], ["23:00", 20], ["24:00", 17]]
+      cooling: [["07:00", 27], ["23:00", 25], ["24:00", 27]]
+    office:
+      heating: [["08:00", 16], ["18:00", 21], ["24:00", 16]]
+      cooling: [["08:00", 28], ["18:00", 24], ["24:00", 28]]
+    commercial:
+      heating: [["09:00", 16], ["21:00", 21], ["24:00", 16]]
+      cooling: [["09:00", 28], ["21:00", 24], ["24:00", 28]]
+
+# --- Residential occupant behaviour (stochastic user archetypes) ----------- #
+# Each RESIDENTIAL dwelling gets an occupant BEHAVIOUR archetype and an
+# OCCUPANCY PERIOD. They are assigned per-dwelling — random but deterministic
+# (seeded by the dwelling reference), OR fixed for all dwellings via
+# build_energy_model(residential_behavior=, residential_period=). The random
+# draw is weighted by section demographics (average household size + population
+# age, from the sociodemographic layer social_ES/INE, columns br__average_
+# household_size / br__population_mean_age / br__population_share_over_64). When
+# those are missing, household size is estimated from the dwelling area and the
+# 'default' bucket weights are used.
+residential_behavior:
+  enabled: true
+  m2_per_person: 35              # fallback people/home = dwelling area / this
+
+  # Occupant archetypes. Setpoints may be a single °C constant (applied all day)
+  # or {occupied, away} following the occupancy period. hvac_availability:
+  #   always     → HVAC available 24 h
+  #   occupancy  → HVAC available only when the dwelling is occupied
+  # ventilation_ach = natural-ventilation air changes/h when the window is open
+  # (0 = never ventilates); ventilation_schedule names the opening profile below.
+  behaviors:
+    unaware:      # highly stochastic, never ventilate, wasteful tight band
+      heating: 22
+      cooling: 23
+      hvac_availability: always
+      ventilation_ach: 0.0
+    aware:        # condition only when home; ventilate midday in winter
+      heating: {occupied: 21, away: 17}
+      cooling: {occupied: 25, away: 30}
+      hvac_availability: occupancy
+      ventilation_ach: 2.0
+      ventilation_schedule: winter_midday
+    always_on:    # HVAC always working, no ventilation
+      heating: 21
+      cooling: 24
+      hvac_availability: always
+      ventilation_ach: 0.0
+    passive:      # HVAC only when strictly needed; maximise natural ventilation
+      heating: {occupied: 17, away: 15}
+      cooling: {occupied: 28, away: 32}
+      hvac_availability: occupancy
+      ventilation_ach: 4.0
+      ventilation_schedule: whenever_mild
+
+  # Occupancy fraction (0..1) profiles → internal gains + the occupied/away
+  # setpoint band + the 'occupancy' HVAC availability. weekdays/weekends split.
+  occupancy_periods:
+    nights_workdays:      # away during working hours, home nights + weekends
+      weekdays: [["07:00", 1.0], ["09:00", 0.35], ["18:00", 0.2], ["23:00", 1.0], ["24:00", 1.0]]
+      weekends: [["09:00", 1.0], ["24:00", 0.85]]
+    days:                 # home during the day (retired / homemaker)
+      weekdays: [["24:00", 0.7]]
+      weekends: [["24:00", 0.8]]
+    all_day:              # home almost all the time
+      weekdays: [["24:00", 0.9]]
+      weekends: [["24:00", 0.9]]
+    weekends_away:        # away on weekends
+      weekdays: [["07:00", 1.0], ["09:00", 0.4], ["18:00", 0.2], ["24:00", 1.0]]
+      weekends: [["10:00", 0.5], ["18:00", 0.1], ["24:00", 0.6]]
+
+  # Natural-ventilation opening profiles (fraction of ventilation_ach applied).
+  ventilation_schedules:
+    winter_midday: [["10:00", 0.0], ["14:00", 1.0], ["24:00", 0.0]]
+    whenever_mild: [["08:00", 0.0], ["22:00", 1.0], ["24:00", 0.0]]
+
+  # Assignment: weighted random draw of behaviour + period, per demographic
+  # bucket. Behaviour weights by an AGE bucket (section mean age); period weights
+  # by a HOUSEHOLD-SIZE bucket (avg people/home). Weights are normalised.
+  assignment:
+    age_buckets:                       # by br__population_mean_age (years)
+      young: {max_mean_age: 40}
+      mixed: {max_mean_age: 50}
+      older: {max_mean_age: 200}
+    household_buckets:                 # by br__average_household_size (people)
+      single: {max_size: 1.5}
+      small:  {max_size: 3.0}
+      family: {max_size: 20.0}
+    behavior_weights:
+      young:   {aware: 3, passive: 3, unaware: 2, always_on: 2}
+      mixed:   {aware: 3, passive: 2, unaware: 2, always_on: 3}
+      older:   {aware: 2, passive: 1, unaware: 3, always_on: 4}
+      default: {aware: 3, passive: 2, unaware: 2, always_on: 3}
+    period_weights:
+      single:  {nights_workdays: 4, all_day: 2, days: 2, weekends_away: 2}
+      small:   {nights_workdays: 4, all_day: 2, days: 2, weekends_away: 2}
+      family:  {nights_workdays: 3, all_day: 3, days: 3, weekends_away: 2}
+      default: {nights_workdays: 4, all_day: 2, days: 2, weekends_away: 2}
+
+# --- Simulation control + site + outputs ---------------------------------- #
+simulation:
+  timestep_per_hour: 4
+  location: {name: Site, latitude: 41.62, longitude: 0.63, time_zone: 1.0, elevation: 200.0}
+  # Reporting frequencies emitted by default (build_energy_model(output_frequencies=)
+  # overrides). Allowed: hourly, daily, monthly, annual (year). Fine frequencies
+  # (hourly/daily) report air temperature + relative humidity + thermal demand
+  # per zone; coarse (monthly/annual) report thermal demand per zone only.
+  output_frequencies: [monthly]
+  outputs:
+    # Variable EnergyPlus names by role. Demand = ideal-loads heating/cooling
+    # energy (present only on conditioned zones); comfort = air temp + RH
+    # (every zone, conditioned or not).
+    comfort: ["Zone Mean Air Temperature", "Zone Air Relative Humidity"]
+    demand:  ["Zone Ideal Loads Supply Air Total Heating Energy",
+              "Zone Ideal Loads Supply Air Total Cooling Energy"]
+    fine_frequencies:   [hourly, daily]     # get comfort + demand
+    coarse_frequencies: [monthly, annual]   # get demand only

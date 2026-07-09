@@ -43,7 +43,12 @@ INSTALL_REQUIRES = [
 
     # --- OSM / Networks ---
     "osmnx>=1.8,<2.1",
+    "pyrosm>=0.6",  # local PBF POI parsing (MIT); avoids Overpass rate limits
     "networkx>=3.2",
+
+    # --- Energy modeling (EnergyPlus IDF; both MIT-licensed) ---
+    "eppy>=0.5.63",
+    "geomeppy>=0.12",
 
     # --- File formats & tabular IO ---
     "pyarrow>=14.0",
@@ -104,18 +109,16 @@ setup(
     include_package_data=True,
     package_data={
         'hypercadaster_es': ['cached_files/*.xlsx'],
+        'hypercadaster_ES': ['energy_config.yaml'],
     },
     license_files=("LICENSE",),
     install_requires=INSTALL_REQUIRES,
-    python_requires=">=3.10",
+    python_requires=">=3.12",
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
         "Intended Audience :: Science/Research", 
         "License :: OSI Approved :: European Union Public Licence 1.2 (EUPL 1.2)",
-        "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.10",
-        "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
         "Topic :: Scientific/Engineering :: GIS",
         "Topic :: Software Development :: Libraries :: Python Modules",
@@ -123,7 +126,7 @@ setup(
     ],
     keywords="cadastral data, geospatial, spain, gis, real estate",
     extras_require={
-        "dev": ["black>=24.0", "ruff>=0.4", "pytest>=7.0", "pytest-cov>=4.0"],
+        "dev": ["black>=24.0", "ruff>=0.4", "pytest>=7.0", "pytest-cov>=4.0", "pdoc>=14.0"],
         # "pdal": ["pdal>=3.0"],  # if/when you wire PDAL features
     },
 )

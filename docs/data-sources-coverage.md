@@ -339,4 +339,4 @@ Community-contributed geographic data providing additional context and validatio
 
 ---
 
-[← Library Structure](library-structure.md) | [Use Cases & Applications →](use-cases-applications.md) | [Back to README](../README.md)
+[← Library Structure](library-structure.md) | [Output Data Schema →](output-schema.md) | [Back to README](../README.md)

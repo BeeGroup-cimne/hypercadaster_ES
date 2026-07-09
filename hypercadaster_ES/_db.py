@@ -23,6 +23,7 @@ import duckdb
 import geopandas as gpd
 import pandas as pd
 from shapely import wkb as _shapely_wkb
+from shapely.geometry.base import BaseGeometry as _BaseGeometry
 
 
 DB_FILENAME = "building_results.duckdb"
@@ -52,6 +53,7 @@ BASIC_BUILDING_COLUMNS = (
 
 
 def db_path(results_dir: str) -> str:
+    """Return the path to the central DuckDB file inside ``results_dir``."""
     return os.path.join(results_dir, DB_FILENAME)
 
 
@@ -99,6 +101,10 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
 # ---------------------------------------------------------------------------
 
 def set_table_crs(con: duckdb.DuckDBPyConnection, table: str, crs) -> None:
+    """Persist a table's CRS (as EPSG) in the ``_meta`` sidecar table.
+
+    No-ops when ``crs`` is None or has no resolvable EPSG code.
+    """
     if crs is None:
         return
     try:
@@ -115,6 +121,7 @@ def set_table_crs(con: duckdb.DuckDBPyConnection, table: str, crs) -> None:
 
 
 def get_table_crs(con: duckdb.DuckDBPyConnection, table: str):
+    """Return the stored ``pyproj.CRS`` for a table, or None if unset."""
     row = con.execute(
         "SELECT value FROM _meta WHERE key = ?", [f"crs:{table}"]
     ).fetchone()
@@ -131,6 +138,12 @@ def get_table_crs(con: duckdb.DuckDBPyConnection, table: str):
 def mark_zone(con: duckdb.DuckDBPyConnection, cadaster_code: str,
               zone_reference: str, state: str,
               error: Optional[str] = None) -> None:
+    """Upsert a zone's processing state into the ``zone_status`` ledger.
+
+    Records ``state`` (e.g. ``'ok'`` / ``'error'``) and optional ``error`` text
+    for ``(cadaster_code, zone_reference)``, refreshing ``finished_at``. This
+    ledger drives resume-on-rerun (see :func:`completed_zones`).
+    """
     con.execute(
         """
         INSERT INTO zone_status (cadaster_code, zone_reference, state, error)
@@ -145,6 +158,8 @@ def mark_zone(con: duckdb.DuckDBPyConnection, cadaster_code: str,
 
 
 def completed_zones(con: duckdb.DuckDBPyConnection, cadaster_code: str) -> set:
+    """Return the set of ``zone_reference`` values marked ``'ok'`` for a
+    municipality, so a re-run can skip already-processed zones."""
     rows = con.execute(
         "SELECT zone_reference FROM zone_status "
         "WHERE cadaster_code = ? AND state = 'ok'",
@@ -195,18 +210,61 @@ def _geom_select_sql(columns: Iterable[str], geom_cols: Iterable[str]) -> str:
 
 def write_gdf(con: duckdb.DuckDBPyConnection, table: str, gdf: gpd.GeoDataFrame,
               *, geom_cols: Iterable[str] = ("geometry",),
-              if_exists: str = "replace") -> None:
+              if_exists: str = "replace",
+              key_cols: Optional[Iterable[str]] = None) -> None:
     """Persist a GeoDataFrame to `table`.
 
     `if_exists`:
         - 'replace' — DROP + CREATE TABLE AS.
-        - 'append'  — INSERT INTO an existing table with a compatible schema.
+        - 'append'  — INSERT INTO an existing table, reconciling schema drift:
+          columns the frame introduces are ADDed to the table; columns the
+          table has but the frame lacks are filled NULL. This matters because
+          different municipalities produce different column sets (e.g. CAT
+          per-use-type area pivots), so a shared `buildings` table must be the
+          union of all of them rather than the first writer's schema.
+        - 'upsert' — requires `key_cols`. For rows whose key already exists,
+          UPDATE only the columns this frame carries; INSERT the rest. Columns
+          the table has but the frame lacks are left UNTOUCHED on existing rows.
+          This is what lets a `building_parts_inference=False` re-run refresh
+          the simple/CAT features while PRESERVING the complex inference
+          features (shadows, walls, structural floors, …) computed by an
+          earlier inference run — they simply aren't in the frame, so they keep
+          their values instead of being nulled. Schema drift is reconciled the
+          same way as 'append'. Creates the table when it doesn't exist yet.
 
     Geometry columns become native GEOMETRY. CRS is recorded in `_meta`.
+    Any additional object column holding shapely geometries (e.g. the
+    secondary geometries `read_gdf` decodes) is auto-detected and stored as
+    GEOMETRY too, so it round-trips rather than being pickled to BLOB.
     """
-    geom_cols = tuple(geom_cols)
+    geom_set = set(geom_cols)
+    for col in gdf.columns:
+        if col in geom_set:
+            continue
+        sample = _first_non_null(gdf[col])
+        if isinstance(sample, _BaseGeometry):
+            geom_set.add(col)
+    geom_cols = tuple(geom_set)
     df = _df_with_wkb(gdf, geom_cols)
     con.register("_tmp_write_gdf", df)
+
+    def _table_exists() -> bool:
+        try:
+            con.execute(f'DESCRIBE "{table}"')
+            return True
+        except Exception:
+            return False
+
+    def _reconcile_schema():
+        """ADD COLUMN for every frame column the table doesn't have yet."""
+        existing = {r[0] for r in con.execute(f'DESCRIBE "{table}"').fetchall()}
+        tmp_types = {r[0]: str(r[1])
+                     for r in con.execute('DESCRIBE _tmp_write_gdf').fetchall()}
+        for c in df.columns:
+            if c not in existing:
+                _ty = 'GEOMETRY' if c in geom_set else tmp_types.get(c, 'VARCHAR')
+                con.execute(f'ALTER TABLE "{table}" ADD COLUMN "{c}" {_ty}')
+
     try:
         select_sql = _geom_select_sql(df.columns, geom_cols)
         if if_exists == "replace":
@@ -215,12 +273,52 @@ def write_gdf(con: duckdb.DuckDBPyConnection, table: str, gdf: gpd.GeoDataFrame,
                 f'CREATE TABLE "{table}" AS SELECT {select_sql} FROM _tmp_write_gdf'
             )
         elif if_exists == "append":
+            _reconcile_schema()
+            # Explicit column list → table columns absent from the frame get
+            # NULL instead of a positional-count mismatch.
+            col_list = ", ".join(f'"{c}"' for c in df.columns)
             con.execute(
-                f'INSERT INTO "{table}" SELECT {select_sql} FROM _tmp_write_gdf'
+                f'INSERT INTO "{table}" ({col_list}) '
+                f'SELECT {select_sql} FROM _tmp_write_gdf'
             )
+        elif if_exists == "upsert":
+            keys = list(key_cols or ())
+            if not keys or any(k not in df.columns for k in keys):
+                raise ValueError(
+                    "upsert requires key_cols present in the frame; got "
+                    f"key_cols={key_cols!r}, frame columns missing "
+                    f"{[k for k in keys if k not in df.columns]}"
+                )
+            if not _table_exists():
+                con.execute(
+                    f'CREATE TABLE "{table}" AS SELECT {select_sql} FROM _tmp_write_gdf'
+                )
+            else:
+                _reconcile_schema()
+                # Source rows with geometry decoded, used by both UPDATE and INSERT.
+                src = f"(SELECT {select_sql} FROM _tmp_write_gdf) src"
+                key_join = " AND ".join(f'"{table}"."{k}" = src."{k}"' for k in keys)
+                set_cols = [c for c in df.columns if c not in keys]
+                if set_cols:
+                    set_clause = ", ".join(f'"{c}" = src."{c}"' for c in set_cols)
+                    con.execute(
+                        f'UPDATE "{table}" SET {set_clause} FROM {src} WHERE {key_join}'
+                    )
+                # Insert rows whose key isn't already present. Keys are plain
+                # (non-geometry) columns, so correlate the table directly with
+                # the raw _tmp_write_gdf rows.
+                col_list = ", ".join(f'"{c}"' for c in df.columns)
+                key_match = " AND ".join(
+                    f'"{table}"."{k}" = _tmp_write_gdf."{k}"' for k in keys)
+                con.execute(
+                    f'INSERT INTO "{table}" ({col_list}) '
+                    f'SELECT {select_sql} FROM _tmp_write_gdf '
+                    f'WHERE NOT EXISTS (SELECT 1 FROM "{table}" WHERE {key_match})'
+                )
         else:
             raise ValueError(
-                f"if_exists must be 'replace' or 'append', got {if_exists!r}"
+                f"if_exists must be 'replace', 'append' or 'upsert', "
+                f"got {if_exists!r}"
             )
     finally:
         con.unregister("_tmp_write_gdf")
@@ -789,7 +887,14 @@ def write_df_safe(con: duckdb.DuckDBPyConnection, table: str, df: pd.DataFrame,
             new_data[col] = [_to_pickle_bytes(v) for v in df[col]]
         else:
             src = df[col]
-            new_data[col] = src.to_numpy() if hasattr(src, "to_numpy") else list(src)
+            # Preserve pandas extension dtypes (e.g. StringDtype, Int64) by
+            # keeping the Series — `to_numpy()` would collapse an all-NA string
+            # column back to object, which DuckDB then infers as INTEGER,
+            # causing VARCHAR-vs-INTEGER type drift against the central table.
+            if hasattr(src, "dtype") and pd.api.types.is_extension_array_dtype(src.dtype):
+                new_data[col] = src.reset_index(drop=True)
+            else:
+                new_data[col] = src.to_numpy() if hasattr(src, "to_numpy") else list(src)
     df2 = pd.DataFrame(new_data)
 
     con.register("_tmp_write_df_safe", df2)
@@ -979,12 +1084,21 @@ def read_gdf(con: duckdb.DuckDBPyConnection, table: str, *,
              geom_col: str = "geometry") -> gpd.GeoDataFrame:
     """Read a DuckDB table back as a GeoDataFrame.
 
-    The geometry column is materialised from GEOMETRY → WKB → shapely
-    via `GeoSeries.from_wkb`. CRS is restored from `_meta`. BLOB
-    columns whose bytes look like pickled data are unpickled (same
-    heuristic as `read_df_safe`); other GEOMETRY columns stay as raw
-    WKB bytes so they don't acquire the geopandas `geometry` dtype
-    (which would cause DuckDB `con.register` failures in `write_gdf`).
+    The designated geometry column is materialised from GEOMETRY → WKB →
+    shapely via `GeoSeries.from_wkb` and set as the active geometry. CRS is
+    restored from `_meta`.
+
+    Object columns are also decoded so the returned frame carries usable
+    Python values rather than opaque ``bytearray``s:
+
+    * Other GEOMETRY-typed columns (e.g. ``br__building_footprint_geometry``)
+      → shapely geometries (plain object column, not the active geometry).
+    * Pickled BLOBs (0x80 prefix) → their original Python object.
+    * Text BLOBs (valid UTF-8, e.g. a date string widened to BLOB by shard
+      type-drift) → ``str``.
+
+    `write_gdf` round-trips all of these back (it auto-detects shapely
+    columns as GEOMETRY and re-pickles complex objects).
     """
     sql = f'SELECT * REPLACE (ST_AsWKB("{geom_col}") AS "{geom_col}") FROM "{table}"'
     if where:
@@ -996,19 +1110,51 @@ def read_gdf(con: duckdb.DuckDBPyConnection, table: str, *,
         None if (b is None or b is pd.NA) else bytes(b)
         for b in df[geom_col]
     ])
-    # Unpickle BLOB columns whose content is a pickled Python object.
-    # Only the designated geom_col is converted to GeoSeries; all other
-    # bytes/bytearray columns stay as bytes unless they look like pickle.
+
+    # Columns DuckDB reports as GEOMETRY (other than geom_col) come back as
+    # raw WKB bytes — decode them to shapely so callers get real geometries.
+    try:
+        geom_typed = {r[0] for r in con.execute(f'DESCRIBE "{table}"').fetchall()
+                      if str(r[1]).upper() == 'GEOMETRY'}
+    except Exception:
+        geom_typed = set()
+
+    def _wkb_or_none(b):
+        if b is None or b is pd.NA:
+            return None
+        try:
+            return _shapely_wkb.loads(bytes(b))
+        except Exception:
+            return b  # leave undecodable bytes untouched
+
+    def _text_or_bytes(b):
+        if b is None or b is pd.NA:
+            return None
+        try:
+            return bytes(b).decode('utf-8')
+        except Exception:
+            return b  # genuine binary stays as bytes
+
     for col in df.columns:
         if col == geom_col or df[col].dtype != object:
+            continue
+        if col in geom_typed:
+            df[col] = [_wkb_or_none(v) for v in df[col]]
             continue
         sample = _first_non_null(df[col])
         if sample is None or not isinstance(sample, (bytes, bytearray, memoryview)):
             continue
         sb = bytes(sample) if not isinstance(sample, bytes) else sample
-        if len(sb) < 2 or sb[0] != 0x80:
-            continue
-        df[col] = [_maybe_unpickle(v) for v in df[col]]
+        if len(sb) >= 2 and sb[0] == 0x80:
+            df[col] = [_maybe_unpickle(v) for v in df[col]]   # pickled object
+        else:
+            # Non-pickle BLOB: decode to str if it is valid UTF-8 text (e.g. a
+            # date string that shard type-drift widened to BLOB), else keep raw.
+            try:
+                sb.decode('utf-8')
+            except Exception:
+                continue
+            df[col] = [_text_or_bytes(v) for v in df[col]]
     return gpd.GeoDataFrame(df, geometry=geom_col, crs=get_table_crs(con, table))
 
 
@@ -1128,6 +1274,7 @@ class ResultsHandle:
     # -- row count ----------------------------------------------------------
 
     def sbr_count(self) -> int:
+        """Number of ``sbr_results`` rows for this handle's municipality."""
         con = self._con()
         own_con = con is not self._parent_con
         try:
@@ -1141,6 +1288,7 @@ class ResultsHandle:
                 con.close()
 
     def br_count(self) -> int:
+        """Number of ``br_results`` rows for this handle's municipality."""
         con = self._con()
         own_con = con is not self._parent_con
         try:

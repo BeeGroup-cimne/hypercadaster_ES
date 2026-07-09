@@ -18,6 +18,7 @@ import os
 import glob
 import numpy as np
 import pandas as pd
+from ._pretty import PrettyDict
 import polars as pl
 import geopandas as gpd
 import rasterio
@@ -299,6 +300,32 @@ def process_open_data_addresses(open_data_layers_dir, cadaster_codes, parcels_gd
 
 def get_cadaster_address(cadaster_dir, cadaster_codes, directions_from_CAT_files=True, CAT_files_dir="CAT_files",
                          directions_from_open_data=True, open_data_layers_dir="open_data"):
+    """Read and assemble cadastral address points for the given municipalities.
+
+    Loads the INSPIRE Address GML per municipality, parses street type/name/number
+    and the geolocated address point, and optionally enriches street naming from
+    CAT files and/or Barcelona open data.
+
+    Parameters
+    ----------
+    cadaster_dir : str
+        Root of the downloaded cadastral layers.
+    cadaster_codes : list[str]
+        Cadastral municipality codes to read.
+    directions_from_CAT_files : bool, default True
+        Also derive street names from CAT files in ``CAT_files_dir``.
+    CAT_files_dir : str, default "CAT_files"
+        CAT files directory (used when ``directions_from_CAT_files``).
+    directions_from_open_data : bool, default True
+        Also derive street names from Barcelona open data.
+    open_data_layers_dir : str, default "open_data"
+        Barcelona open-data directory (used when ``directions_from_open_data``).
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        One row per address with geometry ``address_location``.
+    """
     sys.stderr.write(f"\nReading the cadaster addresses for {len(cadaster_codes)} municipalities\n")
 
     address_gdf = gpd.GeoDataFrame()
@@ -370,8 +397,13 @@ def get_cadaster_address(cadaster_dir, cadaster_codes, directions_from_CAT_files
             addresses_CAT_["street_number_label"], addresses_CAT_["street_number_clean"] = utils.normalize_street_number(
                 addresses_CAT_["street_number"]
             )
+            # Tag THIS municipality's chunk before concatenating. Assigning to
+            # the accumulated frame instead would overwrite cadaster_code for
+            # every previously-added municipality with the current code, so all
+            # CAT addresses province-wide would end up labelled with the last
+            # processed code (mislabelling entire municipalities downstream).
+            addresses_CAT_['cadaster_code'] = code
             addresses_CAT = pd.concat([addresses_CAT, addresses_CAT_], ignore_index=True)
-            addresses_CAT['cadaster_code'] = code
 
         def calculate_centroid(group):
             valid_points = [pt for pt in group["location"] if isinstance(pt, Point)]
@@ -551,6 +583,201 @@ def assign_building_zones(gdf, cadaster_dir, cadaster_codes):
     return gdf
 
 
+# Cadastral OtherConstruction `constructionNature` → thermal-zone use type.
+# The Spanish Catastro only populates this layer with `openAirPool` (pools) in
+# practice, but the INSPIRE code list is extensible, so this is a dict that's
+# easy to grow. Any nature NOT listed here is still stored in
+# `br__other_constructions` but is not routed into the thermal zoning (and is
+# logged by `join_other_constructions` so new types surface for mapping).
+_CONSTRUCTION_NATURE_USE_TYPE = {
+    "openAirPool": "Sports facilities",
+}
+# Human-readable detailed-use label per nature (falls back to the raw nature).
+_CONSTRUCTION_NATURE_LABEL = {
+    "openAirPool": "Open-air pool",
+}
+
+
+def join_other_constructions(building_gdf_, cadaster_dir, code):
+    """Join cadastral OtherConstruction geometries onto buildings and route
+    mapped natures into the thermal zoning.
+
+    The ``A.ES.SDGC.BU.<code>.otherconstruction.gml`` layer holds detached
+    constructions (open-air swimming pools, etc.). Its ``localId`` is
+    ``<building_reference>_PI.<n>``, so the prefix joins directly on
+    ``building_reference``.
+
+    Adds a ``br__other_constructions`` column — a list of
+    ``{nature, area, geometry}`` per building. When ``br__thermal_zones`` is
+    present, every construction whose ``constructionNature`` is in
+    ``_CONSTRUCTION_NATURE_USE_TYPE`` has its geometry assigned to the building's
+    zone of the mapped use type (e.g. a pool → "Sports facilities"), or a new
+    such zone is appended, so downstream views place that zone at the
+    construction's true footprint. Natures not in the map are kept in the
+    column but left unrouted and logged as a warning.
+    """
+    path = f"{cadaster_dir}/buildings/unzip/A.ES.SDGC.BU.{code}.otherconstruction.gml"
+    if not os.path.exists(path):
+        return building_gdf_
+    try:
+        oc = gpd.read_file(path, layer="OtherConstruction")
+    except Exception as _e:
+        sys.stderr.write(f"Could not read OtherConstruction for {code}: {_e}\n")
+        return building_gdf_
+    if oc.empty or "localId" not in oc.columns:
+        return building_gdf_
+
+    oc = oc.copy()
+    oc["building_reference"] = (
+        oc["localId"].astype(str).str.replace(r"_PI\.\d+$", "", regex=True))
+    if (oc.crs is not None and getattr(building_gdf_, "crs", None) is not None
+            and oc.crs != building_gdf_.crs):
+        oc = oc.to_crs(building_gdf_.crs)
+
+    by_ref = {}
+    for ref, sub in oc.groupby("building_reference"):
+        items = []
+        for _, r in sub.iterrows():
+            g = r.geometry
+            if g is None or g.is_empty:
+                continue
+            items.append({"nature": r.get("constructionNature"),
+                          "area": round(float(g.area), 2),
+                          "geometry": g})
+        if items:
+            by_ref[ref] = items
+    if not by_ref:
+        return building_gdf_
+
+    building_gdf_ = building_gdf_.copy(deep=False)
+    building_gdf_["br__other_constructions"] = (
+        building_gdf_["building_reference"].map(by_ref))
+
+    # Self-reporting: tally every constructionNature seen, and flag any that
+    # aren't mapped to a use type (so new municipalities surface new types).
+    from collections import Counter
+    nat_counts = Counter(o["nature"] for v in by_ref.values() for o in v)
+    mapped = {n: c for n, c in nat_counts.items() if n in _CONSTRUCTION_NATURE_USE_TYPE}
+    unmapped = {n: c for n, c in nat_counts.items() if n not in _CONSTRUCTION_NATURE_USE_TYPE}
+    sys.stderr.write(
+        f"join_other_constructions[{code}]: joined to "
+        f"{building_gdf_['br__other_constructions'].notna().sum()} buildings; "
+        f"natures={dict(nat_counts)}; mapped={mapped}\n"
+    )
+    if unmapped:
+        sys.stderr.write(
+            f"join_other_constructions[{code}]: WARNING unmapped "
+            f"constructionNature {unmapped} kept in br__other_constructions but "
+            f"NOT routed to a thermal zone — add to "
+            f"mergers._CONSTRUCTION_NATURE_USE_TYPE to map.\n"
+        )
+
+    if "br__thermal_zones" in building_gdf_.columns:
+        from shapely.ops import unary_union as _uu
+
+        def _augment(zones, others):
+            if not isinstance(zones, list) or not isinstance(others, list):
+                return zones
+            # Group mapped constructions by their target use type.
+            by_use = {}
+            for o in others:
+                if not isinstance(o, dict):
+                    continue
+                use = _CONSTRUCTION_NATURE_USE_TYPE.get(o.get("nature"))
+                g = o.get("geometry")
+                if use is None or g is None or getattr(g, "is_empty", True):
+                    continue
+                slot = by_use.setdefault(use, {"geoms": [], "labels": set()})
+                slot["geoms"].append(g)
+                slot["labels"].add(
+                    _CONSTRUCTION_NATURE_LABEL.get(o["nature"], o["nature"]))
+            if not by_use:
+                return zones
+            zones = list(zones)
+            for use, slot in by_use.items():
+                geoms = slot["geoms"]
+                geom = _uu(geoms) if len(geoms) > 1 else geoms[0]
+                area = round(float(geom.area), 2)
+                labels = sorted(slot["labels"])
+                attached = False
+                for i, z in enumerate(zones):
+                    if isinstance(z, dict) and z.get("use_type") == use:
+                        z = dict(z)
+                        z["geometry"] = geom
+                        z["detailed_use_types"] = sorted(set(
+                            (z.get("detailed_use_types") or []) + labels))
+                        z["source"] = "other_construction"
+                        zones[i] = z
+                        attached = True
+                if not attached:
+                    zones.append({
+                        "zone_id": f"{use}|other_construction",
+                        "kind": "occupied",
+                        "use_type": use,
+                        "detailed_use_types": labels,
+                        "floor": 0, "floors": [0], "duplex": False,
+                        "n_spaces": len(geoms),
+                        "building_spaces_references": [],
+                        "area_with_communals": area,
+                        "area_without_communals": area,
+                        "economic_value": 0.0,
+                        "geometry": geom,
+                        "source": "other_construction",
+                    })
+            return zones
+
+        building_gdf_["br__thermal_zones"] = [
+            _augment(z, o) for z, o in zip(
+                building_gdf_["br__thermal_zones"],
+                building_gdf_["br__other_constructions"])
+        ]
+    return building_gdf_
+
+
+# Use-type keywords whose thermal zones are not occupied by people (parking,
+# storage, …). Open-air pools (routed from OtherConstruction) are also marked
+# non-occupied via their source/detailed-use markers below.
+_NON_OCCUPIED_ZONE_USE_KEYS = ("parking", "warehouse", "storage", "garage")
+
+
+def _thermal_zone_is_non_occupied(z):
+    """True when a thermal-zone dict represents a space not occupied by people
+    (warehouse/parking/storage, or an open-air pool)."""
+    if not isinstance(z, dict) or z.get("kind") == "communal":
+        return False
+    ut = str(z.get("use_type", "")).lower()
+    if any(k in ut for k in _NON_OCCUPIED_ZONE_USE_KEYS):
+        return True
+    det = " ".join(str(d) for d in (z.get("detailed_use_types") or [])).lower()
+    if "pool" in det:
+        return True
+    return z.get("source") == "other_construction"
+
+
+def classify_non_occupied_thermal_zones(building_gdf_):
+    """Tag thermal zones that aren't occupied by people with
+    ``kind='non_occupied'`` (warehouse/parking and open-air pools), leaving
+    communal cores and people-occupied zones untouched. Runs at merge time so
+    it applies without re-running the inference."""
+    if "br__thermal_zones" not in building_gdf_.columns:
+        return building_gdf_
+
+    def _mark(zones):
+        if not isinstance(zones, list):
+            return zones
+        out = []
+        for z in zones:
+            if _thermal_zone_is_non_occupied(z) and z.get("kind") != "non_occupied":
+                z = dict(z)
+                z["kind"] = "non_occupied"
+            out.append(z)
+        return out
+
+    building_gdf_ = building_gdf_.copy(deep=False)
+    building_gdf_["br__thermal_zones"] = building_gdf_["br__thermal_zones"].map(_mark)
+    return building_gdf_
+
+
 def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
                            cadaster_codes, results_dir, open_street_dir, building_parts_plots=False,
                            plot_zones_ratio=0.01, building_parts_inference=False,
@@ -558,7 +785,44 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
                            open_data_layers_dir=None, CAT_files_dir=None,
                            floor_height=3.0, ground_floor_height=5.0, num_workers=-1,
                            force_update=False, cleanup_shards=True):
+    """Join building geometry, attributes and (optionally) inference to addresses.
 
+    Reads the INSPIRE Building layer per municipality, attaches building
+    footprint/use/status/year and space classification, and — when
+    ``building_parts_inference`` is set — runs the geometric inference pipeline
+    (footprints, walls, patios, orientation, shadows) writing ``br_results`` /
+    ``sbr_results`` to the central DuckDB. The ``buildings`` table is upserted
+    per municipality.
+
+    Parameters
+    ----------
+    gdf : geopandas.GeoDataFrame
+        Address-level frame from :func:`get_cadaster_address`.
+    cadaster_dir, census_tracts_dir, DEM_raster_dir, results_dir, open_street_dir : str
+        Input/output directories.
+    cadaster_codes : list[str]
+        Municipalities to process.
+    building_parts_inference : bool, default False
+        Run the geometric inference engine (single municipality only).
+    building_parts_inference_using_CAT_files : bool, default False
+        Use CAT space data to guide inference.
+    building_parts_plots, plot_zones_ratio : bool / float
+        Emit per-zone diagnostic plots for a sampled fraction of zones.
+    open_data_layers, open_data_layers_dir, CAT_files_dir : optional
+        Barcelona open-data / CAT enrichment sources.
+    floor_height, ground_floor_height : float
+        Storey heights (m) used by the inference.
+    num_workers : int, default -1
+        Parallel workers (-1 = all cores).
+    force_update, cleanup_shards : bool
+        Rebuild cached tables / remove per-zone shard DBs after ingestion.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        Address×building frame with building attributes (and ``br__*`` inference
+        columns when enabled).
+    """
     sys.stderr.write(f"\nJoining the buildings description for {len(cadaster_codes)} municipalities\n")
 
     # Drop stale buildings table when force_update is requested so the first
@@ -625,8 +889,15 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
             # ------------------------------------------------------------
             # 1️⃣ Get neighboring municipalities (ONLY THESE)
             # ------------------------------------------------------------
+            # Neighbours must be resolved for the *current* municipality only.
+            # Passing the whole batch list here (a) recomputes an identical,
+            # batch-wide union+intersect on every iteration — the dominant fixed
+            # cost of this loop — and (b) treats every batch municipality as
+            # "original", so adjacent municipalities that are *both* in the batch
+            # get excluded from each other's neighbour set, dropping the border
+            # building-parts this logic exists to load.
             nearby_cadaster_codes = utils.get_neighboring_cadaster_codes(
-                cadaster_codes,
+                [code],
                 census_tracts_dir,
                 buffer_distance=nearby_buildings_buffer
             )
@@ -823,9 +1094,28 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
                     )
 
                 central_con.register("_building_slim", _slim)
+                # Exclude the heavy per-building BLOB columns (shadows /
+                # terrain grids / wall segments) from the bulk frame. Each
+                # is ~11 GB on disk for Barcelona and explodes into tens of
+                # GB of Python dicts once read_gdf unpickles it across the
+                # full building set — the cause of the post-BR-JOIN OOM.
+                # They stay in br_results in the central DB and are fetched
+                # per-building on demand via
+                # utils.get_heavy_columns_for_building (see HEAVY_BLOB_COLS).
+                _br_cols = {
+                    r[0] for r in central_con.execute(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'br_results'"
+                    ).fetchall()
+                }
+                _br_exclude = ["building_reference", "cadaster_code", "zone_reference"]
+                _br_exclude += sorted(_db_mod.HEAVY_BLOB_COLS & _br_cols)
+                _br_exclude_sql = ", ".join(f'"{c}"' for c in _br_exclude)
+                _merge_t = utils.stage_timer("merge: BR LEFT JOIN br_results (SQL)")
+                _merge_t.__enter__()
                 try:
                     # --- BR merge: one SQL statement ---
-                    central_con.execute("""
+                    central_con.execute(f"""
                         CREATE OR REPLACE TABLE _br_merged AS
                         SELECT b."gml_id",
                                b."building_status",
@@ -835,8 +1125,7 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
                                b."year_of_construction",
                                b."zone_reference",
                                b."zone_type",
-                               r.* EXCLUDE ("building_reference", "cadaster_code",
-                                            "zone_reference")
+                               r.* EXCLUDE ({_br_exclude_sql})
                         FROM _building_slim b
                         LEFT JOIN "main"."br_results" r
                                   ON r."building_reference" = b."building_reference"
@@ -844,17 +1133,26 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
                     """, [code])
                 finally:
                     central_con.unregister("_building_slim")
+                    _merge_t.__exit__(None, None, None)
 
                 # --- SBR aggregation: count + dict construction in SQL ---
+                _sbr_t = utils.stage_timer("merge: SBR aggregation (json_group_object + UPDATEs)")
+                _sbr_t.__enter__()
                 sbr_cols_row = central_con.execute(r"""
                     SELECT column_name FROM information_schema.columns
                     WHERE table_name = 'sbr_results'
                       AND column_name LIKE 'sbr\__%'
                     ORDER BY column_name
                 """).fetchall()
-                sbr_cols = [r[0] for r in sbr_cols_row]
+                # Drop the heavy per-SBR BLOB columns: json_group_object'ing
+                # the pickled shadow/terrain grids would rebuild the same
+                # tens-of-GB payload we just excluded from the BR side and
+                # land it back in _br_merged for read_gdf to choke on.
+                sbr_cols = [r[0] for r in sbr_cols_row
+                            if r[0] not in _db_mod.HEAVY_BLOB_COLS]
 
                 if sbr_cols:
+                    utils.stage_log(f"  SBR: {len(sbr_cols)} sbr_* columns to aggregate")
                     # Count SBRs per building
                     central_con.execute("""
                         CREATE OR REPLACE TABLE _sbr_counts AS
@@ -864,6 +1162,7 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
                         WHERE "cadaster_code" = ?
                         GROUP BY "building_reference"
                     """, [code])
+                    utils.stage_log("  SBR: _sbr_counts built")
 
                     # Split into multi-SBR and single-SBR buildings.
                     # Multi-SBR: build {sbr_id: value} JSON objects per column
@@ -890,6 +1189,7 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
                           )
                         GROUP BY "building_reference"
                     """, [code])
+                    utils.stage_log("  SBR: _sbr_multi (json_group_object) built")
 
                     # Single-SBR: NULL for all sbr columns
                     single_null_cols = ', '.join(
@@ -911,6 +1211,7 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
                         UNION ALL
                         SELECT "building_reference", {all_cols} FROM _sbr_single
                     """)
+                    utils.stage_log("  SBR: _sbr_agg union built; starting UPDATE _br_merged")
 
                     # Merge SBR aggregation into br_merged
                     set_clauses = ', '.join(
@@ -931,18 +1232,22 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
                         WHERE _br_merged."building_reference" = c."building_reference"
                     """)
 
+                _sbr_t.__exit__(None, None, None)
+
                 # Read the merged result back as a GeoDataFrame.
                 # read_gdf converts the designated geometry column and
                 # unpickles any BLOB columns (pickled per-use-type dicts
                 # like br__building_spaces_*); other GEOMETRY columns
                 # stay as raw WKB bytes so write_gdf downstream doesn't
                 # see unexpected geopandas 'geometry' dtype columns.
-                building_gdf_ = _db_mod.read_gdf(
-                    central_con, "_br_merged", geom_col="building_geometry"
-                )
+                with utils.stage_timer("merge: read _br_merged into GeoDataFrame"):
+                    building_gdf_ = _db_mod.read_gdf(
+                        central_con, "_br_merged", geom_col="building_geometry"
+                    )
 
                 # Also keep br_results for building_part_gdf downstream
-                building_part_gdf = inference_handle.br_to_pandas()
+                with utils.stage_timer("merge: br_results -> pandas (building_part_gdf)"):
+                    building_part_gdf = inference_handle.br_to_pandas()
 
                 # We're done with the parent connection — close it.
                 if central_con is not None:
@@ -1028,8 +1333,56 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
             )
 
             # Join both tables
-            final_df = summary.join(area_pivot, on="building_reference", how="left").to_pandas()
-            building_gdf_ = pd.merge(building_gdf_, final_df, on="building_reference", how="left")
+            with utils.stage_timer("merge: CAT area/summary join + merge into buildings"):
+                final_df = summary.join(area_pivot, on="building_reference", how="left").to_pandas()
+                building_gdf_ = pd.merge(building_gdf_, final_df, on="building_reference", how="left")
+
+            # Unit/dwelling counts from the inference's br__building_spaces, which
+            # tallies spaces only on floors that exist in the real BuildingPart
+            # geometry. CAT can list spaces on a floor the geometry lacks (so the
+            # last floor gets synthesized); those must NOT inflate the counts.
+            # br__building_spaces is {use_type: n_spaces}; n_building_units is its
+            # sum and n_dwellings its 'Residential' entry. Falls back to the raw
+            # CAT-summary value when br__building_spaces isn't available.
+            if building_parts_inference and 'br__building_spaces' in building_gdf_.columns:
+                def _units_from_spaces(d):
+                    return sum(d.values()) if isinstance(d, dict) and d else None
+
+                def _dwellings_from_spaces(d):
+                    return d.get('Residential', 0) if isinstance(d, dict) and d else None
+
+                _u = building_gdf_['br__building_spaces'].apply(_units_from_spaces)
+                _w = building_gdf_['br__building_spaces'].apply(_dwellings_from_spaces)
+                building_gdf_['n_building_units'] = _u.where(
+                    _u.notna(), building_gdf_['n_building_units'])
+                building_gdf_['n_dwellings'] = _w.where(
+                    _w.notna(), building_gdf_['n_dwellings'])
+
+            # Undeveloped parcels ("solares", CAT use type 'M') live only in CAT
+            # dataset 15, so the dataset-14-based parse never emits them and they
+            # have no BuildingPart geometry — they'd otherwise be missing from
+            # building_gdf_ entirely and carry all-NaN CAT columns downstream.
+            # Add a minimal row (undeveloped-land area + zeroed unit counts) so
+            # they at least surface their parcel area.
+            with utils.stage_timer("merge: undeveloped-parcel CAT supplement"):
+                undev = building_inference.undeveloped_parcels_from_CAT(code, CAT_files_dir)
+                if not undev.empty:
+                    undev = undev[
+                        ~undev["building_reference"].isin(building_gdf_["building_reference"])
+                    ]
+                if not undev.empty:
+                    _geom_name = (
+                        building_gdf_.geometry.name
+                        if isinstance(building_gdf_, gpd.GeoDataFrame) else "building_geometry"
+                    )
+                    _crs = (
+                        building_gdf_.crs
+                        if isinstance(building_gdf_, gpd.GeoDataFrame) else None
+                    )
+                    building_gdf_ = gpd.GeoDataFrame(
+                        pd.concat([building_gdf_, undev], ignore_index=True),
+                        geometry=_geom_name, crs=_crs,
+                    )
 
         elif not building_parts_inference:
             # Only strip to basic columns when building_parts_inference is explicitly False
@@ -1037,6 +1390,13 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
                                          'building_geometry', 'year_of_construction', 'n_building_units', 'n_dwellings',
                                          'n_floors_above_ground', 'building_area', 'zone_reference', 'zone_type']]
         # When building_parts_inference=True but buildings_CAT=None, keep all columns (including br__ and sbr_data)
+
+        # Join detached OtherConstruction geometries (pools, …) and route pools
+        # into the thermal zoning as "Sports facilities".
+        with utils.stage_timer("merge: join OtherConstruction (pools)"):
+            building_gdf_ = join_other_constructions(building_gdf_, cadaster_dir, code)
+        # Mark warehouse/parking and pool zones as not occupied by people.
+        building_gdf_ = classify_non_occupied_thermal_zones(building_gdf_)
 
         # Persist the per-municipality result to the central DuckDB as a
         # `buildings` table so downstream consumers (read_addresses_indicators,
@@ -1049,17 +1409,22 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
             else:
                 building_gdf_ = building_gdf_.copy(deep=False)
                 building_gdf_["cadaster_code"] = code
-            # Check if table exists; use 'replace' for first write.
-            _row = _build_con.execute(
-                "SELECT 1 FROM information_schema.tables "
-                "WHERE table_name = 'buildings' LIMIT 1"
-            ).fetchone()
-            _if_exists = "append" if _row is not None else "replace"
-            _db_mod_build.write_gdf(
-                _build_con, "buildings", building_gdf_,
-                geom_cols=("building_geometry",),
-                if_exists=_if_exists,
-            )
+            # Upsert keyed by building so a re-run refreshes the columns this
+            # run produced WITHOUT duplicating rows and WITHOUT nulling columns
+            # it didn't compute. In particular a building_parts_inference=False
+            # re-run updates the simple/CAT features but preserves the complex
+            # inference features (shadows, walls, structural floors, …) left by
+            # an earlier inference run. write_gdf creates the table on first use.
+            with utils.stage_timer(
+                f"merge: upsert 'buildings' table to central DB "
+                f"({len(building_gdf_)} rows)"
+            ):
+                _db_mod_build.write_gdf(
+                    _build_con, "buildings", building_gdf_,
+                    geom_cols=("building_geometry",),
+                    if_exists="upsert",
+                    key_cols=("cadaster_code", "building_reference"),
+                )
         finally:
             _build_con.close()
 
@@ -1082,7 +1447,11 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
         # drop it from the right side so pd.merge doesn't suffix the names.
         if "cadaster_code" in building_gdf.columns:
             building_gdf = building_gdf.drop(columns="cadaster_code")
-        merged_gdf = pd.merge(gdf, building_gdf, left_on="building_reference", right_on="building_reference", how="left")
+        with utils.stage_timer(
+            f"merge: address↔building pd.merge "
+            f"({len(gdf)} addresses × {len(building_gdf)} buildings)"
+        ):
+            merged_gdf = pd.merge(gdf, building_gdf, left_on="building_reference", right_on="building_reference", how="left")
     else:
         merged_gdf = building_gdf
 
@@ -1090,7 +1459,29 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
 
 
 def join_cadaster_parcel(gdf, cadaster_dir, cadaster_codes, how="left"):
+    """Attach cadastral parcel geometry (and centroid) to buildings.
 
+    Reads the INSPIRE CadastralParcel GML per municipality, keys it by
+    ``building_reference`` and merges ``parcel_geometry`` onto ``gdf``.
+
+    Parameters
+    ----------
+    gdf : geopandas.GeoDataFrame | None
+        Building frame to enrich. When None, only the parcel frame is returned.
+    cadaster_dir : str
+        Root of the downloaded cadastral layers.
+    cadaster_codes : list[str]
+        Municipalities to read.
+    how : str, default "left"
+        Merge strategy for joining parcels onto ``gdf``.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame | tuple
+        ``gdf`` with ``parcel_geometry`` when ``gdf`` is given (returned as
+        ``(gdf_joined, parcel_gdf)`` where ``parcel_gdf`` also carries
+        ``parcel_centroid``); otherwise just the parcel frame.
+    """
     for code in tqdm(cadaster_codes, desc="Iterating by cadaster codes...") if len(cadaster_codes)>1 else cadaster_codes:
         # sys.stderr.write("\r" + " " * 60)
         # sys.stderr.flush()
@@ -1119,7 +1510,23 @@ def join_cadaster_parcel(gdf, cadaster_dir, cadaster_codes, how="left"):
     return (gdf_joined,parcel_gdf) if gdf is not None else gdf_joined
 
 def join_adm_div_naming(gdf, cadaster_dir, cadaster_codes):
+    """Add administrative-division names (municipality/province/autonomous
+    community) to ``gdf`` by joining on ``cadaster_code``.
 
+    Parameters
+    ----------
+    gdf : (Geo)DataFrame
+        Frame carrying a ``cadaster_code`` column.
+    cadaster_dir : str
+        Unused placeholder kept for signature symmetry with other joiners.
+    cadaster_codes : list[str]
+        Municipalities whose naming metadata to fetch.
+
+    Returns
+    -------
+    (Geo)DataFrame
+        ``gdf`` with municipality/province/autonomous-community name columns.
+    """
     return pd.merge(gdf, utils.get_administrative_divisions_naming(cadaster_codes=cadaster_codes),
                     left_on="cadaster_code", right_on="cadaster_code", how="left")
 
@@ -1129,6 +1536,57 @@ def join_cadaster_data(cadaster_dir, census_tracts_dir, DEM_raster_dir, cadaster
                        use_CAT_files=False, open_data_layers=False, open_data_layers_dir=None, CAT_files_dir = None,
                        floor_height=3.0, ground_floor_height=5.0, num_workers=-1,
                        force_update=False, cleanup_shards=True):
+    """Orchestrate the full cadastral join: addresses + buildings + parcels + naming.
+
+    This is the core of ``hc.merge()``. It reads addresses
+    (:func:`get_cadaster_address`), joins building geometry and optional
+    inference (:func:`join_cadaster_building`), attaches parcels
+    (:func:`join_cadaster_parcel`) and administrative naming
+    (:func:`join_adm_div_naming`), returning the unified building GeoDataFrame.
+
+    Parameters
+    ----------
+    cadaster_dir, census_tracts_dir, DEM_raster_dir, results_dir, open_street_dir : str
+        Input/output directories.
+    cadaster_codes : list[str]
+        Municipalities to process.
+    building_parts_inference, use_CAT_files, open_data_layers : bool
+        Feature toggles forwarded to the building join.
+    building_parts_plots, plot_zones_ratio, open_data_layers_dir, CAT_files_dir,
+    floor_height, ground_floor_height, num_workers, force_update, cleanup_shards :
+        See :func:`join_cadaster_building`.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        The merged building-level frame (before the external layer joins in
+        ``hc.merge``).
+    """
+    # Drop municipalities whose downloaded cadastral GMLs are missing (e.g. a
+    # download that failed in a large province run), so one absent municipality
+    # doesn't abort the whole merge. Each needs its address, building and parcel
+    # GMLs to be processed.
+    def _has_cadaster_files(code):
+        return (
+            os.path.exists(f"{cadaster_dir}/address/unzip/A.ES.SDGC.AD.{code}.gml") and
+            os.path.exists(f"{cadaster_dir}/buildings/unzip/A.ES.SDGC.BU.{code}.building.gml") and
+            os.path.exists(f"{cadaster_dir}/parcels/unzip/A.ES.SDGC.CP.{code}.cadastralparcel.gml")
+        )
+
+    present = [c for c in cadaster_codes if _has_cadaster_files(c)]
+    missing = [c for c in cadaster_codes if c not in present]
+    if missing:
+        sys.stderr.write(
+            f"\nWarning: skipping {len(missing)} of {len(cadaster_codes)} municipalities "
+            f"with missing cadastral GML files (re-run download() to fetch them): {missing}\n"
+        )
+    if not present:
+        raise FileNotFoundError(
+            f"None of the {len(cadaster_codes)} requested municipalities have their "
+            f"cadastral GML files under '{cadaster_dir}'. Run download() first (and check "
+            f"it completed)."
+        )
+    cadaster_codes = present
 
     # Address
     gdf = get_cadaster_address(
@@ -1230,7 +1688,30 @@ def join_DEM_raster(gdf, raster_dir, geometry_column=None, chunk_size=100_000):
     return gdf
 
 def join_by_census_tracts(gdf, census_tract_dir, columns=None, geometry_column = "census_geometry", year = 2022):
+    """Spatially join INE census-tract codes onto buildings.
 
+    Reads ``validated_census_{year}.gpkg`` and assigns each building the census
+    section/district it falls within (``within`` predicate).
+
+    Parameters
+    ----------
+    gdf : geopandas.GeoDataFrame
+        Building frame to enrich.
+    census_tract_dir : str
+        Directory holding the validated census GPKG.
+    columns : dict, optional
+        Source→output column rename map (defaults to CUSEC→section_code,
+        CUDIS→district_code, geometry→census_geometry).
+    geometry_column : str, default "census_geometry"
+        Name of the census geometry column after renaming.
+    year : int, default 2022
+        Census cartography year to load.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        ``gdf`` with ``section_code`` and ``district_code`` added.
+    """
     if columns is None:
         columns = {
             "CUSEC": "section_code",
@@ -1249,8 +1730,133 @@ def join_by_census_tracts(gdf, census_tract_dir, columns=None, geometry_column =
     return census_gdf
 
 
-def get_census_gdf(census_tract_dir, columns=None, geometry_column="geometry", year=2022, crs="EPSG:4326"):
+def _ine_census2021_sections(wd):
+    """Section-level INE 2021 Census indicators, loaded directly from the main
+    ``C2021_Indicadores`` file and cached under ``{wd}/INE/Census2021_main``.
 
+    Loaded here rather than via ``social_ES.INECensus2021`` because that helper
+    additionally pulls supplementary INE files whose column layout INE has since
+    changed (it currently raises ``KeyError: 'Municipio de residencia'``). The
+    main indicators file already carries every field we need at section
+    granularity. Returns a DataFrame keyed by ``section_code`` (CUSEC =
+    province+municipality+district+section)."""
+    path = os.path.join(wd, "INE", "Census2021_main")
+    os.makedirs(path, exist_ok=True)
+    fn = os.path.join(path, "sections.tsv")
+    if os.path.exists(fn):
+        return pd.read_csv(fn, sep="\t", dtype={"section_code": str})
+    import requests
+    from io import StringIO
+    r = requests.get("https://www.ine.es/censos2021/C2021_Indicadores.csv",
+                     headers={"User-Agent": "Mozilla/5.0"}, timeout=180)
+    r.encoding = "utf-8"
+    raw = pd.read_csv(StringIO(r.text), sep=",", dtype=str)
+    rename = {
+        "t3_1": "Average age",
+        "t4_1": "Percentage of people under 16 years",
+        "t4_3": "Percentage of people over 64 years of age",
+        "t1_1": "Total People",
+        "t21_1": "Total Households",
+        "t22_1": "Households with 1 person",
+        "t22_2": "Households with 2 people",
+        "t22_3": "Households with 3 people",
+        "t22_4": "Households of 4 people",
+        "t22_5": "Households of 5 or more people",
+    }
+    for c in ("cpro", "cmun", "dist", "secc"):
+        raw[c] = raw[c].astype(str).str.strip()
+    raw["section_code"] = raw["cpro"] + raw["cmun"] + raw["dist"] + raw["secc"]
+    keep = ["section_code"] + [c for c in rename if c in raw.columns]
+    out = raw[keep].rename(columns=rename)
+    out.to_csv(fn, sep="\t", index=False)
+    return out
+
+
+def join_sociodemographics(gdf, wd, year=None):
+    """Join INE section-level sociodemographic/socioeconomic indicators onto each
+    building by its census section (``section_code``, added by
+    ``join_by_census_tracts``) → per-building columns
+
+      * ``br__population_mean_age``            — mean age of the section (years)
+      * ``br__population_share_over_64``       — % of the section aged >= 65
+      * ``br__population_share_under_16``      — % of the section aged < 16
+      * ``br__average_household_size``         — mean people per household
+      * ``br__total_households``               — households in the section
+
+    Source: the INE 2021 Population & Housing Census section indicators
+    (``_ine_census2021_sections``). These feed the residential occupant-behaviour
+    assignment in the energy model (``energy._assign_residential_user``). Degrades
+    gracefully: on any missing column / failed download / absent ``section_code``
+    the frame is returned unchanged (behaviour then falls back to per-dwelling
+    area estimates + default demographic buckets)."""
+    if "section_code" not in gdf.columns:
+        sys.stderr.write("sociodemographics: no section_code column; skipping\n")
+        return gdf
+    try:
+        census = _ine_census2021_sections(wd)
+    except Exception as e:
+        sys.stderr.write(f"sociodemographics: INE Census 2021 fetch failed ({e}); skipping\n")
+        return gdf
+
+    def _num(col):
+        return (pd.to_numeric(census[col], errors="coerce")
+                if col in census.columns else pd.Series(np.nan, index=census.index))
+
+    h1, h2, h3 = _num("Households with 1 person"), _num("Households with 2 people"), _num("Households with 3 people")
+    h4, h5 = _num("Households of 4 people"), _num("Households of 5 or more people")
+    tot_hh = _num("Total Households")
+    # Mean household size from the size distribution (5+ counted as 5.5); fall
+    # back to Total People / Total Households when the distribution is absent.
+    size_from_dist = (1 * h1 + 2 * h2 + 3 * h3 + 4 * h4 + 5.5 * h5) / tot_hh
+    size_from_people = _num("Total People") / tot_hh
+    avg_size = size_from_dist.where(size_from_dist.notna(), size_from_people)
+
+    socio = pd.DataFrame({
+        "_sd_key": census["section_code"].astype(str),
+        "br__population_mean_age": _num("Average age"),
+        "br__population_share_over_64": _num("Percentage of people over 64 years of age"),
+        "br__population_share_under_16": _num("Percentage of people under 16 years"),
+        "br__average_household_size": avg_size,
+        "br__total_households": tot_hh,
+    })
+    socio = socio[socio["_sd_key"].str.len() >= 8].drop_duplicates("_sd_key")
+
+    # ``section_code`` may be a scalar or (after address compaction) a 1-element
+    # list; normalise to a scalar string key for the merge without mutating it.
+    def _scalar(v):
+        if isinstance(v, (list, tuple, np.ndarray)):
+            v = v[0] if len(v) else None
+        return None if v is None else str(v)
+    gdf = gdf.copy()
+    gdf["_sd_key"] = gdf["section_code"].map(_scalar)
+    n_match = gdf["_sd_key"].isin(socio["_sd_key"]).sum()
+    gdf = gdf.merge(socio, on="_sd_key", how="left").drop(columns="_sd_key")
+    sys.stderr.write(f"sociodemographics: matched {n_match}/{len(gdf)} buildings to section demographics\n")
+    return gdf
+
+
+def get_census_gdf(census_tract_dir, columns=None, geometry_column="geometry", year=2022, crs="EPSG:4326"):
+    """Load census tracts as a GeoDataFrame with administrative naming columns.
+
+    Parameters
+    ----------
+    census_tract_dir : str
+        Directory holding the validated census GPKG.
+    columns : dict, optional
+        Source→output rename map (defaults to municipality/province/autonomous
+        community names plus section/district codes and geometry).
+    geometry_column : str, default "geometry"
+        Active geometry column after renaming.
+    year : int, default 2022
+        Census cartography year.
+    crs : str, default "EPSG:4326"
+        Output CRS.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        Census tracts with naming/code columns in ``crs``.
+    """
     if columns is None:
         columns = {
             "CUMUN": "ine_municipality_code",
@@ -1272,7 +1878,28 @@ def get_census_gdf(census_tract_dir, columns=None, geometry_column="geometry", y
     return census_gdf
 
 def join_by_neighbourhoods(gdf, neighbourhoods_dir, columns=None, geometry_column="neighborhood_geometry"):
+    """Spatially join Barcelona neighborhood/district names onto buildings.
 
+    Barcelona-only: reads ``neighbourhoods.csv`` (WKT geometries) and assigns
+    each building the neighborhood/district it falls within. Raises if the file
+    is absent, so keep ``neighborhood_layer=False`` for other municipalities.
+
+    Parameters
+    ----------
+    gdf : geopandas.GeoDataFrame
+        Building frame to enrich.
+    neighbourhoods_dir : str
+        Directory holding ``neighbourhoods.csv``.
+    columns : dict, optional
+        Source→output rename map (defaults to codi_barri→neighborhood_code, …).
+    geometry_column : str, default "neighborhood_geometry"
+        Neighborhood geometry column after renaming.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        ``gdf`` with neighborhood/district columns added.
+    """
     if columns is None:
         columns = {
             "codi_barri": "neighborhood_code",
@@ -1295,7 +1922,27 @@ def join_by_neighbourhoods(gdf, neighbourhoods_dir, columns=None, geometry_colum
 
 
 def join_by_postal_codes(gdf, postal_codes_dir, columns=None, geometry_column="postal_code_geometry"):
+    """Spatially join Spanish postal codes onto buildings.
 
+    Reads ``postal_codes.geojson`` and assigns each building the postal code
+    polygon it falls within.
+
+    Parameters
+    ----------
+    gdf : geopandas.GeoDataFrame
+        Building frame to enrich.
+    postal_codes_dir : str
+        Directory holding ``postal_codes.geojson``.
+    columns : dict, optional
+        Source→output rename map (defaults to CODPOS→postal_code, geometry→…).
+    geometry_column : str, default "postal_code_geometry"
+        Postal-code geometry column after renaming.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        ``gdf`` with a ``postal_code`` column added.
+    """
     if columns is None:
         columns = {
             "CODPOS": "postal_code",
@@ -1325,11 +1972,13 @@ def join_pois(gdf, open_street_dir, cadaster_dir, cadaster_codes):
     - poi_{group}[_{subgroup}]_100m   : count of POIs within 100 m
     - poi_{group}[_{subgroup}]_250m   : count of POIs within 250 m
     - poi_{group}[_{subgroup}]_500m   : count of POIs within 500 m
+    - poi_{group}[_{subgroup}]_1000m  : count of POIs within 1000 m
+    - poi_{group}[_{subgroup}]_1500m  : count of POIs within 1500 m
     """
     from collections import defaultdict
 
     GROUPS_OF_INTEREST = {"amenity", "emergency", "healthcare", "leisure", "office", "shop", "tourism"}
-    DISTANCES = [100, 250, 500]
+    DISTANCES = [100, 250, 500, 1000, 1500]
     METRIC_CRS = "EPSG:25831"
 
     sys.stderr.write(f"\nJoining POI indicators for {len(cadaster_codes)} municipalities\n")
@@ -1344,7 +1993,9 @@ def join_pois(gdf, open_street_dir, cadaster_dir, cadaster_codes):
                 cadaster_code=code,
                 cadaster_dir=cadaster_dir,
                 open_street_dir=open_street_dir,
-                buffer_m=200,
+                # fetch a margin at least as wide as the largest proximity ring
+                # so edge buildings' 1500 m counts aren't truncated
+                buffer_m=max(DISTANCES),
             )
         except Exception as e:
             sys.stderr.write(f"Warning: Could not get POIs for {code}: {e}\n")
@@ -1412,7 +2063,7 @@ def join_pois(gdf, open_street_dir, cadaster_dir, cadaster_codes):
             gdf = gdf.merge(ids, on="building_reference", how="left")
 
     # ------------------------------------------------------------------
-    # 2. Distance-based counts (100 m, 250 m, 500 m)
+    # 2. Distance-based counts (100 m, 250 m, 500 m, 1000 m, 1500 m)
     # ------------------------------------------------------------------
     if "building_centroid" in gdf.columns:
         buildings_pts = (
@@ -1513,6 +2164,11 @@ DEFAULT_BUILDING_AGGS = {
     "br__exists_ground_commercial_premises": "sum",
     "br__detached": "sum",
 }
+
+DEFAULT_BUILDING_AGGS = PrettyDict(DEFAULT_BUILDING_AGGS)
+"""Default aggregation operation per known building-level column, used by
+:func:`aggregate_to_grid` / :func:`aggregate_to_h3`. Columns absent from both
+this mapping and the caller's ``aggregations`` argument are dropped."""
 
 
 def _coerce_centroid_gdf(gdf, geometry_col):

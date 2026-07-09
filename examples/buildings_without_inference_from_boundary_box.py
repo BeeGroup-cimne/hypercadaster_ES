@@ -44,7 +44,7 @@ print("Discovering municipalities within bounding box...")
 print(f"Bounding box: {bbox} (lon_min, lat_min, lon_max, lat_max)")
 
 # Get INE municipality codes for municipalities intersecting the bounding box
-ine_codes = hc.get_ine_codes_from_bounding_box(wd, bbox)
+ine_codes = hc.utils.get_ine_codes_from_bounding_box(wd, bbox)
 print(f"Found {len(ine_codes)} municipalities in bounding box:")
 
 # Performance warning for large areas
@@ -55,11 +55,11 @@ if len(ine_codes) > 20:
     print("   This script may take 1-2+ hours to complete.")
     print()
 
-names = hc.municipality_name(ine_codes)
+names = hc.utils.municipality_name(ine_codes)
 pp.pprint(names, compact=True)
 
 # Convert INE codes to cadastral codes
-cadaster_codes = hc.ine_to_cadaster_codes(ine_codes)
+cadaster_codes = hc.utils.ine_to_cadaster_codes(ine_codes)
 print(f"\nCorresponding cadastral codes: {cadaster_codes}")
 
 # Download all required data for discovered municipalities

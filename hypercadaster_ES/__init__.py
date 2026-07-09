@@ -18,19 +18,25 @@ Examples:
     >>> gdf = hc.merge("./data", province_codes=["08"])
 """
 
+# Minimal top-level API. Everything else is reached through the submodules
+# (e.g. hc.utils.ine_to_cadaster_codes, hc.mergers.aggregate_to_grid,
+# hc.energy.build_energy_model, hc.weather.municipality_epw).
 from .functions import download, merge
-from .utils import get_ine_codes_from_bounding_box, ine_to_cadaster_codes, municipality_name
-from .mergers import aggregate_to_grid, aggregate_to_h3
 from ._db import ResultsHandle
-from . import mergers, utils, building_inference, downloaders, interoperability
+from . import (mergers, utils, building_inference, downloaders, interoperability,
+               energy, weather)
 
 __version__ = "1.1.0"
 __author__ = "Jose Manuel Broto Vispe"
 __email__ = "jmbrotovispe@gmail.com"
 
+# Docstrings across the package are written in NumPy style; tell pdoc so it
+# renders the Parameters/Returns sections as proper lists rather than plain text.
+__docformat__ = "numpy"
+
 __all__ = [
-    "download", "merge", "get_ine_codes_from_bounding_box",
-    "ine_to_cadaster_codes", "municipality_name",
-    "aggregate_to_grid", "aggregate_to_h3",
-    "ResultsHandle",
+    # Top-level API
+    "download", "merge", "ResultsHandle",
+    # Submodules (this order drives the API-docs index)
+    "downloaders", "energy", "interoperability", "mergers", "utils", "weather",
 ]

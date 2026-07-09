@@ -6,6 +6,23 @@ This document provides a complete reference for the data structure and columns a
 
 The resulting GeoDataFrame provides comprehensive building-level information organized in logical column groups. The exact columns available depend on the configuration parameters used during processing.
 
+Prefixes tell you where a column comes from:
+
+- **no prefix** — cadastral/address/administrative attributes and join results.
+- **`br__`** — building-reference inference outputs (one row per building;
+  requires `building_parts_inference=True`).
+- **`sbr__`** — single-building-reference inference outputs (one row per
+  physically distinct building within a shared parcel; stored in the
+  `sbr_results` table, see [Space-level results](#-space-level-results-sbr_results)).
+- **`poi_…`** — OpenStreetMap POI indicators (requires `pois_layer=True`).
+
+> **Heavy columns are not in the returned frame.** Eight per-building BLOB
+> columns (shadows, terrain grids, wall segments) are deliberately **excluded**
+> from `merge()`'s output and from the `buildings` table to keep memory bounded
+> — they are only retrievable one building at a time via
+> `get_heavy_columns_for_building()`. See
+> [Heavy BLOB columns](#-heavy-blob-columns-on-demand-only).
+
 ## 🏗️ Core Building Identification & Geometry
 
 ### Primary Identifiers
@@ -42,8 +59,8 @@ The resulting GeoDataFrame provides comprehensive building-level information org
 |--------|------|-------------|
 | `street_name` | String | Street name (e.g., "SANT AGUSTÍ") |
 | `street_type` | String | Street type (e.g., "PLAÇA DE", "CALLE") |
-| `street_number` | String | Building number |
-| `street_number_clean` | Integer | Numeric building number |
+| `street_number_clean` | String | Building number, normalised |
+| `street_number_label` | String | Building number as labelled in the source |
 | `specification` | String | Address specification (entrance, etc.) |
 
 ## 🗺️ Administrative Geography & Context
@@ -152,9 +169,17 @@ The resulting GeoDataFrame provides comprehensive building-level information org
 | `br__above_ground_built_area_by_floor` | List | Built area per floor |
 | `br__above_ground_roof_area_by_floor` | List | Roof area per floor |
 | `br__below_ground_built_area_by_floor` | List | Basement area per floor |
-| `br__building_perimeter_by_floor` | List | Perimeter per floor |
-| `br__building_footprint_by_floor` | List | Footprint geometry per floor |
-| `br__building_footprint_geometry` | LineString | Building outline |
+| `br__building_perimeter_by_floor` | List | Perimeter per floor (above ground) |
+| `br__building_perimeter_below_ground_by_floor` | List | Perimeter per basement floor |
+| `br__building_footprint_by_floor` | Dict | Footprint geometry per floor |
+| `br__building_footprint_geometry` | Geometry | Building outline |
+
+### Structural Floors
+| Column | Type | Description |
+|--------|------|-------------|
+| `br__structural_floors` | Float | Total number of structural floor slabs |
+| `br__structural_floors_by_floor` | List | Structural slabs per above-ground floor |
+| `br__structural_floors_below_ground_by_floor` | List | Structural slabs per basement floor |
 
 ## 🧭 Building Orientation & Environmental Analysis (building_inference=True)
 
@@ -173,33 +198,41 @@ The resulting GeoDataFrame provides comprehensive building-level information org
 | `br__next_building_by_orientation` | Dict | {orientation: distance_to_next_m} |
 | `br__next_building_main_orientation` | Float | Distance to next building at main orientation |
 
-### Building Contour Analysis (Shadow Casting)
+### Building Contour (light column)
 | Column | Type | Description |
 |--------|------|-------------|
-| `br__building_contour_at_distance` | Dict | {orientation: distance_from_centroid_to_edge_m} |
-| `br__building_shadows_at_distance` | Dict | {orientation: [distance_to_first_taller_neighbor_m, per floor]} |
-| `br__vertical_distances_at_collision` | Dict | {orientation: [neighbor_roof_height_above_floor_m, per floor]} |
-| `br__elevation_at_shadow` | Dict | {orientation: absolute_neighbor_roof_elevation_m} |
-| `br__terrain_shadows_at_distance` | Dict | {orientation: distance_to_blocking_terrain_m} — evaluated once at the building's top-floor eye level |
-| `br__terrain_elevation_at_shadow` | Dict | {orientation: absolute_terrain_elevation_at_block_m} |
-| `br__terrain_elevation_profile` | Dict | {orientation: [terrain_elevation_at_each_sample_m]} — observer-independent DEM samples along each outgoing ray |
-| `br__terrain_profile_distances` | List | [distance_from_centroid_m, ...] — sample offset grid that `br__terrain_elevation_profile` is aligned to |
+| `br__building_contour_at_distance` | Dict | `{orientation_deg: distance_from_centroid_to_edge_m}` |
+
+> The full per-floor shadow casting and terrain results
+> (`br__shadows`, `br__shadows_at_distance`, `br__terrain_grid`) are **heavy
+> BLOB columns** excluded from the frame — see
+> [Heavy BLOB columns](#-heavy-blob-columns-on-demand-only).
 
 ## 🌡️ Thermal Analysis Properties (building_inference=True)
 
-### Wall Analysis by Orientation
-| Column | Type | Description |
-|--------|------|-------------|
-| `br__air_contact_wall` | Dict | {orientation: exterior_wall_area_m2} |
-| `br__air_contact_wall_by_floor` | Dict | {orientation: [area_per_floor]} |
-| `br__air_contact_wall_significant_orientations` | List | Significant facade orientations |
-| `br__air_contact_wall_significant_orientations_by_floor` | List | Per-floor significant orientations |
+### Exterior Walls by Orientation
+Exterior walls are split into **main-façade** walls (facing air/street) and
+**party** walls (shared with an adjacent building on the same orientation).
 
-### Internal Walls and Structures
 | Column | Type | Description |
 |--------|------|-------------|
-| `br__adiabatic_wall` | Float | Total internal wall area (m²) |
-| `br__adiabatic_wall_by_floor` | List | Internal wall area per floor |
+| `br__main_facade_wall` | Dict | `{orientation_deg: facade_wall_area_m2}` |
+| `br__main_facade_wall_by_floor` | Dict | `{orientation_deg: [area_per_floor]}` |
+| `br__main_facade_wall_significant_orientations` | List | Dominant façade orientations |
+| `br__main_facade_wall_significant_orientations_by_floor` | List | Per-floor dominant orientations |
+| `br__party_wall` | Dict | `{orientation_deg: party_wall_area_m2}` (shared with neighbour) |
+| `br__party_wall_by_floor` | Dict | `{orientation_deg: [area_per_floor]}` |
+| `br__party_wall_significant_orientations` | List | Dominant party-wall orientations |
+| `br__party_wall_significant_orientations_by_floor` | List | Per-floor dominant orientations |
+
+### Internal & Ground-Contact Walls
+| Column | Type | Description |
+|--------|------|-------------|
+| `br__adiabatic_wall` | Float | Total adiabatic (fully shared) wall area (m²) |
+| `br__adiabatic_wall_by_floor` | List | Adiabatic wall area per floor |
+| `br__terrain_contact_wall` | Float | Total wall area in contact with terrain (m²) |
+| `br__terrain_contact_wall_by_floor` | List | Terrain-contact wall area per above-ground floor |
+| `br__terrain_contact_wall_below_ground_by_floor` | List | Terrain-contact wall area per basement floor |
 | `br__walls_between_slabs` | Float | Total wall area between floor slabs |
 
 ### Courtyard/Patio Analysis
@@ -240,6 +273,52 @@ The resulting GeoDataFrame provides comprehensive building-level information org
 | `br__mean_building_space_category_by_floor` | Dict | Per-floor category averages |
 | `br__mean_building_space_communal_area_by_floor` | Dict | Per-floor shared area averages |
 
+## 🧱 Heavy BLOB columns (on-demand only)
+
+To keep memory bounded on large municipalities (each of these is on the order of
+gigabytes for Barcelona), `merge()` **never materialises** the following eight
+columns into the returned frame or the `buildings` table. They live in the
+`br_results` / `sbr_results` tables and must be fetched one building at a time:
+
+```python
+heavy = hc.utils.get_heavy_columns_for_building(
+    wd, cadaster_code, building_reference, table="br_results"  # or "sbr_results"
+)
+```
+
+`table="br_results"` returns the four `br__` columns; `table="sbr_results"`
+returns the four `sbr__` equivalents. Missing rows yield `None` per column.
+
+| Column (`br__` / `sbr__`) | Type | Structure |
+|---------------------------|------|-----------|
+| `…__shadows` | Dict | `{floor_int: (Multi)Polygon}` — per-floor visible-sky / cast-shadow footprint |
+| `…__shadows_at_distance` | Dict | `{orientation_deg_str: [distance_m per floor]}` — distance to the first taller obstruction |
+| `…__terrain_grid` | Dict | Local DEM raster patch: `{x_min, y_min, cell_size, nx, ny, elev}`, where `elev` is an `ny × nx` grid of elevations (m) |
+| `…__wall_segments` | List | Records `{geometry: LineString, type: "main_facade"｜"party"｜…, floor: int, orientation: …}` |
+
+Plot helpers auto-hydrate these: passing `wd=` to
+`hc.utils.plot_building_shadows_analysis(gdf, ref, wd=wd)` fetches the missing
+shadow/terrain columns for the requested building automatically.
+
+## 🏢 Space-level results (`sbr_results`)
+
+When a cadastral parcel holds several physically distinct buildings, inference
+also produces a **single-building-reference** row per building in the
+`sbr_results` table (read with `hc.utils.read_sbr_inferred_indicators(code, wd)`).
+It mirrors the `br__*` geometry/wall/shadow schema with an `sbr__` prefix, plus:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `single_building_reference` | String | Identifier of the individual building within the parcel |
+| `sbr__n_buildings` | Integer | Number of buildings sharing the parent building reference |
+| `sbr__detached` | Boolean | Whether this building is detached |
+
+All the per-building geometry, floor, wall (`sbr__main_facade_wall`,
+`sbr__party_wall`, `sbr__terrain_contact_wall`, …), patio, structural-floor and
+shadow/terrain columns exist with the `sbr__` prefix (the four
+`sbr__shadows`/`sbr__shadows_at_distance`/`sbr__terrain_grid`/`sbr__wall_segments`
+are heavy — fetch with `table="sbr_results"`).
+
 ## 📍 Points of Interest (pois_layer=True)
 
 POI indicators are added when `pois_layer=True` is passed to `merge()`. Data is sourced from OpenStreetMap and joined at building level for the following groups: `amenity`, `emergency`, `healthcare`, `leisure`, `office`, `shop`, `tourism`.
@@ -255,6 +334,8 @@ For groups with subgroups (e.g. `amenity` → `food`, `education`, …) the colu
 | `poi_{prefix}_100m` | Integer | POI count within 100 m of building centroid |
 | `poi_{prefix}_250m` | Integer | POI count within 250 m of building centroid |
 | `poi_{prefix}_500m` | Integer | POI count within 500 m of building centroid |
+| `poi_{prefix}_1000m` | Integer | POI count within 1000 m of building centroid |
+| `poi_{prefix}_1500m` | Integer | POI count within 1500 m of building centroid |
 
 ### POI Groups and Subgroups
 
@@ -273,6 +354,7 @@ For groups with subgroups (e.g. `amenity` → `food`, `education`, …) the colu
 - `poi_amenity_food_250m` — food amenities within 250 m
 - `poi_emergency_100m` — emergency facilities within 100 m
 - `poi_shop_clothing_500m` — clothing shops within 500 m
+- `poi_leisure_1500m` — leisure POIs within 1500 m
 - `poi_tourism_accommodation_ids` — OSM IDs of accommodation on the building
 
 ## 🏪 Commercial Premises Analysis (Barcelona open_data_layers=True)
@@ -313,8 +395,13 @@ For groups with subgroups (e.g. `amenity` → `food`, `education`, …) the colu
 | Thermal Properties | - | - | ✓ | ✓ |
 | Space Breakdown | - | - | - | ✓ |
 | Economic Data | - | ✓ | - | ✓ |
+| Heavy shadow/terrain columns | - | - | on-demand¹ | on-demand¹ |
+| Space-level `sbr_results` | - | - | ✓ | ✓ |
 | POI Proximity | pois_layer=True | pois_layer=True | pois_layer=True | pois_layer=True |
 | Commercial Premises | Barcelona Only | Barcelona Only | Barcelona Only | Barcelona Only |
+
+¹ Never in the returned frame — fetch with `get_heavy_columns_for_building()`
+(see [Heavy BLOB columns](#-heavy-blob-columns-on-demand-only)).
 
 ---
 

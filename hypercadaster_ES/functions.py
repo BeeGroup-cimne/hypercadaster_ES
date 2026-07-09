@@ -9,6 +9,7 @@ Main functions:
 """
 
 import os
+import sys
 import geopandas as gpd
 from zipfile import ZipFile, BadZipFile
 
@@ -16,11 +17,63 @@ from hypercadaster_ES import mergers
 from hypercadaster_ES import utils
 from hypercadaster_ES import downloaders
 
+
+def _as_code_list(value, width):
+    """Normalise a code selector to a list of zero-padded string codes.
+
+    Accepts a single value or a list, of ints or strings. Every purely numeric
+    code is left-zero-padded to ``width`` (province codes are 2-digit, INE and
+    cadaster codes 5-digit), so ``25``/``"25"`` → ``"25"``, ``8``/``"8"`` →
+    ``"08"`` and ``8019``/``"8019"`` → ``"08019"`` — the leading-zero string form
+    the matching logic expects. Non-numeric codes and codes already at/over
+    ``width`` are kept verbatim (``zfill`` never truncates). Returns ``None``
+    unchanged.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        value = [value]
+    return [str(v).zfill(width) if str(v).isdigit() else str(v) for v in value]
+
+
 def download(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
              neighborhood_layer=True, postal_code_layer=True, census_layer=True,
-             elevation_layer=True, open_data_layers=True, force=False, 
+             elevation_layer=True, open_data_layers=True, force=False,
              building_parts_inference=False):
+    """Download every requested data layer for a geographic area into ``wd``.
 
+    The area is selected with any combination of ``province_codes`` (2-digit),
+    ``ine_codes`` (5-digit INE municipality) or ``cadaster_codes`` (cadastral
+    municipality); the three are resolved to a de-duplicated set of cadastral
+    codes. At least one selector must be provided. Each argument accepts a single
+    string or a list.
+
+    Parameters
+    ----------
+    wd : str
+        Working directory. The directory tree is created if missing.
+    province_codes, ine_codes, cadaster_codes : str | list[str], optional
+        Area selectors (see above).
+    neighborhood_layer, open_data_layers : bool, default True
+        Barcelona-only layers (neighborhood/district boundaries and the
+        commercial/street open-data resources); ignored for other municipalities.
+    postal_code_layer : bool, default True
+        Download Spanish postal-code boundaries (also required by the DEM layer).
+    census_layer : bool, default True
+        Download INE census-tract boundaries.
+    elevation_layer : bool, default True
+        Download the Digital Elevation Model raster covering the area.
+    force : bool, default False
+        Remove ``wd`` before downloading to force a clean re-download.
+    building_parts_inference : bool, default False
+        When True, also download neighbouring municipalities (200 m buffer) so
+        edge buildings have complete context for later inference in ``merge()``.
+
+    Returns
+    -------
+    None
+        Files are written under ``wd``; nothing is returned.
+    """
     if force:
         try:
             os.removedirs(wd)
@@ -28,39 +81,44 @@ def download(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
             pass
     utils.create_dirs(data_dir=wd)
 
-    # Convert inputs to list format
-    if province_codes is not None:
-        province_codes = province_codes if isinstance(province_codes, list) else [province_codes]
-    if ine_codes is not None:
-        ine_codes = ine_codes if isinstance(ine_codes, list) else [ine_codes]
-    if cadaster_codes is not None:
-        cadaster_codes = cadaster_codes if isinstance(cadaster_codes, list) else [cadaster_codes]
+    # Convert inputs to a list of zero-padded string codes (accepts ints too)
+    province_codes = _as_code_list(province_codes, 2)
+    ine_codes = _as_code_list(ine_codes, 5)
+    cadaster_codes = _as_code_list(cadaster_codes, 5)
 
     # Filter which geographical area to download
     all_cadaster_codes = []
-    
+
     if province_codes is None and ine_codes is None and cadaster_codes is None:
         raise ValueError("At least one of the arguments must be provided: province codes (province_codes), "
                          "municipality INE codes (ine_codes), or cadaster codes (cadaster_codes)")
-    
+
     # Add cadaster codes from province_codes
     if province_codes is not None:
         municipalities = utils.list_municipalities(province_codes=province_codes, echo=False)
         province_cadaster_codes = [item['name'].split("-")[0] for item in municipalities]
         all_cadaster_codes.extend(province_cadaster_codes)
-    
+
     # Add cadaster codes from ine_codes
     if ine_codes is not None:
         ine_cadaster_codes = utils.ine_to_cadaster_codes(ine_codes)
         all_cadaster_codes.extend(ine_cadaster_codes)
-    
+
     # Add directly provided cadaster codes
     if cadaster_codes is not None:
         all_cadaster_codes.extend(cadaster_codes)
-    
+
     # Remove duplicates and set final cadaster_codes
     cadaster_codes = list(set(all_cadaster_codes))
-    
+
+    if not cadaster_codes:
+        raise ValueError(
+            "No municipalities resolved from the given selectors "
+            f"(province_codes={province_codes}, ine_codes={ine_codes}). "
+            "Province codes must be 2-digit (e.g. '25' or 25) and INE/cadaster "
+            "codes 5-digit; check the values."
+        )
+
     # Generate derived codes
     ine_codes = utils.cadaster_to_ine_codes(cadaster_codes)
     province_codes = list(set([code[:2] for code in ine_codes]))
@@ -124,105 +182,210 @@ def download(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
                                       "5a-ddea901be8bc/resource/99764d55-b1be-4281-b822-4277442cc721/download/22093"
                                       "0_censcomercialbcn_opendata_2022_v10_mod.csv",
                                   file="barcelona_ground_premises.csv")
-        downloaders.download_file(dir=utils.open_data_dir_(wd),
-                                  url="https://opendata-ajuntament.barcelona.cat/data/dataset/6b5cfa7b-1d8d-45f0-990a-"
-                                      "d1844d43ffd1/resource/26c6be33-44f5-4596-8a29-7ac152546ca7/download",
-                                  file="barcelona_carrerer.zip")
-        try:
-            with ZipFile(f"{utils.open_data_dir_(wd)}/barcelona_carrerer.zip", 'r') as zip:
-                zip.extractall(utils.open_data_dir_(wd))
-                os.rename(f"{utils.open_data_dir_(wd)}/Adreces_elementals.gpkg",
-                          f"{utils.open_data_dir_(wd)}/barcelona_carrerer.gpkg")
-                os.remove(f"{utils.open_data_dir_(wd)}/barcelona_carrerer.zip")
-        except BadZipFile:
-            os.remove(f"{utils.open_data_dir_(wd)}/barcelona_carrerer.zip")
+        # The carrerer (street/address register) resource is consumed as
+        # `barcelona_carrerer.gpkg`. The upstream resource is now served as a
+        # GeoPackage directly (it used to be a zip wrapping
+        # `Adreces_elementals.gpkg`), so handle both, and skip entirely when we
+        # already have the gpkg — otherwise a failed re-download leaves no zip
+        # and the old code raised an uncaught FileNotFoundError.
+        _od = utils.open_data_dir_(wd)
+        _carrerer_gpkg = f"{_od}/barcelona_carrerer.gpkg"
+        if not os.path.exists(_carrerer_gpkg):
+            _carrerer_dl = f"{_od}/barcelona_carrerer.zip"
+            downloaders.download_file(
+                dir=_od,
+                url="https://opendata-ajuntament.barcelona.cat/data/dataset/6b5cfa7b-1d8d-45f0-990a-"
+                    "d1844d43ffd1/resource/26c6be33-44f5-4596-8a29-7ac152546ca7/download",
+                file="barcelona_carrerer.zip")
+            if os.path.exists(_carrerer_dl):
+                try:
+                    with ZipFile(_carrerer_dl, 'r') as zip:
+                        zip.extractall(_od)
+                    os.rename(f"{_od}/Adreces_elementals.gpkg", _carrerer_gpkg)
+                except BadZipFile:
+                    # Not a zip — the download is the GeoPackage itself.
+                    os.rename(_carrerer_dl, _carrerer_gpkg)
+                finally:
+                    if os.path.exists(_carrerer_dl):
+                        os.remove(_carrerer_dl)
+            else:
+                sys.stderr.write(
+                    "Warning: could not download barcelona_carrerer; "
+                    "open-data street register will be unavailable\n")
 
 def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
           neighborhood_layer=True, postal_code_layer=True, census_layer=True, elevations_layer=True,
           open_data_layers=True, building_parts_inference=False, building_parts_plots=False,
           plot_zones_ratio=0.01, use_CAT_files=False, CAT_files_rel_dir="CAT_files",
-          compact_addresses=False, pois_layer=False,
+          compact_addresses=False, pois_layer=False, sociodemographic_layer=False,
           floor_height=3.0, ground_floor_height=5.0, num_workers=-1,
           force_update=False, cleanup_shards=True):
-    """
-    Merge cadastral and geographic data into a unified GeoDataFrame.
+    """Merge the downloaded cadastral and contextual layers into one GeoDataFrame.
 
-    Parameters:
-    -----------
-    pois_layer : bool, default False
-        If True, fetches POIs from OpenStreetMap (amenity, emergency, healthcare,
-        leisure, office, shop, tourism) and adds per-building indicators:
+    This is the primary entry point. It reads the data that :func:`download`
+    placed under ``wd``, joins the cadastral buildings/addresses/parcels with the
+    requested contextual layers (census, postal codes, neighborhoods, elevation,
+    sociodemographics, POIs), optionally runs the geometric **building-parts
+    inference**, persists everything to the central DuckDB
+    (``{wd}/results/building_results.duckdb``) and returns the assembled frame.
 
-        - poi_{group}[_{subgroup}]_count : POIs directly assigned to the building
-        - poi_{group}[_{subgroup}]_ids   : list of POI identifiers on the building
-        - poi_{group}[_{subgroup}]_100m  : POI count within 100 m
-        - poi_{group}[_{subgroup}]_250m  : POI count within 250 m
-        - poi_{group}[_{subgroup}]_500m  : POI count within 500 m
+    The layer/selector arguments should mirror the ones passed to
+    :func:`download` — ``merge`` reads local files and does not download; a layer
+    enabled here but not downloaded will fail or be skipped.
 
-        Results are cached in the open_street directory.
+    Geographic selection (``province_codes`` / ``ine_codes`` / ``cadaster_codes``)
+    works exactly as in :func:`download`: any combination is accepted, each takes
+    a string or list, and at least one is required.
 
+    Parameters
+    ----------
+    wd : str
+        Working directory previously populated by :func:`download`. The results
+        DuckDB is written under ``{wd}/results``.
+    province_codes, ine_codes, cadaster_codes : str | list[str], optional
+        Area selectors, resolved and de-duplicated to cadastral codes. At least
+        one must be given.
+    neighborhood_layer : bool, default True
+        Join Barcelona neighborhood/district boundaries (``neighborhood_name``,
+        ``district_name``). **Barcelona-only** — set ``False`` for any other
+        municipality or the join raises (no neighbourhoods file).
+    postal_code_layer : bool, default True
+        Join the Spanish postal code (``postal_code``) each building falls in.
+    census_layer : bool, default True
+        Join INE census-tract identifiers (``section_code``, ``district_code``).
+        Required for ``sociodemographic_layer``.
+    elevations_layer : bool, default True
+        Sample the DEM to add ground ``elevation`` (m). Note the trailing "s":
+        this is ``elevations_layer`` here, whereas :func:`download` uses
+        ``elevation_layer``.
+    open_data_layers : bool, default True
+        Enrich addresses and add ground-floor commercial-premises indicators from
+        Barcelona open data. **Barcelona-only**; set ``False`` elsewhere.
+    building_parts_inference : bool, default False
+        Run the geometric inference engine (floor footprints, adiabatic/party/
+        main-façade walls, patios, orientation, street relationships, shadows),
+        adding the ``br__*`` columns and populating ``br_results`` / ``sbr_results``.
+        Computationally and memory intensive, and **limited to a single
+        municipality** (raises if more than one is selected). Heavy BLOB columns
+        (shadows/terrain/wall segments) are excluded from the returned frame —
+        fetch them with :func:`hypercadaster_ES.utils.get_heavy_columns_for_building`.
+    building_parts_plots : bool, default False
+        Emit per-zone diagnostic plots during inference. Single municipality only.
+    plot_zones_ratio : float, default 0.01
+        Fraction (0–1) of cadastral zones to plot when ``building_parts_plots``
+        is enabled (0.01 = 1 % of zones).
+    use_CAT_files : bool, default False
+        Use the official cadastral **CAT** files for detailed per-space use-type
+        classification and areas. The CAT files must be present under
+        ``{wd}/{CAT_files_rel_dir}`` (downloaded manually). Adds the
+        ``building_area_*`` and space-breakdown columns.
+    CAT_files_rel_dir : str, default "CAT_files"
+        Directory (relative to ``wd``) holding the CAT files.
     compact_addresses : bool, default False
-        If True, compacts address data so that each building_reference appears only once
-        with address and geolocation information stored as lists. This reduces the number
-        of rows in the output when buildings have multiple addresses.
-        
-        Example transformation:
-        Before: 2 rows per building (one per address)
-        After:  1 row per building with address lists
-        
-    create_full_street_names : bool, default True
-        When compact_addresses=True, whether to create full street name combinations.
-        Creates columns like:
-        - street_full_odbcn_labels: "CARRER GRAN VIA, 123a"
-        - street_full_labels: "CARRER GRAN VIA, 123-A"  
-        - street_full_clean: "CARRER GRAN VIA, 123"
-        - street_full: "CARRER GRAN VIA, 123"
-        
-    use_unique_for_admin : bool, default True
-        When compact_addresses=True, whether to use unique values for administrative
-        areas (districts, neighborhoods, postal codes) instead of creating lists.
-        This prevents duplication when all addresses for a building are in the same area.
-        
-    Returns:
+        Collapse buildings that have several addresses into a single row whose
+        address/geolocation columns become lists (e.g. ``street_name`` →
+        ``street_names``), reducing row count. Administrative columns stay scalar
+        when uniform per building.
+    pois_layer : bool, default False
+        Attach OpenStreetMap POI indicators per building for the groups
+        ``amenity``, ``emergency``, ``healthcare``, ``leisure``, ``office``,
+        ``shop`` and ``tourism``. For each group (and subgroup) it adds, with
+        ``{p}`` = ``poi_{group}[_{subgroup}]``:
+
+        - ``{p}_count`` — POIs located on the building footprint
+        - ``{p}_ids``   — their OSM identifiers
+        - ``{p}_100m`` / ``{p}_250m`` / ``{p}_500m`` / ``{p}_1000m`` / ``{p}_1500m``
+          — POI counts within that radius of the building centroid
+
+        Raw OSM query results are cached under the ``os_maps`` directory so
+        re-runs skip the network.
+    sociodemographic_layer : bool, default False
+        Join INE 2021 census-section sociodemographic indicators (mean age,
+        share over 64 / under 16, average household size, total households) as
+        ``br__population_*`` / ``br__*_household*`` columns. Requires
+        ``census_layer=True`` (needs ``section_code``); degrades gracefully to a
+        no-op if the source is unavailable.
+    floor_height : float, default 3.0
+        Assumed above-ground storey height (m) used by the inference geometry.
+    ground_floor_height : float, default 5.0
+        Assumed ground-floor height (m) used by the inference geometry.
+    num_workers : int, default -1
+        Parallel worker processes for the inference (``-1`` = all cores).
+    force_update : bool, default False
+        Recompute and overwrite cached DuckDB tables instead of reusing existing
+        (already-processed zones are otherwise skipped on re-runs).
+    cleanup_shards : bool, default True
+        Delete the per-zone shard DuckDB files after ingesting them into the
+        central database.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        The merged building-level data (CRS ``EPSG:25831`` for the mainland).
+        Contents depend on the flags above: contextual columns for the enabled
+        layers, ``br__*`` inference columns when ``building_parts_inference`` is
+        set (minus the heavy BLOB columns), and list-valued address columns when
+        ``compact_addresses`` is set. The same data is also persisted to the
+        ``buildings`` table of the central DuckDB.
+
+    Raises
+    ------
+    ValueError
+        If no geographic selector is given, or if ``building_parts_inference`` /
+        ``building_parts_plots`` is requested for more than one municipality.
+
+    See Also
     --------
-    GeoDataFrame
-        Merged cadastral data. If compact_addresses=True, address columns will be 
-        converted to lists (e.g., 'street_name' → 'street_names')
+    download : Fetch the layers this function consumes.
+    hypercadaster_ES.utils.get_heavy_columns_for_building :
+        Retrieve the heavy shadow/terrain columns excluded from the output.
+
+    Examples
+    --------
+    >>> import hypercadaster_ES as hc
+    >>> hc.download("./data", cadaster_codes=["08900"])
+    >>> gdf = hc.merge("./data", cadaster_codes=["08900"],
+    ...                 building_parts_inference=True)
     """
 
-    # Convert inputs to list format
-    if province_codes is not None:
-        province_codes = province_codes if isinstance(province_codes, list) else [province_codes]
-    if ine_codes is not None:
-        ine_codes = ine_codes if isinstance(ine_codes, list) else [ine_codes]
-    if cadaster_codes is not None:
-        cadaster_codes = cadaster_codes if isinstance(cadaster_codes, list) else [cadaster_codes]
+    # Convert inputs to a list of zero-padded string codes (accepts ints too)
+    province_codes = _as_code_list(province_codes, 2)
+    ine_codes = _as_code_list(ine_codes, 5)
+    cadaster_codes = _as_code_list(cadaster_codes, 5)
 
     # Filter which geographical area to download
     all_cadaster_codes = []
-    
+
     if province_codes is None and ine_codes is None and cadaster_codes is None:
         raise ValueError("At least one of the arguments must be provided: province codes (province_codes), "
                          "municipality INE codes (ine_codes), or cadaster codes (cadaster_codes)")
-    
+
     # Add cadaster codes from province_codes
     if province_codes is not None:
         municipalities = utils.list_municipalities(province_codes=province_codes, echo=False)
         province_cadaster_codes = [item['name'].split("-")[0] for item in municipalities]
         all_cadaster_codes.extend(province_cadaster_codes)
-    
+
     # Add cadaster codes from ine_codes
     if ine_codes is not None:
         ine_cadaster_codes = utils.ine_to_cadaster_codes(ine_codes)
         all_cadaster_codes.extend(ine_cadaster_codes)
-    
+
     # Add directly provided cadaster codes
     if cadaster_codes is not None:
         all_cadaster_codes.extend(cadaster_codes)
-    
+
     # Remove duplicates and set final cadaster_codes
     cadaster_codes = list(set(all_cadaster_codes))
-    
+
+    if not cadaster_codes:
+        raise ValueError(
+            "No municipalities resolved from the given selectors "
+            f"(province_codes={province_codes}, ine_codes={ine_codes}). "
+            "Province codes must be 2-digit (e.g. '25' or 25) and INE/cadaster "
+            "codes 5-digit; check the values."
+        )
+
     # Validate building analysis constraints
     if (building_parts_inference or building_parts_plots) and len(cadaster_codes) > 1:
         raise ValueError(
@@ -232,6 +395,7 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
             f"building_parts_plots=True."
         )
 
+    utils.stage_log("merge(): starting join_cadaster_data (addresses + building inference)")
     gdf = mergers.join_cadaster_data(
         cadaster_dir=utils.cadaster_dir_(wd),
         census_tracts_dir=utils.census_tracts_dir_(wd),
@@ -253,32 +417,41 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
         cleanup_shards=cleanup_shards,
     )
 
+    utils.stage_log(f"merge(): join_cadaster_data done -> {len(gdf)} rows")
     if census_layer:
-        gdf = mergers.join_by_census_tracts(
-            gdf = gdf,
-            census_tract_dir=utils.census_tracts_dir_(wd))
+        with utils.stage_timer("merge(): join_by_census_tracts"):
+            gdf = mergers.join_by_census_tracts(
+                gdf = gdf,
+                census_tract_dir=utils.census_tracts_dir_(wd))
+    if sociodemographic_layer:
+        with utils.stage_timer("merge(): join_sociodemographics"):
+            gdf = mergers.join_sociodemographics(gdf=gdf, wd=wd)
     if neighborhood_layer:
-        gdf = mergers.join_by_neighbourhoods(
-            gdf = gdf,
-            neighbourhoods_dir=utils.neighborhoods_dir_(wd))
+        with utils.stage_timer("merge(): join_by_neighbourhoods"):
+            gdf = mergers.join_by_neighbourhoods(
+                gdf = gdf,
+                neighbourhoods_dir=utils.neighborhoods_dir_(wd))
     if postal_code_layer:
-        gdf = mergers.join_by_postal_codes(
-            gdf = gdf,
-            postal_codes_dir=utils.postal_codes_dir_(wd))
+        with utils.stage_timer("merge(): join_by_postal_codes"):
+            gdf = mergers.join_by_postal_codes(
+                gdf = gdf,
+                postal_codes_dir=utils.postal_codes_dir_(wd))
     if elevations_layer:
-        gdf = mergers.join_DEM_raster(
-            gdf = gdf,
-            raster_dir = utils.DEM_raster_dir_(wd))
+        with utils.stage_timer("merge(): join_DEM_raster"):
+            gdf = mergers.join_DEM_raster(
+                gdf = gdf,
+                raster_dir = utils.DEM_raster_dir_(wd))
     if "index" in gdf.columns:
         gdf.drop("index", axis=1, inplace=True)
 
     # columns that have dicts, lists, or bytearrays (BLOB geometry data)
-    cols_with_unhashable = [c for c in gdf.columns
-                       if gdf[c].apply(lambda v: isinstance(v, (dict, list, bytearray))).any()]
+    with utils.stage_timer("merge(): detect unhashable columns + drop_duplicates"):
+        cols_with_unhashable = [c for c in gdf.columns
+                           if gdf[c].apply(lambda v: isinstance(v, (dict, list, bytearray))).any()]
 
-    subset = [c for c in gdf.columns if c not in cols_with_unhashable + ['geometry']]
-    gdf = gdf.drop_duplicates(subset=subset, keep='first')
-    
+        subset = [c for c in gdf.columns if c not in cols_with_unhashable + ['geometry']]
+        gdf = gdf.drop_duplicates(subset=subset, keep='first')
+
     # Apply address compaction if requested
     if compact_addresses:
         # Check if there are multiple rows per building_reference (indicating addresses to compact)
@@ -287,18 +460,24 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
             buildings_with_multiple_addresses = building_counts[building_counts > 1]
             if len(buildings_with_multiple_addresses) > 0:
                 # Apply compaction
-                gdf = utils.compact_addresses(
-                    gdf,
-                    building_reference_col='building_reference'
-                )
+                with utils.stage_timer(
+                    f"merge(): compact_addresses "
+                    f"({len(buildings_with_multiple_addresses)} multi-address buildings)"
+                ):
+                    gdf = utils.compact_addresses(
+                        gdf,
+                        building_reference_col='building_reference'
+                    )
 
     if pois_layer:
-        gdf = mergers.join_pois(
-            gdf=gdf,
-            open_street_dir=utils.open_street_dir_(wd),
-            cadaster_dir=utils.cadaster_dir_(wd),
-            cadaster_codes=cadaster_codes,
-        )
+        with utils.stage_timer("merge(): join_pois"):
+            gdf = mergers.join_pois(
+                gdf=gdf,
+                open_street_dir=utils.open_street_dir_(wd),
+                cadaster_dir=utils.cadaster_dir_(wd),
+                cadaster_codes=cadaster_codes,
+            )
 
+    utils.stage_log(f"merge(): complete -> returning {len(gdf)} rows")
     return gdf
 

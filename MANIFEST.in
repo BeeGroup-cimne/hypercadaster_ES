@@ -1,2 +1,3 @@
 include hypercadaster_ES/cached_files/*.xlsx
 recursive-include hypercadaster_ES/cached_files *.xlsx
+include hypercadaster_ES/energy_config.yaml

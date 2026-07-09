@@ -12,3 +12,6 @@ all_directions_barcelona.py
 *.pyc
 .qwen/
 test_olivella/
+
+# generated API docs (pdoc)
+docs/api/

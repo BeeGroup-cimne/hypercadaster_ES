@@ -87,7 +87,7 @@ def main():
     try:
         # Create interactive plot (will fallback to matplotlib if plotly unavailable)
         # Floor height is automatically detected from the data
-        fig = hc.plot_building_shadows_analysis(
+        fig = hc.utils.plot_building_shadows_analysis(
             gdf=building_gdf,
             building_reference='6161378DF2866A',
             output_path='shadow_analysis_example.pdf',  # Save as PDF
@@ -168,7 +168,7 @@ def main():
     print("\n4. Usage in real projects:")
     print("   💡 To use with actual data:")
     print("      gdf = hc.merge(wd, cadaster_codes=['08900'], building_parts_inference=True)")
-    print("      hc.plot_building_shadows_analysis(gdf, 'YOUR_BUILDING_REF')")
+    print("      hc.utils.plot_building_shadows_analysis(gdf, 'YOUR_BUILDING_REF')")
     print("   💡 New elevation indicator available:")
     print("      br__elevation_at_shadow: elevation of closest neighbor by orientation")
     print("   💡 For multiple buildings, iterate through unique building_reference values")

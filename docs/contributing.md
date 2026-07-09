@@ -23,64 +23,49 @@ python -m venv hypercadaster_dev
 source hypercadaster_dev/bin/activate  # Linux/Mac
 # or: hypercadaster_dev\Scripts\activate  # Windows
 
-# Install in development mode
-pip install -e .
-
-# Install development dependencies
-pip install pytest flake8 black
+# Install in development mode with the dev tools (pytest, black, ruff, pdoc)
+pip install -e ".[dev]"
 ```
+
+## 🧪 Running the Tests
+
+The suite lives in [`tests/`](../tests) and is split into a fast, offline core
+and one network-gated end-to-end smoke test.
+
+```bash
+# Fast, offline unit tests (no downloads) — run these before every PR
+pytest
+
+# Include the live smoke test (downloads a tiny municipality, ~2 min)
+HC_RUN_LIVE=1 pytest      # or: pytest -m live
+```
+
+The offline tests cover the code conversions, grid/H3 aggregation, the energy
+footprint geometry helpers, weather statistics/EPW export, and the public
+import surface. Please add or extend tests alongside any behavioural change;
+keep new tests offline and deterministic unless they genuinely require the
+network (mark those with `@pytest.mark.live`).
+
+## 📚 Building the API Reference
+
+The HTML API reference is generated from the docstrings with
+[`pdoc`](https://pdoc.dev) (Unlicense — permissive, matching our
+permissive-dependency policy):
+
+```bash
+./scripts/build_api_docs.sh      # writes docs/api/index.html (git-ignored)
+```
+
+Keep public functions and classes documented with clear docstrings so the
+generated reference stays useful.
 
 ## 🎯 Areas for Contribution
 
-
-### **Performance Optimizations**
-- Parallel processing improvements for large datasets
-- Memory usage optimization for provincial-scale analysis
-- Caching strategies for repeated analysis
-- Database backend integration for large-scale deployments
-
-### **Data Source Expansions**
-- Integration of the Basque Country and Navarre cadasters
-- Integration with additional Spanish open data sources
-- Historical data integration capabilities
-- Enhanced regional data source integration
-
-### **Analysis Algorithm Improvements**
-- Estimate dwellings distribution by each floor of the building
-- Improved main orientation analysis (currently using parcel geometry)
-- Integration with remote sensing data
-- Enhanced shadow analysis and solar potential calculations
-
-### **Visualization & Reporting**
+- Integrate the Basque Country and Navarre cadasters
 - Web-based dashboard for analysis results
-- Interactive visualization components
-- Export capabilities to additional formats (KML, Shapefile, etc.)
-- Automated report generation
-
-### **External Tool Integration**
-- Integration with building simulation tools for city-level energy simulations
-- GIS software plugin development
-- Building Information Modeling (BIM) format exports
-- Integration with urban planning software
-
-### **Documentation & Examples**
-- Additional tutorial notebooks and scripts
-- Video tutorials and documentation
-- API reference documentation improvements
-- Real-world case study examples
-- Multi-language documentation
-
-### **Testing & Quality Assurance**
-- Comprehensive test suite expansion
-- Performance benchmarking
-- Data quality validation tools
-- Continuous integration improvements
-
-### **User Experience**
-- Command-line interface improvements
-- Configuration file support
-- Progress monitoring enhancements
-- Error message improvements
+- Interoperability with VoxCity and city2graph
+- Integrate a serialised model for predicting WWR, façade material composition and energy systems based on the `epc_CAT` library
+- Integrate `social_ES` library indicators
 
 ## 🛠️ Development Guidelines
 

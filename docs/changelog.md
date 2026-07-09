@@ -73,6 +73,41 @@ an escape hatch).
   use ``hc.utils.get_heavy_columns_for_building()`` for per-building access
 - Pass ``wd=`` to ``plot_building_shadows_analysis()`` to auto-hydrate heavy columns
 
+### ⚡ EnergyPlus Interoperability
+
+Building inference outputs can now be exported to runnable **EnergyPlus** models
+with real local weather.
+
+#### Added
+
+**Energy model generation** (`energy.py`)
+- ``hc.energy.build_energy_model(gdf, building_reference, ...)`` — per-space 3-D thermal
+  model exported as an EnergyPlus **IDF** via ``eppy`` + ``geomeppy`` (both MIT)
+- Spanish archetype envelopes and constructions (``hc.energy.building_archetype``),
+  window-to-wall-ratio prediction (``hc.energy.building_wwr``)
+- YAML-driven defaults (``energy_config.yaml``) with
+  ``hc.energy.configure()`` / ``hc.energy.get_config()`` overrides
+- ``hc.energy.plot_idf_geometry()`` — 3-D viewer for a generated IDF
+
+**Weather → EPW** (`weather.py`)
+- ERA5-Land nearest-cell extraction with coastal fallback
+- ``hc.weather.get_municipality_weather()`` — hourly timeseries for the closest cell
+- ``hc.weather.weather_statistics()`` — heating/cooling degree days + climate summary
+- ``hc.weather.municipality_epw()`` — cached per-year EnergyPlus EPW files, fed into
+  ``build_energy_model(weather_year=...)``
+
+### 📍 Points of Interest (OpenStreetMap)
+
+#### Added
+
+- ``pois_layer=True`` on ``hc.merge()`` — attaches per-building POI indicators
+  from OpenStreetMap (groups: ``amenity``, ``emergency``, ``healthcare``,
+  ``leisure``, ``office``, ``shop``, ``tourism``)
+- Per group/subgroup columns: on-building counts and IDs
+  (``poi_{prefix}_count``, ``poi_{prefix}_ids``) plus proximity counts within
+  100 m / 250 m / 500 m / 1000 m / 1500 m of the building centroid
+- Raw OSM query results cached under ``open_street/`` so re-runs skip the network
+
 ---
 
 ## [1.0.0] - 2025-08-28

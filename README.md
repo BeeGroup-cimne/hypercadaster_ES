@@ -1,23 +1,24 @@
 # hypercadaster_ES
 
-A comprehensive Python library for downloading, processing, and analyzing Spanish cadastral data with integration of external geographic datasets.
+A comprehensive Python library for downloading, processing, and analyzing Spanish cadastral data with integration of external geographic datasets and EnergyPlus model generation.
 
 [![Python Version](https://img.shields.io/badge/python-3.10+-blue.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-EUPL%20v1.2-blue.svg)](https://joinup.ec.europa.eu/collection/eupl/eupl-text-eupl-12)
-[![Version](https://img.shields.io/badge/version-1.0.0-green.svg)](https://github.com/BeeGroup-cimne/hypercadaster_ES)
+[![Version](https://img.shields.io/badge/version-1.1.0-green.svg)](https://github.com/BeeGroup-cimne/hypercadaster_ES)
 
 ## 🎯 Overview
 
-**hypercadaster_ES** is a powerful Python library designed for comprehensive analysis of Spanish cadastral data. It provides tools for downloading official cadastral information, integrating it with external geographic datasets, and performing advanced building analysis including geometric inference, orientation analysis, and energy simulation data preparation.
+**hypercadaster_ES** is a powerful Python library designed for comprehensive analysis of Spanish cadastral data. It provides tools for downloading official cadastral information, integrating it with external geographic datasets, performing advanced building analysis including geometric inference, orientation analysis, and exporting building models for energy simulation (EnergyPlus IDF).
 
 ### Key Features
 
 - 🏘️ **Comprehensive Cadastral Data Access**: Download building, parcel, and address data from Spanish cadastral services
 - 🗺️ **Multi-source Data Integration**: Merge with census tracts, postal codes, elevation models, and OpenStreetMap data
-- 🏗️ **Advanced Building Analysis**: Geometric inference, floor footprint calculation, and building space classification
-- 📊 **Orientation & Environmental Analysis**: Building orientation analysis, street relationships, and shadow calculations
-- 🔌 **External Tool Integration**: Export capabilities for building energy simulation tools
-- 📈 **Scalable Processing**: Optimized for large-scale municipal and provincial analysis
+- 🏗️ **Advanced Building Analysis**: Geometric inference, floor footprint calculation, building space classification, shadow analysis
+- 📊 **Orientation & Environmental Analysis**: Building orientation analysis, street relationships, shadow calculations, terrain analysis
+- 🔌 **External Tool Integration**: Export capabilities for building energy simulation tools (EnergyPlus via eppy+geomeppy)
+- 📈 **Scalable Processing**: Optimized for large-scale municipal and provincial analysis with DuckDB persistence
+- ⚡ **Memory Efficient**: Central DuckDB database reduces memory footprint; heavy BLOB columns loaded on demand
 
 ## 📚 Documentation
 
@@ -26,36 +27,16 @@ A comprehensive Python library for downloading, processing, and analyzing Spanis
 - [**Configuration & Examples**](docs/configuration-examples.md) - Advanced configuration and example workflows
 
 ### Library Reference
-- [**Library Structure**](docs/library-structure.md) - Detailed module documentation and function reference
+- [**Library Structure**](docs/library-structure.md) - Module overview and key entry points
 - [**Data Sources & Coverage**](docs/data-sources-coverage.md) - Available datasets and geographic coverage
 - [**Output Data Schema**](docs/output-schema.md) - Complete data structure and column reference
-
-### Applications & Use Cases
-- [**Use Cases & Applications**](docs/use-cases-applications.md) - Real-world applications and case studies
+- **API Reference** - Generated from docstrings with [pdoc](https://pdoc.dev): run `./scripts/build_api_docs.sh` and open `docs/api/index.html`
 
 ### Development
 - [**Contributing**](docs/contributing.md) - How to contribute to the project
 - [**Changelog**](docs/changelog.md) - Version history and changes
 
 ## 🚀 Quick Start
-
-
-#### Copernicus Data Space
-1. If you don't have a user in Copernicus Data Space Ecosystem, register in:
-https://identity.dataspace.copernicus.eu/auth/realms/CDSE/login-actions/registration?client_id=account-console&tab_id=I9M6-7Mx3Cw&client_data=eyJydSI6Imh0dHBzOi8vaWRlbnRpdHkuZGF0YXNwYWNlLmNvcGVybmljdXMuZXUvYXV0aC9yZWFsbXMvQ0RTRS9hY2NvdW50LyMvcGVyc29uYWwtaW5mbyIsInJ0IjoiY29kZSIsInJtIjoicXVlcnkiLCJzdCI6ImNlMzljODM2LTRmYTgtNGRhNy05ZTZlLTZkNDkwZGEyMjE3YSJ9
-2. Once you are logged in the portal: Go to Dashboard / SentinelHub, and inside the https://shapps.dataspace.copernicus.eu/dashboard/#/ 
-3. Edit your User settings and add a new OAuth client with client name as: hypercadaster_ES.
-4. We recommend to click on the Never expire button.
-5. Once you create it, you'll be able to see the client ID and the secret. Store them in your system in ~/.dataspaces
-```bash
-nano ~/.dataspaces
-```
-6. The format of the file is the following (The hashes are examples, not real ones):
-```bash
-client:hypercadaster_ES
-clientId:sh-djhf1a5a-9193-4262-b786-b912744ca675
-clientSecret:P85fgGylvSV5y87HU8Z76HiJgZraoegQ
-```
 
 ### Library installation
 ```bash
@@ -69,25 +50,30 @@ import hypercadaster_ES as hc
 # Download data for Barcelona municipality
 hc.download("./data", cadaster_codes=["08900"])
 
-# Merge all data into a unified GeoDataFrame
-# (persisted to building_results.duckdb internally)
+# Merge all data into a unified GeoDataFrame (persisted to building_results.duckdb internally)
 gdf = hc.merge("./data", cadaster_codes=["08900"])
 
-# Save results
-gdf.to_pickle("barcelona_data.pkl", compression="gzip")
+# Optional: save the GeoDataFrame for later use (e.g., as Parquet or pickle)
+gdf.to_parquet("./data/barcelona_data.parquet")  # or to_pickle(..., compression="gzip")
 ```
 
 ### Accessing Results via DuckDB
-The central ``building_results.duckdb`` is the canonical artifact. Query
+The central `building_results.duckdb` is the canonical artifact. Query
 directly instead of materialising full GeoDataFrames:
 
 ```python
 # Read inferred indicators from DB (returns pandas DataFrame)
 br = hc.utils.read_br_inferred_indicators("08900", "./data")
 
-# Fetch heavy shadow/terrain columns for one building
+# Fetch heavy shadow/terrain columns for one building (on demand)
 heavy = hc.utils.get_heavy_columns_for_building(
-    "./data", "08900", "8341105DF2884A")
+    "./data", "08900", "8341105DF2884A"
+)
+
+# Access other tables via ResultsHandle (advanced)
+from hypercadaster_ES import _db
+handle = hc.ResultsHandle("./data/results/building_results.duckdb", "08900")
+spaces_df = handle.sbr_to_pandas()  # space-level results
 ```
 
 For detailed installation instructions and advanced examples, see [Installation & Quick Start](docs/installation-quickstart.md).
@@ -95,11 +81,9 @@ For detailed installation instructions and advanced examples, see [Installation 
 ## 🎯 Key Applications
 
 - **Urban Planning & Municipal Management**: Building stock analysis, zoning compliance, infrastructure planning
-- **Energy & Environmental Analysis**: Building energy modeling, solar potential assessment, carbon footprint analysis
+- **Energy & Environmental Analysis**: Building energy modeling, carbon footprint analysis
 - **Real Estate & Economic Analysis**: Property valuation, market analysis, location intelligence
 - **Academic Research**: Urban geography, transportation research, social sciences applications
-
-See [Use Cases & Applications](docs/use-cases-applications.md) for detailed descriptions and examples.
 
 ## 📊 Geographic Coverage
 
@@ -109,10 +93,12 @@ See [Use Cases & Applications](docs/use-cases-applications.md) for detailed desc
 
 ## 🏗️ Advanced Features
 
-- **Building Inference Engine**: Advanced geometric analysis, floor footprint calculation, orientation analysis
+- **Building Inference Engine**: Advanced geometric analysis, floor footprint calculation, orientation analysis, shadow and terrain analysis
 - **Multi-source Integration**: Cadastral, census, elevation, postal, and OpenStreetMap data
 - **CAT Files Support**: Detailed building space classification from official cadastral CAT format
-- **Energy Simulation Ready**: Export formats compatible with building energy simulation tools
+- **Energy Simulation Ready**: Export formats compatible with building energy simulation tools (EnergyPlus IDF via hc.energy.build_energy_model)
+- **POI Proximity Analysis**: Points of interest from OpenStreetMap with distance-based indicators
+- **Commercial Premises Analysis**: Barcelona-specific ground floor commercial data
 
 ## 👥 Authors & Contributors
 
@@ -132,4 +118,4 @@ This project is licensed under the **EUPL v1.2**. See the [license](https://join
 
 *hypercadaster_ES - Built with ❤️ for the Spanish urban analysis and building research community*
 
-*Last updated: August 2025 | Version 1.0.0*
+*Last updated: July 2026 | Version 1.1.0*
