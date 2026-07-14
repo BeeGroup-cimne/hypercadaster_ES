@@ -16,6 +16,7 @@ from zipfile import ZipFile, BadZipFile
 from hypercadaster_ES import mergers
 from hypercadaster_ES import utils
 from hypercadaster_ES import downloaders
+from hypercadaster_ES import social
 
 
 def _as_code_list(value, width):
@@ -145,6 +146,12 @@ def download(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
     else:
         # Download the cadaster datasets of that area
         downloaders.cadaster_downloader(cadaster_dir=utils.cadaster_dir_(wd), cadaster_codes=cadaster_codes)
+
+    # CartoCiudad addresses (one GeoPackage per province), the address source that
+    # replaces the deprecated INSPIRE Address feed and the Barcelona carrerer.
+    downloaders.cartociudad_downloader(cartociudad_dir=utils.cartociudad_dir_(wd),
+                                       province_codes=province_codes)
+
     # Districts and neighborhoods definition are only available for the city of Barcelona
     if '08019' in ine_codes or '08900' in cadaster_codes and neighborhood_layer:
         downloaders.download_file(dir=utils.districts_dir_(wd),
@@ -182,44 +189,44 @@ def download(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
                                       "5a-ddea901be8bc/resource/99764d55-b1be-4281-b822-4277442cc721/download/22093"
                                       "0_censcomercialbcn_opendata_2022_v10_mod.csv",
                                   file="barcelona_ground_premises.csv")
-        # The carrerer (street/address register) resource is consumed as
-        # `barcelona_carrerer.gpkg`. The upstream resource is now served as a
-        # GeoPackage directly (it used to be a zip wrapping
-        # `Adreces_elementals.gpkg`), so handle both, and skip entirely when we
-        # already have the gpkg — otherwise a failed re-download leaves no zip
-        # and the old code raised an uncaught FileNotFoundError.
-        _od = utils.open_data_dir_(wd)
-        _carrerer_gpkg = f"{_od}/barcelona_carrerer.gpkg"
-        if not os.path.exists(_carrerer_gpkg):
-            _carrerer_dl = f"{_od}/barcelona_carrerer.zip"
-            downloaders.download_file(
-                dir=_od,
-                url="https://opendata-ajuntament.barcelona.cat/data/dataset/6b5cfa7b-1d8d-45f0-990a-"
-                    "d1844d43ffd1/resource/26c6be33-44f5-4596-8a29-7ac152546ca7/download",
-                file="barcelona_carrerer.zip")
-            if os.path.exists(_carrerer_dl):
-                try:
-                    with ZipFile(_carrerer_dl, 'r') as zip:
-                        zip.extractall(_od)
-                    os.rename(f"{_od}/Adreces_elementals.gpkg", _carrerer_gpkg)
-                except BadZipFile:
-                    # Not a zip — the download is the GeoPackage itself.
-                    os.rename(_carrerer_dl, _carrerer_gpkg)
-                finally:
-                    if os.path.exists(_carrerer_dl):
-                        os.remove(_carrerer_dl)
-            else:
-                sys.stderr.write(
-                    "Warning: could not download barcelona_carrerer; "
-                    "open-data street register will be unavailable\n")
+        # DEPRECATED: the Barcelona carrerer (street/address register) download is
+        # superseded by CartoCiudad (cartociudad_downloader above), which provides
+        # nationwide address points. Kept commented for reference.
+        # _od = utils.open_data_dir_(wd)
+        # _carrerer_gpkg = f"{_od}/barcelona_carrerer.gpkg"
+        # if not os.path.exists(_carrerer_gpkg):
+        #     _carrerer_dl = f"{_od}/barcelona_carrerer.zip"
+        #     downloaders.download_file(
+        #         dir=_od,
+        #         url="https://opendata-ajuntament.barcelona.cat/data/dataset/6b5cfa7b-1d8d-45f0-990a-"
+        #             "d1844d43ffd1/resource/26c6be33-44f5-4596-8a29-7ac152546ca7/download",
+        #         file="barcelona_carrerer.zip")
+        #     if os.path.exists(_carrerer_dl):
+        #         try:
+        #             with ZipFile(_carrerer_dl, 'r') as zip:
+        #                 zip.extractall(_od)
+        #             os.rename(f"{_od}/Adreces_elementals.gpkg", _carrerer_gpkg)
+        #         except BadZipFile:
+        #             # Not a zip — the download is the GeoPackage itself.
+        #             os.rename(_carrerer_dl, _carrerer_gpkg)
+        #         finally:
+        #             if os.path.exists(_carrerer_dl):
+        #                 os.remove(_carrerer_dl)
+        #     else:
+        #         sys.stderr.write(
+        #             "Warning: could not download barcelona_carrerer; "
+        #             "open-data street register will be unavailable\n")
 
 def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
           neighborhood_layer=True, postal_code_layer=True, census_layer=True, elevations_layer=True,
           open_data_layers=True, building_parts_inference=False, building_parts_plots=False,
           plot_zones_ratio=0.01, use_CAT_files=False, CAT_files_rel_dir="CAT_files",
-          compact_addresses=False, pois_layer=False, sociodemographic_layer=False,
+          pois_layer=False, sociodemographic_layer=False,
+          social_ES_layer=False, social_ES_years=5, social_ES_datasets=None,
+          weather_layer=False, weather_years=5, weather_indicators=None,
+          weather_hdd_base=18.0, weather_cdd_base=21.0, weather_bbox=None,
           floor_height=3.0, ground_floor_height=5.0, num_workers=-1,
-          force_update=False, cleanup_shards=True):
+          force_update=False, cleanup_shards=True, verbose="simple"):
     """Merge the downloaded cadastral and contextual layers into one GeoDataFrame.
 
     This is the primary entry point. It reads the data that :func:`download`
@@ -281,16 +288,12 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
         ``building_area_*`` and space-breakdown columns.
     CAT_files_rel_dir : str, default "CAT_files"
         Directory (relative to ``wd``) holding the CAT files.
-    compact_addresses : bool, default False
-        Collapse buildings that have several addresses into a single row whose
-        address/geolocation columns become lists (e.g. ``street_name`` →
-        ``street_names``), reducing row count. Administrative columns stay scalar
-        when uniform per building.
     pois_layer : bool, default False
         Attach OpenStreetMap POI indicators per building for the groups
         ``amenity``, ``emergency``, ``healthcare``, ``leisure``, ``office``,
         ``shop`` and ``tourism``. For each group (and subgroup) it adds, with
-        ``{p}`` = ``poi_{group}[_{subgroup}]``:
+        ``{p}`` = ``poi__{group}[_{subgroup}]`` (``poi__`` namespace prefix,
+        snake_case group/subgroup):
 
         - ``{p}_count`` — POIs located on the building footprint
         - ``{p}_ids``   — their OSM identifiers
@@ -305,6 +308,65 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
         ``br__population_*`` / ``br__*_household*`` columns. Requires
         ``census_layer=True`` (needs ``section_code``); degrades gracefully to a
         no-op if the source is unavailable.
+    social_ES_layer : bool, default False
+        Join INE socioeconomic indicators from the ``social_ES`` package onto
+        every building, each dataset at its finest geographic level (census
+        section → district → municipality → province, using the codes added by
+        ``census_layer``). Adds ``so__{indicator}_{year}`` columns (``so__``
+        namespace prefix, snake_case indicator, year as suffix)
+        for the most recent ``social_ES_years`` years of the income atlas,
+        population census, education/employment census, rental & housing price
+        indices, and district electricity consumption. Runs **before** the POI
+        join. Requires ``census_layer=True``; ``social_ES`` caches the whole-Spain
+        source files under ``{wd}/INE`` on first use (a slow one-off download).
+        See :mod:`hypercadaster_ES.social` for the curated indicator set.
+    social_ES_years : int, default 5
+        Number of most-recent years to keep per ``social_ES`` dataset.
+    social_ES_datasets : sequence[str], optional
+        Subset of the ``social_ES`` datasets to include; default is all of
+        :data:`hypercadaster_ES.social.ALL_DATASETS` (``"atlas"``,
+        ``"population"``, ``"education"``, ``"rental"``, ``"price"``,
+        ``"electricity"``), plus the per-building **Essential Characteristics**
+        downscaling (``"essential_characteristics"`` →
+        :data:`hypercadaster_ES.social.ESSENTIAL_CHARACTERISTICS`, adding
+        ``ec__*`` proportion columns) which is additionally gated on
+        ``use_CAT_files=True``. That dataset is included when
+        ``social_ES_datasets`` is ``None`` (and ``use_CAT_files=True``) or when it
+        explicitly lists ``"essential_characteristics"``; requesting it without
+        ``use_CAT_files`` skips it with a warning.
+    weather_layer : bool, default False
+        Join annually-aggregated ERA5-Land climate indicators onto every
+        building. Each building is snapped to the nearest 0.1° ERA5-Land cell
+        with data (coastal buildings fall back to the closest inland cell), and
+        the per-cell annual statistics are added as ``we__{indicator}_{year}``
+        columns (``we__`` namespace prefix, snake_case indicator) for each
+        requested year: ``hdd`` / ``cdd`` (heating/cooling
+        degree days), ``precipitation`` (mm), ``ghi`` (kWh/m²),
+        ``air_temperature_mean`` / ``_min`` / ``_max`` (°C),
+        ``relative_humidity_mean`` (%) and ``wind_speed_mean`` (m/s). Uses
+        :mod:`hypercadaster_ES.weather`; the ERA5-Land data is cached under
+        ``{wd}/weather/era5land`` on first use (a one-off download requiring a
+        configured ``~/.cdsapirc``). For a **single municipality** only the one
+        ERA5-Land point nearest the municipality centroid is downloaded (the
+        timeseries endpoint); for several municipalities the province-wide grid
+        is used. Runs **before** the POI join.
+    weather_years : int | sequence[int], default 5
+        Number of most-recent **complete** calendar years to include (the last
+        complete year is the previous one relative to today, since ERA5-Land
+        trails real time), or an explicit list of years (e.g. ``[2021, 2022]``).
+    weather_indicators : sequence[str], optional
+        Subset of the weather indicator stems to keep (see
+        :data:`hypercadaster_ES.weather.WEATHER_INDICATORS`); default is all.
+    weather_hdd_base : float, default 18.0
+        Base temperature (°C) for the heating-degree-day sum.
+    weather_cdd_base : float, default 21.0
+        Base temperature (°C) for the cooling-degree-day sum.
+    weather_bbox : sequence[float], optional
+        Predefined WGS84 bounding box ``[min_lon, min_lat, max_lon, max_lat]``
+        (same order as :func:`hypercadaster_ES.utils.get_ine_codes_from_bounding_box`)
+        over which to download the ERA5-Land weather grid, instead of deriving
+        the extent from the buildings. When given, the weather layer always uses
+        the grid (the single-municipality point download is skipped).
     floor_height : float, default 3.0
         Assumed above-ground storey height (m) used by the inference geometry.
     ground_floor_height : float, default 5.0
@@ -317,6 +379,11 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
     cleanup_shards : bool, default True
         Delete the per-zone shard DuckDB files after ingesting them into the
         central database.
+    verbose : str, default "simple"
+        Logging verbosity. ``"simple"`` suppresses the per-stage
+        ``[stage +… | RSS …]`` markers and per-municipality progress logs
+        (``assign_building_zones``/``join_other_constructions``); ``"full"``
+        shows them.
 
     Returns
     -------
@@ -324,8 +391,9 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
         The merged building-level data (CRS ``EPSG:25831`` for the mainland).
         Contents depend on the flags above: contextual columns for the enabled
         layers, ``br__*`` inference columns when ``building_parts_inference`` is
-        set (minus the heavy BLOB columns), and list-valued address columns when
-        ``compact_addresses`` is set. The same data is also persisted to the
+        set (minus the heavy BLOB columns). Addresses are always compacted to one
+        row per parcel with list-valued address columns (e.g. ``street_name`` is a
+        list of the parcel's addresses). The same data is also persisted to the
         ``buildings`` table of the central DuckDB.
 
     Raises
@@ -347,6 +415,9 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
     >>> gdf = hc.merge("./data", cadaster_codes=["08900"],
     ...                 building_parts_inference=True)
     """
+    # Logging verbosity: "simple" (default) hides the per-stage [stage | RSS]
+    # markers and per-municipality progress logs; "full" shows them.
+    utils.set_verbose(verbose)
 
     # Convert inputs to a list of zero-padded string codes (accepts ints too)
     province_codes = _as_code_list(province_codes, 2)
@@ -403,6 +474,7 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
         cadaster_codes=cadaster_codes,
         results_dir=utils.results_dir_(wd),
         open_street_dir=utils.open_street_dir_(wd),
+        cartociudad_dir=utils.cartociudad_dir_(wd),
         building_parts_inference=building_parts_inference,
         use_CAT_files=use_CAT_files,
         building_parts_plots=building_parts_plots,
@@ -452,22 +524,63 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
         subset = [c for c in gdf.columns if c not in cols_with_unhashable + ['geometry']]
         gdf = gdf.drop_duplicates(subset=subset, keep='first')
 
-    # Apply address compaction if requested
-    if compact_addresses:
-        # Check if there are multiple rows per building_reference (indicating addresses to compact)
-        if 'building_reference' in gdf.columns:
-            building_counts = gdf['building_reference'].value_counts()
-            buildings_with_multiple_addresses = building_counts[building_counts > 1]
-            if len(buildings_with_multiple_addresses) > 0:
-                # Apply compaction
-                with utils.stage_timer(
-                    f"merge(): compact_addresses "
-                    f"({len(buildings_with_multiple_addresses)} multi-address buildings)"
-                ):
-                    gdf = utils.compact_addresses(
-                        gdf,
-                        building_reference_col='building_reference'
-                    )
+    # Addresses are always compacted to one row per parcel (building_reference),
+    # with the per-address columns collapsed into lists of possible addresses.
+    if 'building_reference' in gdf.columns:
+        building_counts = gdf['building_reference'].value_counts()
+        buildings_with_multiple_addresses = building_counts[building_counts > 1]
+        with utils.stage_timer(
+            f"merge(): compact_addresses "
+            f"({len(buildings_with_multiple_addresses)} multi-address buildings)"
+        ):
+            gdf = utils.compact_addresses(
+                gdf,
+                building_reference_col='building_reference'
+            )
+
+        # Match each building space's CAT postal address to the closest of the
+        # parcel's compacted addresses (no-op when inference is disabled): keeps the
+        # CAT value as br__building_spaces_postal_address_from_CAT_file, replaces
+        # br__building_spaces_postal_address with the matched parcel address, and
+        # sets br__building_spaces_postal_address_location to its point.
+        gdf = utils.match_building_space_postal_addresses(gdf)
+
+        # Public-facing names for the compacted postal-address columns.
+        gdf = gdf.rename(columns={
+            'street_full_labels': 'postal_addresses_with_extensions',
+            'street_full_clean': 'postal_addresses_clean',
+            'address_location': 'postal_addresses_location',
+        })
+
+    if social_ES_layer:
+        with utils.stage_timer("merge(): join_social_ES"):
+            gdf = social.join_social_ES(
+                gdf=gdf,
+                wd=wd,
+                n_years=social_ES_years,
+                datasets=social_ES_datasets,
+                use_CAT_files=use_CAT_files,
+                verbose=(verbose == "full"),
+            )
+
+    if weather_layer:
+        with utils.stage_timer("merge(): join_weather"):
+            from hypercadaster_ES import weather
+            gdf = weather.join_weather(
+                gdf=gdf,
+                era5_dir=utils.weather_era5_dir_(wd),
+                years=weather_years,
+                indicators=weather_indicators,
+                hdd_base=weather_hdd_base,
+                cdd_base=weather_cdd_base,
+                update=force_update,
+                bbox=weather_bbox,
+                # Single municipality: fetch only the nearest ERA5-Land point
+                # (timeseries endpoint) instead of the whole province grid. Ignored
+                # when weather_bbox is set (a box always uses the grid).
+                use_point_location=(len(cadaster_codes) == 1),
+                verbose=(verbose == "full"),
+            )
 
     if pois_layer:
         with utils.stage_timer("merge(): join_pois"):

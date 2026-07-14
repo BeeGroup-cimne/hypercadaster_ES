@@ -24,9 +24,9 @@ Examples:
 from .functions import download, merge
 from ._db import ResultsHandle
 from . import (mergers, utils, building_inference, downloaders, interoperability,
-               energy, weather)
+               energy, weather, social)
 
-__version__ = "1.1.0"
+__version__ = "1.2.1"
 __author__ = "Jose Manuel Broto Vispe"
 __email__ = "jmbrotovispe@gmail.com"
 
@@ -38,5 +38,5 @@ __all__ = [
     # Top-level API
     "download", "merge", "ResultsHandle",
     # Submodules (this order drives the API-docs index)
-    "downloaders", "energy", "interoperability", "mergers", "utils", "weather",
+    "downloaders", "energy", "interoperability", "mergers", "social", "utils", "weather",
 ]

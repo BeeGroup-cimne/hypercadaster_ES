@@ -33,17 +33,28 @@ The primary data source providing comprehensive property and building informatio
   - Area calculations
   - Ownership context information
 
-#### **Addresses Data**
-- **Content**: Complete addressing with coordinates, street naming, postal integration
-- **Format**: Shapefile, GML
-- **Coverage**: National (except Basque Country and Navarre)
-- **Update Frequency**: Quarterly
+> **Note — addresses now come from CartoCiudad.** The INSPIRE Address feed
+> (`ES.SDGC.AD`) and the Barcelona Open Data *carrerer* are deprecated; addresses
+> are sourced from CartoCiudad (see below). The Cadastre is still used for parcels,
+> buildings and CAT files.
+
+#### **Addresses Data (CartoCiudad — CNIG)**
+- **Content**: Nationwide postal address points (the CartoCiudad *portales* layer)
+- **Source**: CNIG *Centro de Descargas* (`centrodedescargas.cnig.es`), auto-downloaded
+  per province by name (one GeoPackage / province, `portalpk_publi` layer)
+- **Format**: GeoPackage (EPSG:4258), reprojected to the cadastral CRS
+- **Coverage**: National (all 52 provinces, incl. Basque Country and Navarre)
+- **Update Frequency**: Monthly (the most recent published file is always fetched)
 - **Attributes Include**:
-  - Complete postal addresses
-  - Coordinate locations (EPSG:25830/25831)
-  - Street types and names
-  - Building numbers and entrance specifications
-  - Administrative context
+  - Address point coordinates
+  - Street type (`tipo_vial`) and name (`nombre_via`)
+  - Building number + extension (`numero`, `extension`)
+  - Postal code (`cod_postal`) and population entity (`poblacion`)
+  - Municipality / province / autonomous-community and source metadata
+- **Parcel link**: CartoCiudad points carry no cadastral reference, so each is
+  assigned a `building_reference` by a spatial join to the cadastral parcels.
+- **Output**: always compacted to one row per parcel, with per-address columns
+  as aligned lists.
 
 #### **CAT Files Data**
 - **Content**: Detailed property division data, horizontal ownership structures
@@ -90,6 +101,27 @@ Spain's official statistical organization providing demographic and administrati
 - **Format**: Statistical tables linked to geographic boundaries
 - **Coverage**: National down to census section level
 - **Update Frequency**: Annual estimates, decennial census
+
+#### **Socioeconomic & Demographic Indicators** *(via the `social_ES` package, `social_ES_layer=True`)*
+- **Source**: INE statistical operations, downloaded and cached whole-Spain under `{wd}/INE/…`
+- **Datasets & finest level joined onto each building**:
+  - **Household Income Distribution Atlas** — census **section** (net/gross income
+    per household·person·consumption-unit, income by source, Gini, P80/P20, and
+    demographic headline indicators), 2015–2023
+  - **Population Census** — census **section** (foreign nationality/birth, sex,
+    broad age-band shares)
+  - **Education & Employment Census** — census **section** (education level and
+    labour-force status shares), 2021–2024
+  - **Household Rental Price Index** — **municipality**, 2011–2024
+  - **Housing Price Index** — **province** (quarterly → annual mean), 2007–2025
+  - **Aggregated Electricity Consumption** — **district** (consumption percentiles), 2021
+  - **Essential Characteristics of Population and Households** — per-building
+    downscaling to `ec__*` proportions (requires `use_CAT_files=True`); the INE
+    survey is published only for ~147 larger municipalities nationwide
+- **Output columns**: `so__{indicator}_{year}` (`so__` namespace prefix,
+  snake_case indicator, year as suffix); most recent `social_ES_years`
+  (default 5) kept per dataset
+- **License note**: `social_ES` is distributed under **EUPL-1.2**
 
 ### National Geographic Institute (Instituto Geográfico Nacional - IGN)
 
@@ -164,16 +196,11 @@ Enhanced data availability for Barcelona municipality providing detailed urban i
   - 73 Neighborhoods
   - Historical boundary evolution
 
-#### **Enhanced Street Addressing**
-- **Content**: Enhanced addressing system with building-level precision
-- **Format**: Various
-- **Coverage**: Barcelona municipality
-- **Update Frequency**: Continuous
-- **Features**:
-  - Building-level address validation
-  - Entrance and access point mapping
-  - Multi-language street naming
-  - Historical address evolution
+#### **Enhanced Street Addressing** *(deprecated)*
+- **Status**: **Deprecated** — the Barcelona *carrerer* street/address register is
+  no longer downloaded or used. Addresses for Barcelona (and all of Spain) now come
+  from CartoCiudad. The other Barcelona open-data layers (districts, neighborhoods,
+  ground-floor commercial premises) are unaffected.
 
 ### OpenStreetMap Integration
 
@@ -201,6 +228,24 @@ Community-contributed geographic data providing additional context and validatio
 - **Format**: OSM XML, Polygon data
 - **Coverage**: Variable by municipality
 - **Use**: Cross-validation with cadastral data
+
+### Copernicus Climate Data Store (ECMWF ERA5-Land)
+
+Hourly reanalysis climate data used for the `weather_layer` (annual per-building
+indicators) and the EnergyPlus weather files (EPW) exported by the energy module.
+
+#### **ERA5-Land Reanalysis**
+- **Content**: 2 m air/dew-point temperature, wind components, surface solar
+  radiation, total precipitation, surface pressure, soil temperature
+- **Resolution**: 0.1° (~9 km) grid, hourly, 1950–present (trails real time by ~5 days)
+- **Coverage**: Global land surface (no data over sea — coastal cells resolve to the
+  nearest inland cell)
+- **Access**: CDS API — a configured `~/.cdsapirc` key is required. Two access paths:
+  the **ARCO analysis-ready Zarr** stores over HTTPS (tried first, no download queue)
+  and the classic `cdsapi` retrieve (GRIB grid / CSV timeseries) as fallback
+- **Derived indicators**: heating/cooling degree days, annual precipitation, global
+  horizontal irradiation, temperature/humidity/wind summaries
+- **License**: Copernicus / ECMWF (free, attribution required)
 
 ## 🗺️ Geographic Coverage & Scale
 

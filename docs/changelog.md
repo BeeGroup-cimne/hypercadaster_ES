@@ -2,6 +2,202 @@
 
 All notable changes to hypercadaster_ES will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [1.2.1] - 2026-07-14
+
+### 🏷️ Namespaced, snake_case contextual columns (breaking)
+
+The contextual `merge()` layers now emit **namespace-prefixed, snake_case**
+column names, so their origin is unambiguous and the whole output schema is
+consistent (no more CamelCase keys):
+
+- **Weather** (`weather_layer`): `we__` prefix, e.g. `HDD_2023` → `we__hdd_2023`,
+  `airTemperatureMean_2023` → `we__air_temperature_mean_2023`. Stems in
+  `weather.WEATHER_INDICATORS` are now snake_case.
+- **Socioeconomic** (`social_ES_layer`): `so__` prefix, e.g.
+  `NetIncomePerHousehold_2020` → `so__net_income_per_household_2020`. All
+  `social.*_INDICATORS` output names are now snake_case.
+- **POIs** (`pois_layer`): `poi_` prefix → `poi__`, e.g. `poi_amenity_food_count`
+  → `poi__amenity_food_count` (group/subgroup snake-cased).
+- **Essential Characteristics** (`ec__*`): the Spanish→English translation now
+  emits snake_case, e.g. `ec__MainDwellings_HeatingType_Individual` →
+  `ec__main_dwellings_heating_type_individual`. `translate_ec_column()` /
+  `rename_ec_columns()` output snake_case keys.
+- New helper `utils.to_snake_case()` for normalising identifiers to snake_case.
+
+Consumers referencing the old column names must update to the new ones.
+
+## [1.2.0] - 2026-07-13
+
+### 🌦️ Annual weather indicators from ERA5-Land
+
+A new **`weather_layer`** in `merge()` attaches annually-aggregated ERA5-Land
+climate indicators to every building. Each building is snapped to the nearest
+0.1° ERA5-Land cell **with data** (coastal buildings fall back to the closest
+inland cell), and the per-cell yearly statistics are added as `{Indicator}_{year}`
+columns (year as a suffix, mirroring `social_ES`). It runs **before** the POI join
+and uses `hypercadaster_ES.weather`.
+
+#### Added
+- `merge()` parameters: `weather_layer` (bool), `weather_years` (int = N most-recent
+  **complete** calendar years, or an explicit list, default 5), `weather_indicators`
+  (subset selector, default all), `weather_hdd_base` / `weather_cdd_base` (°C degree-day
+  bases, default 18 / 21), `weather_bbox` (a predefined WGS84
+  `[min_lon, min_lat, max_lon, max_lat]` download extent).
+- Nine indicators per year: `HDD`, `CDD` (heating/cooling degree days),
+  `precipitation` (mm), `GHI` (kWh/m²), `airTemperatureMean` / `_Min` / `_Max` (°C),
+  `relativeHumidityMean` (%), `windSpeedMean` (m/s). See
+  `hypercadaster_ES.weather.WEATHER_INDICATORS`.
+- `weather.join_weather()` orchestrator. Cell resolution and per-cell statistics
+  are computed over the **unique** snapped cells, not per building, so the cost is
+  independent of the number of buildings (scales to city/province frames).
+- ERA5-Land cache directory `utils.weather_era5_dir_(wd)` = `{wd}/weather/era5land`,
+  created by `utils.create_dirs`.
+
+#### ⚡ ARCO analysis-ready Zarr gatherer (priority, no queue)
+- `weather.load_ERA5Land` now gathers with a two-tier strategy: **first** the CDS
+  [Analysis-Ready Cloud-Optimised (ARCO)](https://cds.climate.copernicus.eu/datasets/reanalysis-era5-land?tab=analysis_ready_data)
+  Zarr stores over HTTPS (`_load_ARD`, Bearer-authenticated with the `~/.cdsapirc`
+  key — **no `retrieve` queue**), and **only if that fails** the classic cdsapi
+  retrieve (GRIB grid / CSV timeseries). Toggle with `HC_ERA5_ARD=0/1`.
+  A full year over a small area is fetched in ~seconds vs the queue's minutes-to-hours.
+- **Province-adaptive download**: the grid download/cache extent is derived from the
+  requested area (snapped outward to whole degrees), replacing the previous hard-coded
+  Catalan region — any Spanish province now works, and same-tile municipalities share
+  one cache.
+- **Single-municipality** merges fetch only the ERA5-Land point nearest the municipality
+  centroid (timeseries endpoint) instead of the whole grid, falling back to the grid if
+  that point has no data.
+- New dependencies for the ARD path: `zarr`, `aiohttp` (missing → graceful fallback to
+  the cdsapi retrieve).
+
+### 🧮 Socioeconomic indicators from `social_ES` (INE)
+
+A new **`social_ES_layer`** in `merge()` attaches INE socioeconomic and
+demographic indicators to every building, joining each source dataset at its own
+finest geographic level (census **section** → **district** → **municipality** →
+**province**) using the codes added by `census_layer`. It runs **before** the POI
+join. Output columns use the `{Indicator}_{year}` convention (year as a suffix),
+e.g. `NetIncomePerHousehold_2020`, keeping the most recent `social_ES_years`
+(default 5) per dataset.
+
+#### Added
+- `hypercadaster_ES.social` module with `join_social_ES()` and the curated
+  indicator maps. Datasets (`social.ALL_DATASETS`): `atlas` (Household Income
+  Distribution Atlas — ~20 headline income/inequality/demographic indicators,
+  section level), `population` (census population shares: foreign nationality/
+  birth, sex, broad age bands), `education` (education level + labour-force status
+  shares), `rental` (municipal rental price index), `price` (provincial housing
+  price index, quarterly→annual), `electricity` (district electricity-consumption
+  percentiles).
+- `merge()` parameters: `social_ES_layer` (bool), `social_ES_years` (int, default
+  5), `social_ES_datasets` (subset selector, default all). Source files are
+  fetched once for the whole of Spain and cached under `{wd}/INE/…` by
+  `social_ES` (EUPL-1.2), then reused on subsequent runs.
+- Degrades gracefully: missing `social_ES`, absent `section_code`, or a dataset
+  with no coverage for the selected area is skipped with a warning rather than
+  failing the merge.
+- **Essential Characteristics downscaling** — the INE *Essential Characteristics
+  of Population and Households* survey is downscaled to building level via
+  `social.join_essential_characteristics()`, adding `ec__*` proportion columns
+  (age, income band, household nationality, dwelling size, building type/age,
+  heating, vehicles, internet, …). It is exposed as a `social_ES` dataset
+  (`social.ESSENTIAL_CHARACTERISTICS = "essential_characteristics"`) folded into
+  the `social_ES_layer`: included when `social_ES_datasets` is `None` or lists
+  `"essential_characteristics"`, **and additionally gated on `use_CAT_files=True`**
+  (it consumes the CAT-based `br__area_without_communals` / `br__building_spaces`
+  per-use-type dicts and `year_of_construction`). Requesting it without
+  `use_CAT_files` skips it with a warning. Uses the updated `social_ES` signature
+  that accepts the GeoDataFrame directly (`hypercadaster_ES_input_gdf=`) instead of
+  a pickle path. Note the underlying INE survey is only published for larger
+  municipalities (~147 nationwide), so `ec__*` values populate only there;
+  buildings elsewhere are left unset.
+- `ec__*` columns are now emitted with **English PascalCase keys directly** from
+  `merge()`, e.g.
+  `ec__Viviendas principales - Tipo de calefacción ~ Sí, individual` →
+  `ec__MainDwellings_HeatingType_Individual`. The translation is compositional
+  (curated group/variable/subclass dictionaries + accent-stripped fallback for
+  unseen categories) and idempotent. Exposed as `social.rename_ec_columns(df)`
+  (for pre-existing Spanish-named frames), `social.translate_ec_column()` and
+  `social.ec_column_rename_map()`.
+
+### 🏠 Addresses now sourced from CartoCiudad
+
+Addresses are now taken from **CartoCiudad** (CNIG) instead of the Cadastre's
+INSPIRE Address feed. CartoCiudad is distributed as one GeoPackage per province
+and is auto-downloaded, by province name, from the CNIG *Centro de Descargas*
+(the most recent monthly edition is always fetched). The Cadastre is still used
+for parcels, buildings and CAT files.
+
+#### Added
+- `downloaders.cartociudad_downloader()` — resolves each province's current file
+  and downloads/extracts its address GeoPackage to `{wd}/cartociudad/{province}.gpkg`.
+  (Matches provinces by **name**: the CNIG `codProvincia` filter does not follow
+  INE province codes.)
+- `mergers.get_cartociudad_address()` — reads the CartoCiudad `portalpk_publi`
+  address points, maps them to the canonical address schema, and recovers each
+  point's `building_reference` via a spatial join to the cadastral parcels
+  (`mergers._assign_points_to_parcels`, extracted from the old Barcelona path).
+- New address columns: `population_entity`, `address_source`,
+  `address_last_modification`, `postal_address_specification` (= "Portal").
+- `downloaders.normalize_cartociudad_street_type()` — normalises the inconsistent
+  `tipo_vial` to the canonical Catastro street-type name (see *Changed*). A full
+  scan of all 52 provinces produced a mapping-review CSV (with per-province
+  provenance) under `{wd}/cartociudad/street_type_mapping_review.csv`.
+- `utils.match_building_space_postal_addresses()` — matches each building space's
+  CAT postal address to the closest parcel address, producing three per-space
+  columns: `building_space_postal_address` (the **matched CartoCiudad address**),
+  `building_space_postal_address_from_CAT_file` (the **original CAT value**), and
+  `building_space_postal_address_location` (the matched point). All three are
+  building-level `{use_type: […]}` dicts that explode at the building-space
+  resolution.
+- `hc.merge(verbose=…)` — new parameter (default `"simple"`) that suppresses the
+  per-stage `[stage +… | RSS …]` markers and per-municipality progress logs
+  (`assign_building_zones` / `join_other_constructions`); pass `verbose="full"`
+  to restore them (`utils.set_verbose` / `utils.verbose_log`).
+
+#### Changed
+- **Addresses are always compacted** to one row per parcel (`building_reference`),
+  with per-address columns as aligned lists. The `compact_addresses` parameter of
+  `hc.merge()` has been **removed** (behaviour is now always-on).
+- **Renamed the compacted address columns** for clarity:
+  `street_full_labels` → `postal_addresses_with_extensions`,
+  `street_full_clean` → `postal_addresses_clean`,
+  `address_location` → `postal_addresses_location`,
+  `specification` → `postal_address_specification`.
+- **Street-type normalisation.** `tipo_vial` regional-language/bilingual/
+  descriptor/abbreviation/typo variants map to the Spanish canonical name
+  (`AVINGUDA`/`KALEA`→`AVENIDA`/`CALLE`, `PLAÇA`→`PLAZA`, `PARTICULAR`→`PARTIDA`);
+  genuine Spanish names with no Catastro type are kept; unrecognised short codes
+  become `None`.
+- **`building_space_postal_address` now holds the matched CartoCiudad address**
+  (was the raw CAT value, which moved to `…_from_CAT_file`).
+- A wrongly-elided Catalan `D'` before a consonant is normalised to `DE` in the
+  full-address labels (`PASEO D'GUITART` → `PASEO DE GUITART`); valid elisions
+  before a vowel/h (`D'URGELL`) are kept (`utils._expand_catalan_elision`).
+- `postal_code` now comes from CartoCiudad (`cod_postal`); the postal-code boundary
+  spatial join (`join_by_postal_codes`) is kept only as a fallback for parcels with
+  no CartoCiudad address, and no longer overwrites an existing code.
+
+#### Fixed
+- POI join for large municipalities (e.g. Lleida city `25900`) failed with
+  *"Must have equal len keys and value when setting with an iterable"*:
+  `gpd.sjoin_nearest` emits one row per equidistant tie, inflating the fallback
+  assignment. The nearest-parcel match (and the within-parcel join) are now
+  de-duplicated to one row per POI (`utils.get_pois_open_street_maps`).
+- `cadaster_downloader` works around a Catastro INSPIRE feed bug where
+  special-character municipality names (e.g. the `Ç` in *Sant Llorenç de Morunys*,
+  `25237`) produce a broken download URL: it validates the download is a real zip
+  and retries with collapsed spaces (`downloaders._download_inspire_zip`).
+
+#### Deprecated / removed
+- The INSPIRE **Address** layer (`ES.SDGC.AD`) is no longer downloaded
+  (`cadaster_downloader` still fetches parcels and buildings).
+- The Barcelona Open Data **carrerer** street/address register download and its
+  reader (`_process_barcelona_open_data` / `process_open_data_addresses`) and the
+  old `get_cadaster_address` are deprecated (commented out).
+
 ## [1.1.0] - 2026-06-04
 
 ### 🚀 DuckDB Migration — Eliminating User-Facing RAM Peaks
@@ -359,16 +555,23 @@ hc.merge(
 
 ### 🔮 Future Roadmap
 
-#### Short-term Improvements (v1.1.x)
+#### Recently shipped
+- ✅ INE socioeconomic integration via `social_ES` (income atlas, population,
+  education, rental & housing price, electricity, Essential Characteristics) — v1.2.0
+- ✅ EnergyPlus IDF generation and automatic simulations — v1.1.0+
+- ✅ OpenStreetMap POI proximity indicators — v1.1.0
+- ✅ Nationwide addresses from CartoCiudad — v1.2.0
+
+#### Short-term Improvements
 - Performance optimizations for large-scale processing
 - Enhanced error handling and user feedback
 - Additional data validation and quality checks
-- Expanded documentation and examples
 
-#### Medium-term Features (v1.2.x)
+#### Medium-term Features
 - Basque Country and Navarre cadastral integration
 - Enhanced visualization and reporting capabilities
-- Additional external tool integrations
+- Predicting WWR / façade material / energy systems (`epc_CAT`)
+- Interoperability with VoxCity and city2graph
 
 ---
 

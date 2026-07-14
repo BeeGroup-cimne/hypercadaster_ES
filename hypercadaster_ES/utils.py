@@ -65,6 +65,30 @@ from shapely.geometry import box
 from shapely.ops import unary_union
 
 # ==========================================
+# COLUMN NAMING UTILITIES
+# ==========================================
+
+def to_snake_case(name):
+    """Normalise an identifier to ``snake_case``.
+
+    Handles CamelCase (``airTemperatureMean`` -> ``air_temperature_mean``),
+    acronym runs (``GHI`` -> ``ghi``, ``IncomeP80P20`` -> ``income_p80_p20``)
+    and free text with spaces/punctuation (``Gini Index`` -> ``gini_index``).
+    Already-snake lowercase names are returned unchanged. Output column names in
+    hypercadaster_ES are always snake_case (never CamelCase)."""
+    if name is None:
+        return name
+    s = str(name).strip()
+    # ABCDef -> ABC_Def (split an acronym run from a following CamelCase word)
+    s = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', s)
+    # abcDef / 8Def -> abc_Def / 8_Def (split lower/digit from a following Upper)
+    s = re.sub(r'([a-z\d])([A-Z])', r'\1_\2', s)
+    # collapse any run of non-alphanumerics into a single underscore
+    s = re.sub(r'[^a-zA-Z0-9]+', '_', s)
+    return s.strip('_').lower()
+
+
+# ==========================================
 # PARALLEL PROCESSING UTILITIES
 # ==========================================
 
@@ -99,6 +123,34 @@ def tqdm_joblib(tqdm_object):
 # far into the overall run we are.
 _STAGE_T0 = time.time()
 
+# Verbosity: when False (verbose="simple", the default), the per-stage
+# ``[stage +… | RSS …]`` markers and per-municipality progress prints are
+# suppressed; ``verbose="full"`` turns them on. Set via :func:`set_verbose`
+# (called by ``hc.merge``).
+_VERBOSE_FULL = False
+
+
+def set_verbose(level):
+    """Set global logging verbosity from a ``"simple"``/``"full"`` level.
+
+    ``"full"`` enables the ``[stage …]`` markers and per-municipality progress
+    logs; anything else (``"simple"``, the default) suppresses them.
+    """
+    global _VERBOSE_FULL
+    _VERBOSE_FULL = str(level).lower() == "full"
+
+
+def is_verbose():
+    """Whether full (verbose="full") logging is currently enabled."""
+    return _VERBOSE_FULL
+
+
+def verbose_log(message):
+    """Write ``message`` to stderr only when full verbosity is enabled."""
+    if _VERBOSE_FULL:
+        sys.stderr.write(message)
+        sys.stderr.flush()
+
 
 def _rss_mb():
     """Current process resident-set size in MiB, or None if unavailable.
@@ -123,8 +175,11 @@ def stage_log(message):
     Format: ``[stage +H:MM:SS | RSS NNNN MB] message`` where the offset
     is wall-clock time since this module was imported (≈ process start)
     and RSS is the current resident memory. Cheap enough to call
-    anywhere in the hot path's outer loop.
+    anywhere in the hot path's outer loop. Suppressed unless full verbosity
+    is enabled (``hc.merge(verbose="full")``).
     """
+    if not _VERBOSE_FULL:
+        return
     elapsed = int(time.time() - _STAGE_T0)
     h, rem = divmod(elapsed, 3600)
     m, s = divmod(rem, 60)
@@ -195,6 +250,14 @@ def open_data_dir_(wd):
     """Path to the (Barcelona) open-data subdirectory of working dir ``wd``."""
     return f"{wd}/open_data"
 
+def cartociudad_dir_(wd):
+    """Path to the CartoCiudad (per-province address gpkg) subdirectory of ``wd``."""
+    return f"{wd}/cartociudad"
+
+def weather_era5_dir_(wd):
+    """Path to the ERA5-Land raw/parquet weather cache subdirectory of ``wd``."""
+    return f"{wd}/weather/era5land"
+
 def create_dirs(data_dir):
     """Create the full working-directory tree used by :func:`hypercadaster_ES.download`.
 
@@ -221,7 +284,9 @@ def create_dirs(data_dir):
     os.makedirs(postal_codes_dir_(data_dir), exist_ok=True)
     os.makedirs(f"{postal_codes_dir_(data_dir)}/raw", exist_ok=True)
     os.makedirs(open_data_dir_(data_dir), exist_ok=True)
+    os.makedirs(cartociudad_dir_(data_dir), exist_ok=True)
     os.makedirs(open_street_dir_(data_dir), exist_ok=True)
+    os.makedirs(weather_era5_dir_(data_dir), exist_ok=True)
 
 # PyCatastro.ConsultaMunicipio("BARCELONA")['consulta_municipalero'][]
 # def dwellings_per_building_reference(province_name, municipality_name, building_reference):
@@ -2684,7 +2749,7 @@ OSM_TAGS_STRUCTURED = {
 OSM_TAGS_STRUCTURED = PrettyDict(OSM_TAGS_STRUCTURED)
 """OpenStreetMap POI taxonomy consumed by the POI layer:
 ``group → subgroup → [OSM tag values]``. Drives both the OSM query tags and the
-generated ``poi_{group}[_{subgroup}]`` output columns."""
+generated ``poi__{group}[_{subgroup}]`` output columns."""
 
 POIS_COLS = {
     "general": [
@@ -3092,7 +3157,8 @@ def get_pois_open_street_maps(
             if poi_gdf is None or poi_gdf.empty:
                 return poi_gdf
 
-            poi_gdf = poi_gdf.to_crs(crs_out)
+            # Unique index so the row-per-POI bookkeeping below is unambiguous.
+            poi_gdf = poi_gdf.to_crs(crs_out).reset_index(drop=True)
 
             # Spatial join: POIs inside parcels
             poi_with_parcels = gpd.sjoin(
@@ -3101,6 +3167,11 @@ def get_pois_open_street_maps(
                 how="left",
                 predicate="within"
             )
+            # A POI that falls within several (overlapping) parcels yields one
+            # row per parcel; keep the first so there is exactly one row per POI.
+            poi_with_parcels = poi_with_parcels[
+                ~poi_with_parcels.index.duplicated(keep="first")
+            ]
 
             # Fallback: nearest parcel for unmatched POIs
             no_parcel_mask = poi_with_parcels["building_reference"].isna()
@@ -3122,10 +3193,17 @@ def get_pois_open_street_maps(
                     parcel_centroids[["building_reference", "geometry"]],
                     how="left"
                 )
+                # sjoin_nearest emits one row per equidistant tie; collapse to the
+                # first match per POI so the assignment aligns one-to-one with the
+                # masked rows (positional ``.values`` would otherwise raise
+                # "Must have equal len keys and value ..." when ties inflate it).
+                nearest_parcels = nearest_parcels[
+                    ~nearest_parcels.index.duplicated(keep="first")
+                ]
 
                 poi_with_parcels.loc[
                     no_parcel_mask, "building_reference"
-                ] = nearest_parcels["building_reference"].values
+                ] = nearest_parcels["building_reference"]
 
             poi_with_parcels = poi_with_parcels.drop(
                 columns=["index_right"], errors="ignore"
@@ -3600,6 +3678,25 @@ def _reorder_inverted_street_name(name):
     return ' '.join(reversed(parts))
 
 
+# In Catalan the preposition "de" elides to "d'" only before a vowel or h
+# ("d'Aragó", "d'Homs"); before a consonant it stays "de". Some source street
+# names carry a wrong/attached elision (e.g. "D'GUITART"), so expand "D'" back to
+# "DE " when it is immediately followed by a consonant. A lookahead keeps the
+# consonant; the apostrophe may be straight (') or typographic (’).
+_CATALAN_ELISION_RE = re.compile(r"\bD['’]\s*(?=[BCÇDFGJKLMNÑPQRSTVWXYZ])", re.IGNORECASE)
+
+
+def _expand_catalan_elision(name):
+    """Expand an incorrectly-elided Catalan ``D'`` to ``DE`` before a consonant.
+
+    ``"D'GUITART" -> "DE GUITART"``, ``"D' GUITART" -> "DE GUITART"``. Vowel/h
+    cases (``"D'URGELL"``, ``"D'HOMS"``) and non-strings are left untouched.
+    """
+    if not isinstance(name, str):
+        return name
+    return _CATALAN_ELISION_RE.sub("DE ", name)
+
+
 # Cadastral thoroughfare texts embed the aggregated municipality (pedanía) as an
 # ``AG.<NAME>`` marker somewhere inside the street name, delimited from the rest
 # by ``;``, ``-`` or whitespace, and the marker itself can sit at the start,
@@ -3659,9 +3756,11 @@ def _create_full_street_names(gdf):
         return _type_map.get(t, t) if isinstance(t, str) else t
 
     def _clean_name(n):
-        # strip the AG.<municipality> marker, then un-invert the remainder
+        # strip the AG.<municipality> marker, un-invert the remainder, then fix a
+        # wrong Catalan "D'" elision that only surfaces once the name is un-inverted
+        # (e.g. "GUITART, D'" -> "D' GUITART" -> "DE GUITART").
         clean, _ = _split_aggregated_municipality(n)
-        return _reorder_inverted_street_name(clean)
+        return _expand_catalan_elision(_reorder_inverted_street_name(clean))
 
     def _agg_suffix(n):
         return _aggregated_municipality_suffix(_split_aggregated_municipality(n)[1])
@@ -3844,7 +3943,7 @@ def compact_addresses(
     ],
     geolocation_cols=['address_location'],
     admin_cols=[
-        'district_code', 'district_name', 'postal_code',
+        'district_code', 'district_name', 'postal_code', 'population_entity',
         'neighborhood_code', 'neighborhood_name', 'section_code'
     ],
     create_full_street_names=True,
@@ -3998,6 +4097,93 @@ def compact_addresses(
     )
 
     return df_compacted
+
+
+def _best_address_match_index(address, ref_labels):
+    """Index of the ``ref_labels`` entry most similar to ``address`` (or None)."""
+    import difflib
+    if not isinstance(address, str) or not ref_labels:
+        return None
+    a = address.upper()
+    best_i, best_r = None, -1.0
+    for i, lab in enumerate(ref_labels):
+        if not isinstance(lab, str):
+            continue
+        r = difflib.SequenceMatcher(None, a, lab.upper()).ratio()
+        if r > best_r:
+            best_r, best_i = r, i
+    return best_i
+
+
+def _match_space_addresses(space_addresses, ref_labels, ref_locations):
+    """For each space address, return ``(matched_label, matched_location)`` taken
+    from the closest reference parcel address (both None when there is no match)."""
+    if not isinstance(space_addresses, list):
+        return space_addresses, space_addresses
+    labels = ref_labels if isinstance(ref_labels, list) else []
+    locs = ref_locations if isinstance(ref_locations, list) else []
+    out_labels, out_locs = [], []
+    for a in space_addresses:
+        idx = _best_address_match_index(a, labels)
+        out_labels.append(labels[idx] if idx is not None and idx < len(labels) else None)
+        out_locs.append(locs[idx] if idx is not None and idx < len(locs) else None)
+    return out_labels, out_locs
+
+
+def match_building_space_postal_addresses(
+    gdf,
+    spaces_col="br__building_spaces_postal_address",
+    labels_col="street_full_labels",
+    locations_col="address_location",
+    from_cat_col="br__building_spaces_postal_address_from_CAT_file",
+    location_col="br__building_spaces_postal_address_location",
+):
+    """Match every building space's CAT postal address to the closest parcel address.
+
+    For each ``br__building_spaces_postal_address`` entry (a CAT per-space postal
+    address) the closest compacted parcel address in ``labels_col``
+    (``street_full_labels`` / ``postal_addresses_with_extensions``) is found, and:
+
+    - the original CAT address is preserved in ``from_cat_col``
+      (``br__building_spaces_postal_address_from_CAT_file``);
+    - ``spaces_col`` (``br__building_spaces_postal_address``) is **replaced** with the
+      matched parcel-address string (None when the parcel has no address);
+    - ``location_col`` (``br__building_spaces_postal_address_location``) gets the
+      matched address point.
+
+    All three mirror the ``{use_type: [...]}`` dict (or plain list) shape of the
+    space-address column, so :func:`flat_gdf_to_building_spaces_resolution` explodes
+    them to per-space ``building_space_postal_address`` /
+    ``building_space_postal_address_from_CAT_file`` /
+    ``building_space_postal_address_location`` automatically.
+
+    No-op (returns ``gdf`` unchanged) when any required column is absent — e.g. when
+    building-parts inference is disabled and there are no building spaces.
+    """
+    if not all(c in gdf.columns for c in (spaces_col, labels_col, locations_col)):
+        return gdf
+
+    def _row(row):
+        spaces = row[spaces_col]
+        labels = row[labels_col]
+        locs = row[locations_col]
+        if isinstance(spaces, dict):
+            lab_d, loc_d = {}, {}
+            for ut, v in spaces.items():
+                lab, loc = _match_space_addresses(v, labels, locs)
+                lab_d[ut], loc_d[ut] = lab, loc
+            return spaces, lab_d, loc_d
+        if isinstance(spaces, list):
+            lab, loc = _match_space_addresses(spaces, labels, locs)
+            return spaces, lab, loc
+        return spaces, None, None
+
+    gdf = gdf.copy()
+    res = gdf.apply(_row, axis=1, result_type="expand")
+    gdf[from_cat_col] = res[0]     # original CAT address preserved
+    gdf[spaces_col] = res[1]       # replaced with the matched parcel address
+    gdf[location_col] = res[2]     # matched address point
+    return gdf
 
 # ==========================================
 # SHADOW VISUALIZATION
@@ -5496,7 +5682,7 @@ def plot_linestrings_and_polygons(linestrings, polygons=None, pdf_file=None):
 def plot_building_reference(
     gdf,
     building_reference="",
-    address_col="address_location",
+    address_col="postal_addresses_location",
     building_centroid_col="building_centroid",
     parcel_centroid_col="parcel_centroid",
     parcel_geom_col="parcel_geometry",
@@ -7149,7 +7335,7 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
     # list (e.g. ['CL LLOBERA, 47', 'CL NOU, 40', ...]). Keep the COMPLETE
     # address (street + house number), de-duplicate, take the first 3.
     _street_names = []
-    for _scol in ('street_full_labels', 'street_full_clean'):
+    for _scol in ('postal_addresses_with_extensions', 'postal_addresses_clean'):
         if _scol in building_data.columns:
             for _v in building_data[_scol].dropna():
                 for _it in (_v if isinstance(_v, (list, tuple)) else [_v]):

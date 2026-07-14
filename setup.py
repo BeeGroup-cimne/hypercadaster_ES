@@ -3,7 +3,7 @@ from setuptools import find_packages, setup
 
 HERE = pathlib.Path(__file__).parent
 
-VERSION = "1.0.6"
+VERSION = "1.2.1"
 PACKAGE_NAME = "hypercadaster_es"
 AUTHOR = "Jose Manuel Broto Vispe"
 AUTHOR_EMAIL = "jmbrotovispe@gmail.com"
@@ -92,6 +92,9 @@ INSTALL_REQUIRES = [
 
     # --- YAML / config ---
     "PyYAML>=6.0",
+
+    # --- Socioeconomic INE datasets (EUPL-1.2) ---
+    "social_ES>=1.0.0",
 ]
 
 

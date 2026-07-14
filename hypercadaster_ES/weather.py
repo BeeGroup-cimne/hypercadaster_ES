@@ -211,15 +211,157 @@ def transformation_pipe(df, mode="averaged"):
     return df
 
 
+def _grid_bounds(lat_range, lon_range, pad_deg=0.0):
+    """Province-scale bounding box for the ERA5-Land grid download/cache.
+
+    Snaps the requested area OUTWARD to whole degrees (after an optional
+    ``pad_deg``) so that (a) the download covers the whole area of interest with
+    margin, and (b) the cache key is stable across municipalities that fall in
+    the same degree tiles — a province-wide run resolves to a single shared file
+    instead of re-downloading per municipality. Replaces the previous
+    hard-coded Catalan region, so any Spanish province adapts automatically."""
+    import math
+    lat_lo = min(lat_range) - pad_deg
+    lat_hi = max(lat_range) + pad_deg
+    lon_lo = min(lon_range) - pad_deg
+    lon_hi = max(lon_range) + pad_deg
+    return {
+        'lat_min': float(max(-90.0, math.floor(lat_lo))),
+        'lat_max': float(min(90.0, math.ceil(lat_hi))),
+        'lon_min': float(max(-180.0, math.floor(lon_lo))),
+        'lon_max': float(min(180.0, math.ceil(lon_hi))),
+    }
+
+
+def _bounds_str(bounds):
+    """Filename-safe bounds key (``lat_max_lon_min_lat_min_lon_max``), matching
+    the order used in the GRIB filenames written by :func:`download_ERA5Land`."""
+    return (f"{bounds['lat_max']}_{bounds['lon_min']}_"
+            f"{bounds['lat_min']}_{bounds['lon_max']}")
+
+
+# --------------------------------------------------------------------------- #
+# ERA5-Land ARCO analysis-ready Zarr gatherer (PRIORITY over the cdsapi retrieve)
+# --------------------------------------------------------------------------- #
+# The CDS now publishes ERA5-Land as Analysis-Ready Cloud-Optimised (ARCO) Zarr
+# stores served over HTTPS with a ``Bearer <CDS-API-KEY>`` header. Reading a
+# small bbox/point slice avoids the slow queue-based ``retrieve`` workflow
+# entirely, so :func:`load_ERA5Land` tries this FIRST and only falls back to
+# :func:`download_ERA5Land` (GRIB grid / CSV timeseries) on any failure.
+# Ref: https://cds.climate.copernicus.eu/datasets/reanalysis-era5-land?tab=analysis_ready_data
+_ARD_BASE = "https://arco.datastores.ecmwf.int"
+
+# The canonical pipeline needs these ERA5-Land short names; grouped by the ARCO
+# store that carries them: ``store group -> (numeric store id, [short names])``.
+_ARD_STORES = {
+    "sfc-2m-temperature": ("007", ["t2m", "d2m"]),
+    "sfc-wind": ("008", ["u10", "v10"]),
+    "sfc-pressure-precipitation": ("009", ["sp", "tp"]),
+    "sfc-radiation-heat": ("010", ["ssrd"]),
+    "sfc-soil-temperature": ("006", ["stl4"]),
+}
+
+
+def _ard_cds_key():
+    """CDS API key for the ARCO Zarr Bearer auth (env ``CDSAPI_KEY`` or the
+    ``key:`` line of ``~/.cdsapirc``); ``None`` if not configured."""
+    key = os.getenv("CDSAPI_KEY")
+    if key:
+        return key.strip()
+    rc = os.path.expanduser("~/.cdsapirc")
+    if os.path.exists(rc):
+        with open(rc) as fh:
+            for line in fh:
+                if line.strip().startswith("key:"):
+                    return line.split(":", 1)[1].strip()
+    return None
+
+
+def _ard_enabled():
+    """Whether to attempt the ARCO ARD path. On by default when a CDS key is
+    available; force off with ``HC_ERA5_ARD=0`` or on with ``HC_ERA5_ARD=1``."""
+    flag = os.getenv("HC_ERA5_ARD")
+    if flag is not None:
+        return flag.strip().lower() not in ("0", "false", "no", "off", "")
+    return _ard_cds_key() is not None
+
+
+def _ard_store_url(group, num, chunks):
+    return (f"{_ARD_BASE}/cadl-arco-{chunks}-{num}/arco/reanalysis_era5_land/"
+            f"{group}/{chunks}Chunked.zarr")
+
+
+def _load_ARD(lat_range, lon_range, ym_range, mode="averaged", chunks="geo"):
+    """Gather ERA5-Land for the bbox/period from the ARCO Zarr stores and return
+    the SAME canonical hourly polars frame as the cdsapi path.
+
+    Opens each needed ARCO store lazily, selects the bounding box and time range,
+    then reuses :func:`cleaning_pipe` (short names -> library names) and
+    :func:`transformation_pipe`. Unlike the GRIB path, the ARCO ``ssrd``/``tp``
+    flux fields are ALREADY per-hour (verified: the daily curve peaks at midday
+    and returns to zero rather than accumulating), so ``_deaccumulate_grib`` is
+    NOT applied — this matches the CSV-timeseries path. ``chunks='geo'`` is
+    optimised for time-series over a small area (our use). Raises on any
+    access/dependency problem so the caller can fall back to the CDS retrieve."""
+    import xarray as xr  # zarr/fsspec/aiohttp pulled in lazily; ImportError -> fallback
+
+    key = _ard_cds_key()
+    if not key:
+        raise RuntimeError("no CDS API key for ARCO Zarr auth")
+    storage_options = {"headers": {"Authorization": f"Bearer {key}"}}
+
+    lat_lo, lat_hi = round(min(lat_range), 1), round(max(lat_range), 1)
+    lon_lo, lon_hi = round(min(lon_range), 1), round(max(lon_range), 1)
+    t0 = pd.Timestamp(min(ym_range))
+    t1 = pd.Timestamp(max(ym_range)) + pd.Timedelta(hours=23)
+
+    merged = None
+    for group, (num, varnames) in _ARD_STORES.items():
+        url = _ard_store_url(group, num, chunks)
+        ds = xr.open_zarr(url, consolidated=True, storage_options=storage_options)
+        ds = ds[varnames]
+        # Robust to ascending/descending coordinate order AND float-imprecise grid
+        # nodes (e.g. 41.60000000000116): boolean-select the box widened by half a
+        # 0.1 grid step, so a tight/point request still captures its cell(s). The
+        # caller filters to the exact rounded range afterwards.
+        eps = 0.05
+        latm = (ds.latitude >= lat_lo - eps) & (ds.latitude <= lat_hi + eps)
+        lonm = (ds.longitude >= lon_lo - eps) & (ds.longitude <= lon_hi + eps)
+        ds = ds.sel(latitude=ds.latitude[latm], longitude=ds.longitude[lonm])
+        ds = ds.sel(time=slice(t0, t1))
+        merged = ds if merged is None else xr.merge([merged, ds])
+
+    pdf = merged.to_dataframe().reset_index()
+    # Rename the ARCO time coordinate so cleaning_pipe maps it exactly like the
+    # CDS 'valid_time' field, and keep only pipeline-understood columns.
+    pdf = pdf.rename(columns={"time": "valid_time"})
+    shortnames = [c for grp in _ARD_STORES.values() for c in grp[1]]
+    keep = ["latitude", "longitude", "valid_time"] + shortnames
+    pdf = pdf[[c for c in keep if c in pdf.columns]]
+
+    df = pl.from_pandas(pdf)
+    df = df.pipe(cleaning_pipe)          # valid_time->time, short->canonical, drop nulls (sea)
+    if df.is_empty():
+        raise RuntimeError("ARCO returned no land cells for the requested bbox/period")
+    df = df.with_columns(
+        pl.col("time").dt.cast_time_unit("us").dt.replace_time_zone("UTC"))
+    # NB: no _deaccumulate_grib here — ARCO ssrd/tp are already per-hour fluxes.
+    df = df.pipe(transformation_pipe, mode=mode)
+    return df
+
+
 def load_ERA5Land(data_dir, lat_range, lon_range, ym_range, tz_local, update=True, use_point_location=True,
                   mode="averaged"):
-    """Download (if needed), clean, transform and cache ERA5-Land weather.
+    """Gather (if needed), clean, transform and cache ERA5-Land weather.
 
-    Ensures the raw ERA5-Land data covering ``ym_range`` is present (via
-    :func:`download_ERA5Land`), runs it through :func:`cleaning_pipe` and
-    :func:`transformation_pipe`, and caches the result as a Parquet keyed by the
-    Catalan region bounds and time range. Returns the cached frame on repeat
-    calls unless ``update`` is set.
+    On a cache miss (or ``update``) the data is gathered with a two-tier
+    strategy: **first** the ARCO analysis-ready Zarr stores (:func:`_load_ARD` —
+    no CDS queue, used whenever a CDS key is available and ``HC_ERA5_ARD`` is not
+    ``0``), and **only if that fails** the classic cdsapi ``retrieve`` via
+    :func:`download_ERA5Land` (GRIB grid / CSV timeseries). Either way the result
+    is run through :func:`cleaning_pipe` / :func:`transformation_pipe` and cached
+    as a Parquet keyed by the (province-scale, whole-degree) grid bounds and time
+    range. Returns the cached frame on repeat calls unless ``update`` is set.
 
     Parameters
     ----------
@@ -245,19 +387,33 @@ def load_ERA5Land(data_dir, lat_range, lon_range, ym_range, tz_local, update=Tru
     """
     os.makedirs(data_dir, exist_ok=True)
 
-    # Always use Catalan region for parquet file (same as download)
-    CATALAN_BOUNDS = {
-        'lat_min': 40.5,
-        'lat_max': 42.9,
-        'lon_min': 0.1,
-        'lon_max': 3.4
-    }
+    # Grid download/cache bounds adapt to the requested area, snapped outward to
+    # whole degrees so a whole province resolves to one shared cache tile (same
+    # bounds used by download_ERA5Land below, since it receives lat/lon_range).
+    grid_bounds = _grid_bounds(lat_range, lon_range)
+    bounds_str = _bounds_str(grid_bounds)
+    file = f"{data_dir}/weather_{'~'.join([str(i) for i in ym_range])}_{bounds_str}_{"ts" if use_point_location else "grid"}.parquet"
 
-    # Create parquet file name based on Catalan region bounds, not requested bounds
-    catalan_bounds_str = f"{CATALAN_BOUNDS['lat_max']}_{CATALAN_BOUNDS['lon_min']}_{CATALAN_BOUNDS['lat_min']}_{CATALAN_BOUNDS['lon_max']}"
-    file = f"{data_dir}/weather_{'~'.join([str(i) for i in ym_range])}_{catalan_bounds_str}_{"ts" if use_point_location else "grid"}.parquet"
+    ard_df = None
+    if ((not os.path.exists(file)) or update) and _ard_enabled():
+        # PRIORITY PATH: ARCO analysis-ready Zarr (no CDS queue). Any failure
+        # (missing deps, no access, beta outage, out-of-memory) falls back to
+        # the classic cdsapi retrieve below.
+        try:
+            ard_df = _load_ARD(lat_range, lon_range, ym_range, mode=mode)
+            sys.stderr.write("\tERA5-Land: gathered via ARCO analysis-ready Zarr "
+                             "(priority path, no queue)\n")
+        except Exception as e:
+            sys.stderr.write(f"\tERA5-Land: ARCO ARD path unavailable ({e}); "
+                             f"falling back to CDS retrieve\n")
+            ard_df = None
 
-    if (not os.path.exists(file)) or update:
+    if ard_df is not None:
+        df = ard_df.unique(subset=["latitude", "longitude", "time"]).sort(
+            ["latitude", "longitude", "time"])
+        df.write_parquet(file)
+
+    elif (not os.path.exists(file)) or update:
 
         download_ERA5Land(
             data_dir=data_dir,
@@ -291,7 +447,7 @@ def load_ERA5Land(data_dir, lat_range, lon_range, ym_range, tz_local, update=Tru
                 # For GRIB files, use the original logic (fallback when no point location files exist)
                 try:
                     file_ym = int(os.path.splitext(fn)[0].split('_')[0])
-                    if file_ym >= min_ym and file_ym <= max_ym and catalan_bounds_str in fn:
+                    if file_ym >= min_ym and file_ym <= max_ym and bounds_str in fn:
                         list_data_files.append(f'{data_dir}/{fn}')
                 except:
                     continue
@@ -729,19 +885,15 @@ def download_ERA5Land(data_dir, ym_range, lat_range=[90, -90], lon_range=[-180, 
         download_lon_range = [center_lon, center_lon]
         sys.stderr.write(f"\tUsing point location: lat {center_lat}, lon {center_lon}\n")
     else:
-        # Force Catalan region bounding box for downloads
-        CATALAN_BOUNDS = {
-            'lat_min': 40.5,
-            'lat_max': 42.9,
-            'lon_min': 0.1,
-            'lon_max': 3.4
-        }
+        # Province-scale bounding box derived from the requested area, snapped
+        # outward to whole degrees (matches the cache key in load_ERA5Land). Any
+        # Spanish province adapts automatically; municipalities in the same tiles
+        # share one download instead of forcing the whole Catalan region.
+        grid_bounds = _grid_bounds(lat_range, lon_range)
+        download_lat_range = [grid_bounds['lat_min'], grid_bounds['lat_max']]
+        download_lon_range = [grid_bounds['lon_min'], grid_bounds['lon_max']]
 
-        # Use Catalan bounds instead of requested bounds for download
-        download_lat_range = [CATALAN_BOUNDS['lat_min'], CATALAN_BOUNDS['lat_max']]
-        download_lon_range = [CATALAN_BOUNDS['lon_min'], CATALAN_BOUNDS['lon_max']]
-
-        sys.stderr.write(f"\tUsing Catalan region bounds: lat {download_lat_range[0]} to {download_lat_range[1]}, "
+        sys.stderr.write(f"\tUsing province bounds: lat {download_lat_range[0]} to {download_lat_range[1]}, "
                          f"lon {download_lon_range[0]} to {download_lon_range[1]}\n")
 
     # Connect to the Copernicus Climate Date Store
@@ -849,10 +1001,10 @@ def download_ERA5Land(data_dir, ym_range, lat_range=[90, -90], lon_range=[-180, 
             year = int(str(ym)[0:4])
             month = int(str(ym)[4:6])
 
-            # Use Catalan bounds for filename
+            # Encode the (province-scale) grid bounds in the filename
             filename = f'{data_dir}/{year}{month:02}_{download_lat_range[1]}_{download_lon_range[0]}_{download_lat_range[0]}_{download_lon_range[1]}.grib'
 
-            sys.stderr.write(f'\t\t--> Checking {year}{month:02} in Catalan region bounds\n')
+            sys.stderr.write(f'\t\t--> Checking {year}{month:02} in province grid bounds\n')
 
             if not os.path.exists(filename):
                 sys.stderr.write(f'\t\t--> Downloading {year}{month:02}...\n')
@@ -1197,3 +1349,260 @@ def municipality_epw(era5_dir, epw_dir, lat, lon, year, *, elevation=0.0,
         write_epw(dst, epw_path, year=int(year), latitude=slat, longitude=slon,
                   elevation=elevation, tz_offset=tz_offset, city=city)
     return (epw_path, stats) if return_stats else epw_path
+
+
+# --------------------------------------------------------------------------- #
+# Building-level weather layer (annual indicators per ERA5-Land cell)
+# --------------------------------------------------------------------------- #
+# Maps the statistic keys returned by ``weather_statistics`` to the friendly
+# output-column stems used by the merge weather layer. Output columns are named
+# ``we__{stem}_{year}`` (mirroring the social_ES ``so__{indicator}_{year}``
+# convention). Stems are snake_case (never CamelCase).
+WEATHER_PREFIX = "we__"
+WEATHER_INDICATORS = {
+    "HDD": "hdd",                              # heating degree days
+    "CDD": "cdd",                              # cooling degree days
+    "precip_total_mm": "precipitation",        # total precipitation (mm)
+    "ghi_total_kwh_m2": "ghi",                 # global horizontal irradiation (kWh/m2)
+    "t_mean": "air_temperature_mean",          # mean 2 m air temperature (C)
+    "t_min": "air_temperature_min",            # min 2 m air temperature (C)
+    "t_max": "air_temperature_max",            # max 2 m air temperature (C)
+    "rh_mean": "relative_humidity_mean",       # mean relative humidity (%)
+    "wind_mean": "wind_speed_mean",            # mean wind speed (m/s)
+}
+
+
+def _resolve_weather_years(years):
+    """Normalise the ``years`` selector to a sorted list of calendar years.
+
+    An int ``N`` selects the ``N`` most-recent COMPLETE calendar years (the last
+    complete year is the previous one relative to today, since ERA5-Land trails
+    real time). A list/tuple/set of years is used verbatim (cast to int)."""
+    if isinstance(years, (list, tuple, set)):
+        return sorted({int(y) for y in years})
+    n = int(years)
+    if n <= 0:
+        return []
+    last = dt.date.today().year - 1
+    return list(range(last - n + 1, last + 1))
+
+
+def join_weather(gdf, era5_dir, years=5, indicators=None, hdd_base=18.0,
+                 cdd_base=21.0, search_deg=0.6, tz_local="Europe/Madrid",
+                 update=False, mode="averaged", bbox=None,
+                 use_point_location=False, verbose=True):
+    """Join annually-aggregated ERA5-Land climate indicators onto every building.
+
+    For each requested calendar year the ERA5-Land grid covering the buildings'
+    bounding box is loaded (see :func:`load_ERA5Land`), every building is snapped
+    to the ERA5-Land 0.1° cell nearest its centroid that carries data (sea/empty
+    cells fall back to the closest inland cell), and the per-cell annual
+    statistics from :func:`weather_statistics` (HDD/CDD, precipitation, GHI,
+    temperature, humidity, wind) are attached as ``we__{indicator}_{year}``
+    columns (snake_case indicator stems).
+
+    Resolution is done on the small set of UNIQUE snapped cells rather than
+    per building, so the cost is independent of the number of buildings and this
+    scales to city-sized frames.
+
+    Parameters
+    ----------
+    gdf : geopandas.GeoDataFrame
+        Building frame with geometry (any CRS; centroids are reprojected to
+        WGS84 to pick ERA5-Land cells).
+    era5_dir : str
+        Directory for the ERA5-Land raw files and derived Parquet cache (a
+        one-off download on first use; requires a configured ``~/.cdsapirc``).
+    years : int | sequence[int], default 5
+        Number of most-recent complete calendar years, or an explicit list of
+        years. See :func:`_resolve_weather_years`.
+    indicators : sequence[str], optional
+        Subset of the indicator stems to keep (see :data:`WEATHER_INDICATORS`;
+        both stems and statistic keys are accepted). Default: all.
+    hdd_base, cdd_base : float, default 18.0 / 21.0
+        Base temperatures (C) for the heating/cooling degree-day sums.
+    search_deg : float, default 0.6
+        Padding (degrees) added around the buildings' bounding box when loading
+        the grid, so coastal buildings still find an inland cell with data.
+    tz_local : str, default "Europe/Madrid"
+        Local timezone passed to :func:`load_ERA5Land`.
+    update : bool, default False
+        Force a re-download/rebuild of the ERA5-Land cache.
+    mode : {"averaged", "instantaneous"}, default "averaged"
+        Temporal-averaging mode passed to :func:`load_ERA5Land`.
+    bbox : sequence[float], optional
+        Predefined WGS84 bounding box ``[min_lon, min_lat, max_lon, max_lat]``
+        (the same order as :func:`hypercadaster_ES.utils.get_ine_codes_from_bounding_box`)
+        over which to download/cache the ERA5-Land grid, instead of deriving the
+        extent from the buildings. Buildings are still snapped to the nearest
+        cell **within** this box. Forces grid mode (``use_point_location`` is
+        ignored when a box is given).
+    use_point_location : bool, default False
+        When ``True`` (recommended for a **single municipality**) download only
+        the single ERA5-Land point nearest the municipality centroid via the
+        ``reanalysis-era5-land-timeseries`` endpoint, instead of the whole
+        province grid — far cheaper, and every building gets that point's
+        indicators. Falls back to the province grid for any year whose nearest
+        point returns no data (e.g. an offshore centroid resolving to a sea
+        cell, which a lone point cannot escape).
+    verbose : bool, default True
+        Emit per-year progress to stderr.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        ``gdf`` with the ``we__{indicator}_{year}`` columns added. Degrades
+        gracefully: a year (or the whole layer) that cannot be loaded is skipped
+        with a warning and the frame is returned with whatever joined.
+    """
+    import geopandas as gpd
+
+    def log(msg):
+        if verbose:
+            sys.stderr.write(f"weather: {msg}\n")
+
+    if gdf is None or len(gdf) == 0:
+        return gdf
+
+    year_list = _resolve_weather_years(years)
+    if not year_list:
+        log("no years resolved; skipping weather layer")
+        return gdf
+
+    if indicators is None:
+        keep = list(WEATHER_INDICATORS.items())
+    else:
+        wanted = set(indicators)
+        keep = [(k, v) for k, v in WEATHER_INDICATORS.items()
+                if v in wanted or k in wanted]
+        if not keep:
+            log(f"none of the requested indicators {sorted(wanted)} are known; "
+                f"available: {sorted(WEATHER_INDICATORS.values())}; skipping")
+            return gdf
+
+    # Per-building WGS84 centroids (used only to pick a 0.1 ERA5-Land cell).
+    try:
+        cent = gpd.GeoSeries(gdf.geometry.centroid, crs=gdf.crs).to_crs(4326)
+        blon = cent.x.to_numpy()
+        blat = cent.y.to_numpy()
+    except Exception as e:
+        log(f"could not compute building centroids ({e}); skipping weather layer")
+        return gdf
+
+    finite = np.isfinite(blon) & np.isfinite(blat)
+    if not finite.any():
+        log("no valid building coordinates; skipping weather layer")
+        return gdf
+
+    rlat = np.round(blat, 1)
+    rlon = np.round(blon, 1)
+
+    # Extent over which the ERA5-Land grid is downloaded/cached: a predefined
+    # bbox (WGS84 [min_lon, min_lat, max_lon, max_lat]) takes precedence over the
+    # buildings' own extent and forces grid mode; otherwise use the buildings.
+    if bbox is not None:
+        lon_lo, lat_lo, lon_hi, lat_hi = (float(v) for v in bbox)
+        load_lat = [min(lat_lo, lat_hi) - search_deg, max(lat_lo, lat_hi) + search_deg]
+        load_lon = [min(lon_lo, lon_hi) - search_deg, max(lon_lo, lon_hi) + search_deg]
+        point_mode = False
+        if use_point_location:
+            log("bbox given; ignoring use_point_location and using the grid")
+    else:
+        load_lat = [float(np.nanmin(blat)) - search_deg, float(np.nanmax(blat)) + search_deg]
+        load_lon = [float(np.nanmin(blon)) - search_deg, float(np.nanmax(blon)) + search_deg]
+        point_mode = use_point_location
+
+    gdf = gdf.copy()
+
+    for year in year_list:
+        ym_range = [dt.datetime(int(year), 1, 1), dt.datetime(int(year), 12, 31)]
+
+        # load_ERA5Land's point mode downloads the single ERA5-Land point nearest
+        # the CENTRE of the passed range (= the municipality centroid here), so
+        # passing the padded building bbox picks the closest point automatically.
+        def _load_era5(point):
+            return load_ERA5Land(
+                data_dir=era5_dir,
+                lat_range=load_lat,
+                lon_range=load_lon,
+                ym_range=ym_range, tz_local=tz_local, update=update,
+                use_point_location=point, mode=mode)
+
+        df = None
+        if point_mode:
+            try:
+                cand = _load_era5(point=True)
+                if not cand.filter(pl.col("airTemperature").is_not_null()).is_empty():
+                    df = cand
+                else:
+                    log(f"{year}: nearest point has no data (likely a sea cell); "
+                        f"falling back to the province grid")
+            except Exception as e:
+                log(f"{year}: point download failed ({e}); "
+                    f"falling back to the province grid")
+        if df is None:
+            try:
+                df = _load_era5(point=False)
+            except Exception as e:
+                log(f"{year}: could not load ERA5-Land ({e}); skipping this year")
+                continue
+
+        # ERA5-Land cells that actually carry data (drop all-null sea cells).
+        cells = (
+            df.filter(pl.col("airTemperature").is_not_null())
+              .group_by([pl.col("latitude").round(1).alias("clat"),
+                         pl.col("longitude").round(1).alias("clon")])
+              .agg(pl.len())
+        )
+        if cells.is_empty():
+            log(f"{year}: no ERA5-Land cell with data in the area; skipping")
+            continue
+        clat = cells["clat"].to_numpy()
+        clon = cells["clon"].to_numpy()
+        cell_set = {(round(float(a), 1), round(float(b), 1))
+                    for a, b in zip(clat, clon)}
+
+        # Resolve the UNIQUE snapped building keys to a data cell (cheap even for
+        # millions of buildings): a key that is itself a data cell maps to itself;
+        # otherwise it snaps to the nearest data cell (haversine).
+        keys = pd.DataFrame({"rlat": rlat, "rlon": rlon})
+        uniq = keys[finite].drop_duplicates().reset_index(drop=True)
+        stat_cache = {}
+
+        def _stats_for(slat, slon):
+            k = (slat, slon)
+            if k not in stat_cache:
+                dst = station_timeseries(df, slat, slon)
+                stat_cache[k] = weather_statistics(
+                    dst, hdd_base=hdd_base, cdd_base=cdd_base)
+            return stat_cache[k]
+
+        recs = []
+        for a, b in zip(uniq["rlat"].to_numpy(), uniq["rlon"].to_numpy()):
+            a = round(float(a), 1)
+            b = round(float(b), 1)
+            if (a, b) in cell_set:
+                slat, slon = a, b
+            else:
+                d = _haversine_km(a, b, clat, clon)
+                i = int(np.argmin(d))
+                slat, slon = round(float(clat[i]), 1), round(float(clon[i]), 1)
+            st = _stats_for(slat, slon)
+            rec = {"rlat": a, "rlon": b}
+            for stat_key, stem in keep:
+                rec[f"{WEATHER_PREFIX}{stem}_{year}"] = st.get(stat_key)
+            recs.append(rec)
+        stats_df = pd.DataFrame(recs)
+
+        # Broadcast the per-cell values back to every building via a left join on
+        # the snapped key (non-finite buildings get NaN).
+        keys["_ord"] = np.arange(len(gdf))
+        merged = keys.merge(stats_df, on=["rlat", "rlon"], how="left") \
+                     .sort_values("_ord")
+        for stat_key, stem in keep:
+            col = f"{WEATHER_PREFIX}{stem}_{year}"
+            gdf[col] = merged[col].to_numpy()
+        log(f"{year}: added {len(keep)} indicators "
+            f"({len(uniq)} unique cells resolved)")
+
+    return gdf

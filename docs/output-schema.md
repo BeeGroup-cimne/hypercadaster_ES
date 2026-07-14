@@ -37,7 +37,7 @@ Prefixes tell you where a column comes from:
 | `building_geometry` | Polygon | Building footprint polygon |
 | `building_area` | Float | Total gross floor area (m²) |
 | `building_centroid` | Point | Building geometric center point |
-| `address_location` | Point | Primary address coordinates |
+| `postal_addresses_location` | List[Point] | Coordinates of each of the parcel's addresses (from CartoCiudad) |
 
 ## 🏠 Building Characteristics & Attributes
 
@@ -54,14 +54,32 @@ Prefixes tell you where a column comes from:
 
 ## 📍 Complete Address Information
 
+Addresses come from **CartoCiudad** (CNIG) and are always compacted to **one row
+per parcel** (`building_reference`): the per-address columns are **lists**, all
+aligned to the same order (the *i*-th entry of each list describes the parcel's
+*i*-th address). The raw `street_type` / `street_name` / `street_number_*` columns
+are collapsed into the combined `postal_addresses_*` label lists below.
+
+**Street-type normalisation.** CartoCiudad's `tipo_vial` is inconsistent (regional
+languages, bilingual `SPANISH / REGIONAL` forms, `X, Y` descriptors, abbreviations,
+typos). It is normalised to the canonical Catastro full name via
+`downloaders.normalize_cartociudad_street_type` — e.g. `AVINGUDA`/`KALEA`→`AVENIDA`/`CALLE`,
+`PLAÇA`→`PLAZA`, `PARTICULAR`→`PARTIDA`. Genuine Spanish names with no Catastro
+equivalent (`BULEVAR`, `AUTOPISTA`, `DISEMINADO`, `PARAJE`, …) are kept; unrecognised
+short codes become `None`. The full mapping (with per-province provenance) is in
+`{wd}/cartociudad/street_type_mapping_review.csv`.
+
 ### Structured Addressing
 | Column | Type | Description |
 |--------|------|-------------|
-| `street_name` | String | Street name (e.g., "SANT AGUSTÍ") |
-| `street_type` | String | Street type (e.g., "PLAÇA DE", "CALLE") |
-| `street_number_clean` | String | Building number, normalised |
-| `street_number_label` | String | Building number as labelled in the source |
-| `specification` | String | Address specification (entrance, etc.) |
+| `postal_addresses_with_extensions` | List[String] | Full address per entry, using the source number label with extension (e.g. "CALLE GRAN, 4", "CARRER MAJOR, 20(B)") |
+| `postal_addresses_clean` | List[String] | Full address per entry, using the normalised number |
+| `postal_code` | List[String] | Postal code of each address (from CartoCiudad `cod_postal`; boundary-polygon fallback) |
+| `population_entity` | List[String] | Population entity / hamlet / estate name (`poblacion`) per address |
+| `postal_addresses_location` | List[Point] | Address point coordinates (see Geometric Information) |
+| `postal_address_specification` | String | Address type (always "Portal" for CartoCiudad) |
+| `address_source` | String | Origin of the address data (`fuente_datos`) |
+| `address_last_modification` | Datetime | Source last-modification timestamp (`fecha_modificacion`) |
 
 ## 🗺️ Administrative Geography & Context
 
@@ -148,8 +166,16 @@ Prefixes tell you where a column comes from:
 | `br__building_spaces_detailed_use_type` | Dict | {space_type: [detailed_uses]} |
 | `br__building_spaces_economic_value` | Dict | {space_type: [values]} |
 | `br__building_spaces_effective_year` | Dict | {space_type: [construction_years]} |
-| `br__building_spaces_postal_address` | Dict | {space_type: [addresses]} |
+| `br__building_spaces_postal_address` | Dict | {space_type: [addresses]} — each space matched to the closest `postal_addresses_with_extensions` entry (CartoCiudad); None where the parcel has no address |
+| `br__building_spaces_postal_address_from_CAT_file` | Dict | {space_type: [addresses]} — the original CAT-file per-space postal address (before the CartoCiudad match) |
+| `br__building_spaces_postal_address_location` | Dict | {space_type: [Points]} — the matched address's point (`postal_addresses_location`) |
 | `br__building_spaces_inner_address` | Dict | {space_type: [internal_refs]} |
+
+> At the building-space resolution (`utils.flat_gdf_to_building_spaces_resolution`),
+> these `br__building_spaces_*` dicts explode to one value per space, including
+> `building_space_postal_address` (the matched CartoCiudad address),
+> `building_space_postal_address_from_CAT_file` (the original CAT value) and
+> `building_space_postal_address_location` (the matched point).
 
 ## 🏗️ Building Geometry & Structure Analysis (building_inference=True)
 
@@ -319,23 +345,81 @@ shadow/terrain columns exist with the `sbr__` prefix (the four
 `sbr__shadows`/`sbr__shadows_at_distance`/`sbr__terrain_grid`/`sbr__wall_segments`
 are heavy — fetch with `table="sbr_results"`).
 
+## 🧮 Socioeconomic Indicators (social_ES_layer=True)
+
+INE socioeconomic/demographic indicators from the `social_ES` package, joined
+(before the POI join) at each dataset's finest geographic level using the census
+codes added by `census_layer`. Column names follow `so__{indicator}_{year}`
+(`so__` namespace prefix, snake_case indicator, year as a **suffix**); the most
+recent `social_ES_years` (default 5) are kept per dataset.
+
+### Section/district/municipality/province indicators
+
+| Column pattern | Level | Description |
+|----------------|-------|-------------|
+| `so__net_income_per_household_{year}`, `so__net_income_per_person_{year}`, `so__net_income_per_consumption_unit_{year}`, `so__gross_income_per_household_{year}`, `so__gross_income_per_person_{year}`, `so__median_income_per_consumption_unit_{year}` | Section | Income Atlas — mean/median income (€) |
+| `so__salary_income_per_person_{year}`, `so__pension_income_per_person_{year}`, `so__unemployment_income_per_person_{year}`, `so__other_benefits_income_per_person_{year}`, `so__other_income_per_person_{year}` | Section | Income Atlas — income by source (€) |
+| `so__gini_index_{year}`, `so__income_p80_p20_{year}`, `so__average_age_{year}`, `so__average_household_size_{year}`, `so__pct_spanish_{year}`, `so__pct_single_person_households_{year}`, `so__pct_over_65_{year}`, `so__pct_under_18_{year}`, `so__population_{year}` | Section | Income Atlas — inequality & demographics |
+| `so__pct_foreign_nationality_{year}`, `so__pct_foreign_born_{year}`, `so__pct_male_{year}`, `so__pct_under_15_{year}`, `so__pct_working_age_{year}`, `so__pct_65_plus_{year}` | Section | Population Census — population shares (%) |
+| `so__pct_edu_primary_or_below_{year}`, `so__pct_edu_lower_secondary_{year}`, `so__pct_edu_upper_secondary_{year}`, `so__pct_edu_tertiary_{year}`, `so__pct_employed_{year}`, `so__pct_unemployed_{year}`, `so__pct_student_{year}`, `so__pct_pensioner_{year}`, `so__pct_other_inactive_{year}` | Section | Education & Employment Census (%) |
+| `so__rental_price_index_{year}` | Municipality | Household rental price index |
+| `so__housing_price_index_total_{year}`, `so__housing_price_index_new_{year}`, `so__housing_price_index_second_hand_{year}` | Province | Housing price index (annual mean) |
+| `so__electricity_consumption_p10_{year}`…`p90_{year}` | District | Electricity-consumption percentiles (kWh) |
+
+Coverage reflects INE publication scope (e.g. rental index and electricity exist
+only for some municipalities/districts); unmatched buildings get `NaN`.
+
+### Essential Characteristics of Households and People downscaling — `ec__*` (use_CAT_files=True only)
+
+When `use_CAT_files=True` and the `essential_characteristics` dataset is selected
+(default when `social_ES_datasets=None`), the INE *Essential Characteristics of
+Population and Households* survey is downscaled to each building as `ec__*`
+proportion columns (percentages; each variable group sums to 100). Column names
+are **English snake_case**, `ec__{group}_{variable}_{subclass}`, e.g.
+`ec__main_dwellings_heating_type_individual`,
+`ec__people_in_households_number_of_vehicles_3_or_more`. The survey is published only
+for larger municipalities (~147 nationwide), so these columns populate only there.
+
+## 🌦️ Weather Indicators (weather_layer=True)
+
+Annually-aggregated ERA5-Land climate indicators, joined (before the POI join) by
+snapping each building to the nearest 0.1° ERA5-Land cell that carries data
+(coastal buildings fall back to the closest inland cell). Column names follow
+`we__{indicator}_{year}` (`we__` namespace prefix, snake_case indicator, year as
+a **suffix**); one column per requested year (`weather_years`, default the 5 most
+recent complete calendar years).
+
+| Column pattern | Unit | Description |
+|----------------|------|-------------|
+| `we__hdd_{year}` | °C·day | Heating degree days (base `weather_hdd_base`, default 18 °C) |
+| `we__cdd_{year}` | °C·day | Cooling degree days (base `weather_cdd_base`, default 21 °C) |
+| `we__precipitation_{year}` | mm | Total annual precipitation |
+| `we__ghi_{year}` | kWh/m² | Global horizontal irradiation (annual sum) |
+| `we__air_temperature_mean_{year}` / `we__air_temperature_min_{year}` / `we__air_temperature_max_{year}` | °C | Mean / min / max 2 m air temperature |
+| `we__relative_humidity_mean_{year}` | % | Mean relative humidity |
+| `we__wind_speed_mean_{year}` | m/s | Mean 10 m wind speed |
+
+`weather_indicators` selects a subset of these stems (default: all nine). Buildings
+with no resolvable cell (e.g. invalid geometry) get `NaN`. Source: Copernicus
+Climate Data Store ERA5-Land (see [Data Sources](data-sources-coverage.md)).
+
 ## 📍 Points of Interest (pois_layer=True)
 
 POI indicators are added when `pois_layer=True` is passed to `merge()`. Data is sourced from OpenStreetMap and joined at building level for the following groups: `amenity`, `emergency`, `healthcare`, `leisure`, `office`, `shop`, `tourism`.
 
-For groups with subgroups (e.g. `amenity` → `food`, `education`, …) the column prefix is `poi_{group}_{subgroup}`. For groups without subgroups (e.g. `emergency`, `healthcare`) the prefix is `poi_{group}`.
+For groups with subgroups (e.g. `amenity` → `food`, `education`, …) the column prefix is `poi__{group}_{subgroup}`. For groups without subgroups (e.g. `emergency`, `healthcare`) the prefix is `poi__{group}`. Group/subgroup names are snake_case.
 
 ### Per-group/subgroup Columns
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `poi_{prefix}_count` | Integer | Number of POIs located on the building footprint |
-| `poi_{prefix}_ids` | List | OSM identifiers of POIs on the building |
-| `poi_{prefix}_100m` | Integer | POI count within 100 m of building centroid |
-| `poi_{prefix}_250m` | Integer | POI count within 250 m of building centroid |
-| `poi_{prefix}_500m` | Integer | POI count within 500 m of building centroid |
-| `poi_{prefix}_1000m` | Integer | POI count within 1000 m of building centroid |
-| `poi_{prefix}_1500m` | Integer | POI count within 1500 m of building centroid |
+| `poi__{prefix}_count` | Integer | Number of POIs located on the building footprint |
+| `poi__{prefix}_ids` | List | OSM identifiers of POIs on the building |
+| `poi__{prefix}_100m` | Integer | POI count within 100 m of building centroid |
+| `poi__{prefix}_250m` | Integer | POI count within 250 m of building centroid |
+| `poi__{prefix}_500m` | Integer | POI count within 500 m of building centroid |
+| `poi__{prefix}_1000m` | Integer | POI count within 1000 m of building centroid |
+| `poi__{prefix}_1500m` | Integer | POI count within 1500 m of building centroid |
 
 ### POI Groups and Subgroups
 
@@ -350,12 +434,12 @@ For groups with subgroups (e.g. `amenity` → `food`, `education`, …) the colu
 | `tourism` | `accommodation`, `camping`, `culture`, `attraction`, `leisure`, `information`, `rental` | hotels, museums, viewpoints… |
 
 **Examples of generated column names:**
-- `poi_amenity_food_count` — restaurants/cafes/bars on the building
-- `poi_amenity_food_250m` — food amenities within 250 m
-- `poi_emergency_100m` — emergency facilities within 100 m
-- `poi_shop_clothing_500m` — clothing shops within 500 m
-- `poi_leisure_1500m` — leisure POIs within 1500 m
-- `poi_tourism_accommodation_ids` — OSM IDs of accommodation on the building
+- `poi__amenity_food_count` — restaurants/cafes/bars on the building
+- `poi__amenity_food_250m` — food amenities within 250 m
+- `poi__emergency_100m` — emergency facilities within 100 m
+- `poi__shop_clothing_500m` — clothing shops within 500 m
+- `poi__leisure_1500m` — leisure POIs within 1500 m
+- `poi__tourism_accommodation_ids` — OSM IDs of accommodation on the building
 
 ## 🏪 Commercial Premises Analysis (Barcelona open_data_layers=True)
 
@@ -384,21 +468,24 @@ For groups with subgroups (e.g. `amenity` → `food`, `education`, …) the colu
 
 ## 📋 Column Availability Matrix
 
-| Feature Category | Basic | +CAT Files | +Inference | +Inference+CAT |
-|-----------------|--------|------------|------------|----------------|
-| Core Building Info | ✓ | ✓ | ✓ | ✓ |
-| Address Info | ✓ | ✓ | ✓ | ✓ |
-| Administrative | ✓ | ✓ | ✓ | ✓ |
-| Usage by Area | - | ✓ | - | ✓ |
-| Geometric Analysis | - | - | ✓ | ✓ |
-| Orientation Analysis | - | - | ✓ | ✓ |
-| Thermal Properties | - | - | ✓ | ✓ |
-| Space Breakdown | - | - | - | ✓ |
-| Economic Data | - | ✓ | - | ✓ |
-| Heavy shadow/terrain columns | - | - | on-demand¹ | on-demand¹ |
-| Space-level `sbr_results` | - | - | ✓ | ✓ |
-| POI Proximity | pois_layer=True | pois_layer=True | pois_layer=True | pois_layer=True |
-| Commercial Premises | Barcelona Only | Barcelona Only | Barcelona Only | Barcelona Only |
+| Feature Category                                           | Basic                | +CAT Files           | +Inference           | +Inference+CAT       |
+|------------------------------------------------------------|----------------------|----------------------|----------------------|----------------------|
+| Core Building Info                                         | ✓                    | ✓                    | ✓                    | ✓                    |
+| Address Info                                               | ✓                    | ✓                    | ✓                    | ✓                    |
+| Administrative                                             | ✓                    | ✓                    | ✓                    | ✓                    |
+| Usage by Area                                              | -                    | ✓                    | -                    | ✓                    |
+| Geometric Analysis                                         | -                    | -                    | ✓                    | ✓                    |
+| Orientation Analysis                                       | -                    | -                    | ✓                    | ✓                    |
+| Thermal Properties                                         | -                    | -                    | ✓                    | ✓                    |
+| Space Breakdown                                            | -                    | -                    | -                    | ✓                    |
+| Economic Data                                              | -                    | ✓                    | -                    | ✓                    |
+| Heavy shadow/terrain columns                               | -                    | -                    | on-demand¹           | on-demand¹           |
+| Space-level `sbr_results`                                  | -                    | -                    | ✓                    | ✓                    |
+| POI Proximity                                              | pois_layer=True      | pois_layer=True      | pois_layer=True      | pois_layer=True      |
+| Socioeconomic indicators                                   | social_ES_layer=True | social_ES_layer=True | social_ES_layer=True | social_ES_layer=True |
+| Weather indicators                                         | weather_layer=True   | weather_layer=True   | weather_layer=True   | weather_layer=True   |
+| Essential Characteristics of Households and People `ec__*` | -                    | social_ES_layer=True | -                    | social_ES_layer=True |
+| Commercial Premises                                        | Barcelona Only       | Barcelona Only       | Barcelona Only       | Barcelona Only       |
 
 ¹ Never in the returned frame — fetch with `get_heavy_columns_for_building()`
 (see [Heavy BLOB columns](#-heavy-blob-columns-on-demand-only)).

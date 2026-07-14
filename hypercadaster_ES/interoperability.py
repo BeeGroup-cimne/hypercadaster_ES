@@ -109,11 +109,11 @@ def create_parcel_address_map(result_gdf, target_parcel_ref='6161378DF2766A'):
         print(f"    Available parcel_geometry type: {type(target_addresses['parcel_geometry'].iloc[0])}")
         return None
 
-    # Set the correct geometry column for addresses (use address_location instead of geometry)
-    if 'address_location' in target_addresses.columns:
-        # Create a proper GeoDataFrame with address_location as geometry
-        target_addresses = target_addresses.set_geometry('address_location')
-        print(f"✅ Using 'address_location' column for address points")
+    # Set the correct geometry column for addresses (use postal_addresses_location instead of geometry)
+    if 'postal_addresses_location' in target_addresses.columns:
+        # Create a proper GeoDataFrame with postal_addresses_location as geometry
+        target_addresses = target_addresses.set_geometry('postal_addresses_location')
+        print(f"✅ Using 'postal_addresses_location' column for address points")
 
     # Convert to WGS84 for Folium
     web_crs = 'EPSG:4326'
@@ -189,7 +189,7 @@ def create_parcel_address_map(result_gdf, target_parcel_ref='6161378DF2766A'):
     for idx, address in target_addresses_web.iterrows():
         try:
             # Check if geometry exists and is valid
-            if pd.isna(address.address_location) or address.address_location is None:
+            if pd.isna(address.postal_addresses_location) or address.postal_addresses_location is None:
                 print(f"⚠️ Skipping address {idx} - no valid geometry")
                 continue
 
@@ -197,10 +197,10 @@ def create_parcel_address_map(result_gdf, target_parcel_ref='6161378DF2766A'):
 
             # Get coordinates safely
             try:
-                lat = address.address_location.y
-                lon = address.address_location.x
+                lat = address.postal_addresses_location.y
+                lon = address.postal_addresses_location.x
             except AttributeError:
-                print(f"⚠️ Skipping address {address_count} - invalid geometry type: {type(address.address_location)}")
+                print(f"⚠️ Skipping address {address_count} - invalid geometry type: {type(address.postal_addresses_location)}")
                 continue
 
             # Build detailed popup information with better formatting
@@ -249,8 +249,8 @@ def create_parcel_address_map(result_gdf, target_parcel_ref='6161378DF2766A'):
             cluster_count = 0
             for idx, address in target_addresses_web.iterrows():
                 try:
-                    if pd.notna(address.address_location) and hasattr(address.address_location, 'y'):
-                        lat, lon = address.address_location.y, address.address_location.x
+                    if pd.notna(address.postal_addresses_location) and hasattr(address.postal_addresses_location, 'y'):
+                        lat, lon = address.postal_addresses_location.y, address.postal_addresses_location.x
 
                         # Build the same detailed address info as regular markers
                         street_name = address.get('street_name', 'Unknown')

@@ -234,8 +234,8 @@ log.info("Reference CRS: %s", source_crs)
 
 records = []
 for _, row in gdf.iterrows():
-    addresses = row.get("street_full_clean")
-    locations = row.get("address_location")
+    addresses = row.get("postal_addresses_clean")
+    locations = row.get("postal_addresses_location")
     neighborhoods = row.get("neighborhood_name")
     building_ref = scalarize(row.get("building_reference"))
 

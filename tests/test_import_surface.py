@@ -14,7 +14,7 @@ SUBMODULE_API = {
     "energy": ["build_energy_model", "building_archetype", "building_wwr",
                "plot_idf_geometry", "configure", "get_config"],
     "weather": ["get_municipality_weather", "municipality_epw",
-                "weather_statistics"],
+                "weather_statistics", "join_weather"],
 }
 
 
@@ -49,5 +49,5 @@ def test_all_matches_module_attrs():
 
 def test_submodules_importable():
     for sub in ("mergers", "utils", "building_inference", "downloaders",
-                "interoperability", "energy", "weather"):
+                "interoperability", "energy", "weather", "social"):
         assert hasattr(hc, sub)

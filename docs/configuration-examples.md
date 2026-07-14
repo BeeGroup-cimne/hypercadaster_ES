@@ -86,9 +86,73 @@ gdf = hc.merge(
     
     # CAT file integration (requires separate download)
     use_CAT_files=True,               # Use detailed building space data
-    CAT_files_rel_dir="CAT_files"     # CAT files directory location
+    CAT_files_rel_dir="CAT_files",    # CAT files directory location
+
+    # Socioeconomic enrichment (INE via social_ES; runs before POIs)
+    social_ES_layer=True,             # income atlas, population, education, prices, electricity
+    social_ES_years=5,                # keep the 5 most recent years -> so__{indicator}_{year}
+    social_ES_datasets=None,          # all datasets; Essential Characteristics (ec__*) added
+                                      # automatically because use_CAT_files=True
+
+    # Annual weather indicators (ERA5-Land; runs before POIs)
+    weather_layer=True,               # HDD/CDD, precipitation, GHI, temperature, humidity, wind
+    weather_years=5,                  # 5 most recent complete years -> we__{indicator}_{year}
 )
 ```
+
+### Socioeconomic layer (`social_ES`)
+
+```python
+# Adds so__{indicator}_{year} columns (income, population, education, rental &
+# housing prices, electricity) joined at each dataset's finest geographic level.
+# With use_CAT_files=True, the per-building Essential Characteristics survey is
+# also downscaled to English-keyed ec__* proportion columns.
+gdf = hc.merge(
+    wd, cadaster_codes=["25900"],     # Lleida city
+    census_layer=True,                # required — provides section_code
+    use_CAT_files=True,               # enables the ec__* Essential Characteristics
+    social_ES_layer=True,
+    # Optional: pick a subset of datasets
+    # social_ES_datasets=["atlas", "education", "essential_characteristics"],
+)
+
+# For a frame produced by an older run with Spanish ec__ names:
+gdf = hc.social.rename_ec_columns(gdf)
+```
+
+> The first `social_ES_layer=True` run downloads and caches the whole-Spain INE
+> source files under `{wd}/INE/…` (a slow one-off); later runs reuse the cache.
+> `social_ES` is EUPL-1.2 licensed.
+
+### Weather layer (ERA5-Land)
+
+```python
+# Adds annual we__{indicator}_{year} climate columns per building: we__hdd, we__cdd,
+# we__precipitation, we__ghi, we__air_temperature_mean/min/max, we__relative_humidity_mean,
+# we__wind_speed_mean. Each building is snapped to the nearest ERA5-Land cell with data.
+gdf = hc.merge(
+    wd, cadaster_codes=["25900"],     # Lleida city (single municipality -> nearest-point download)
+    weather_layer=True,
+    weather_years=5,                  # or an explicit list, e.g. [2021, 2022, 2023]
+    # weather_indicators=["HDD", "CDD", "precipitation"],  # subset (default: all 9)
+    # weather_hdd_base=18.0, weather_cdd_base=21.0,        # degree-day bases (°C)
+)
+
+# Predefined bounding box (e.g. when processing many municipalities at once):
+ine_codes = hc.utils.get_ine_codes_from_bounding_box(wd, [1.9, 41.2, 2.6, 41.6])
+gdf = hc.merge(
+    wd, ine_codes=ine_codes,
+    weather_layer=True,
+    weather_bbox=[1.9, 41.2, 2.6, 41.6],   # [min_lon, min_lat, max_lon, max_lat]
+)
+```
+
+> Weather data is gathered from the CDS **ERA5-Land** dataset (requires a
+> configured `~/.cdsapirc` key) and cached under `{wd}/weather/era5land`. The
+> fast **ARCO analysis-ready Zarr** path is tried first (no download queue),
+> falling back to the classic `cdsapi` retrieve; disable it with the
+> `HC_ERA5_ARD=0` environment variable. Install `zarr` and `aiohttp` for the
+> ARCO path.
 
 ### CAT Files Integration
 

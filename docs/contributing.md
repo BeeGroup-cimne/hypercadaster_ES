@@ -65,7 +65,10 @@ generated reference stays useful.
 - Web-based dashboard for analysis results
 - Interoperability with VoxCity and city2graph
 - Integrate a serialised model for predicting WWR, façade material composition and energy systems based on the `epc_CAT` library
-- Integrate `social_ES` library indicators
+
+> `social_ES` INE indicator integration (income atlas, population, education,
+> rental & housing prices, electricity, Essential Characteristics) shipped in
+> v1.2.0 — see `hypercadaster_ES/social.py` and `merge(social_ES_layer=True)`.
 
 ## 🛠️ Development Guidelines
 

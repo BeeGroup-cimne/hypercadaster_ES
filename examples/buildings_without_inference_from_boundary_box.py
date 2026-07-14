@@ -77,12 +77,14 @@ postal_code_layer = True           # Include postal code boundaries
 census_layer = True                # Include INE census tract data
 elevations_layer = True            # Include digital elevation model
 open_data_layers = True            # Include open data layers where available
-NDVI_layer = True                  # Include the NDVI results
 building_parts_inference = False   # Disable building geometric inference for faster processing
 building_parts_plots = False       # Disable plot generation
 plot_zones_ratio = None            # No plot generation needed
 use_CAT_files = True               # Use detailed CAT format files
 CAT_files_rel_dir = "CAT_files"    # Directory containing CAT files
+weather_layer = True               # Add annual ERA5-Land climate indicators
+weather_years = 5                  # ...for the 5 most recent complete years
+weather_bbox = bbox                # Download the weather grid over the same bounding box
 
 # Perform analysis for all municipalities in bounding box
 print("Processing data without building inference for faster execution...")
@@ -94,14 +96,16 @@ gdf = hc.merge(
     neighborhood_layer=neighborhood_layer, 
     postal_code_layer=postal_code_layer, 
     census_layer=census_layer,
-    elevations_layer=elevations_layer, 
+    elevations_layer=elevations_layer,
     open_data_layers=open_data_layers,
-    NDVI_layer=NDVI_layer,
-    building_parts_inference=building_parts_inference, 
+    building_parts_inference=building_parts_inference,
     building_parts_plots=building_parts_plots,
     plot_zones_ratio=plot_zones_ratio,
-    use_CAT_files=use_CAT_files, 
-    CAT_files_rel_dir=CAT_files_rel_dir
+    use_CAT_files=use_CAT_files,
+    CAT_files_rel_dir=CAT_files_rel_dir,
+    weather_layer=weather_layer,
+    weather_years=weather_years,
+    weather_bbox=weather_bbox
 )
 
 # Filter only the buildings and the first address

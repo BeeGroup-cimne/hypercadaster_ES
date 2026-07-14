@@ -13,11 +13,12 @@ pip install pdoc
 ```
 hypercadaster_ES/
 ├── functions.py         # Primary entry points: download(), merge()
-├── downloaders.py       # Data acquisition (Catastro, INE, DEM, Barcelona open data)
+├── downloaders.py       # Data acquisition (Catastro, CartoCiudad addresses, INE, DEM, Barcelona open data)
 ├── mergers.py           # Joins all sources into one GeoDataFrame; grid/H3 aggregation
 ├── building_inference.py# Geometric/space inference (br__* columns, shadows, footprints)
 ├── energy.py            # Per-space 3-D thermal model → EnergyPlus IDF
-├── weather.py           # ERA5-Land → climate stats + EPW files
+├── social.py            # INE socioeconomic indicators via social_ES (income, population, ...)
+├── weather.py           # ERA5-Land → weather_layer indicators, climate stats + EPW files
 ├── utils.py             # Geometry, codes, plotting and DB read helpers
 ├── interoperability.py  # Dataset builders for external tools (e.g. IREC)
 └── _db.py               # DuckDB persistence layer (internal)
@@ -38,8 +39,17 @@ The public API is what `import hypercadaster_ES as hc` exposes (see
     (single municipality only; memory-intensive).
   - `use_CAT_files` — pull detailed space classification from official CAT files.
   - `pois_layer` — attach OpenStreetMap POI proximity indicators.
-  - `compact_addresses` — collapse multi-address buildings into one row of lists.
+  - `social_ES_layer` — attach INE socioeconomic indicators (income atlas,
+    population, education, rental & housing prices, electricity, and — when
+    `use_CAT_files=True` — the per-building Essential Characteristics
+    downscaling). Tune with `social_ES_years` and `social_ES_datasets`.
   - `sociodemographic_layer`, `floor_height`, `ground_floor_height`, `num_workers`.
+  - `verbose` — `"simple"` (default) hides the `[stage | RSS]` markers and
+    per-municipality progress logs; `"full"` shows them.
+
+  Addresses (from CartoCiudad) are always compacted to one row per parcel, with
+  the per-address columns collapsed into aligned lists; street types are
+  normalised to canonical Catastro names.
 
 ## 🔗 mergers.py — integration & aggregation
 
@@ -75,6 +85,29 @@ coupling). Public entry points:
 - **`building_archetype(...)`**, **`building_wwr(...)`** — Spanish archetype
   envelopes and window-to-wall-ratio prediction.
 
+## 🧮 social.py — INE socioeconomic indicators
+
+Attaches INE socioeconomic/demographic indicators to every building via the
+`social_ES` package (EUPL-1.2), joining each source dataset at its finest
+geographic level (census section → district → municipality → province) from the
+codes added by `census_layer`. Wired into `merge()` through `social_ES_layer`
+and executed **before** the POI join. Whole-Spain source files are cached once
+under `{wd}/INE/…`.
+
+- **`join_social_ES(gdf, wd, n_years=5, datasets=None, use_CAT_files=False)`** —
+  adds `so__{indicator}_{year}` columns (`so__` prefix, snake_case indicator,
+  year as a suffix) for the most recent
+  `n_years` of each dataset in `ALL_DATASETS` (`atlas`, `population`,
+  `education`, `rental`, `price`, `electricity`), plus — when
+  `use_CAT_files=True` and selected — the Essential Characteristics downscaling.
+- **`join_essential_characteristics(gdf, wd)`** — downscales the INE *Essential
+  Characteristics of Population and Households* survey to building level (needs
+  the CAT-based `br__*` columns), adding English-keyed `ec__*` proportion
+  columns. The survey is published only for larger municipalities.
+- **`rename_ec_columns(df)` / `translate_ec_column()` / `ec_column_rename_map()`**
+  — Spanish→English snake_case translation for the `ec__*` columns (applied
+  automatically inside the merge; the helper is for pre-existing Spanish frames).
+
 ## 🌤️ weather.py — climate data → EPW
 
 Nearest-cell ERA5-Land extraction (with coastal fallback) feeding degree-day
@@ -86,6 +119,13 @@ statistics and cached per-year EPW files:
   and temperature/humidity/wind/solar summaries.
 - **`municipality_epw(era5_dir, epw_dir, lat, lon, year, ...)`** — path to a
   cached EnergyPlus EPW file (built on demand).
+- **`join_weather(gdf, era5_dir, years=5, ...)`** — the `merge(weather_layer=True)`
+  orchestrator: snaps every building to its nearest ERA5-Land cell and adds annual
+  `we__{indicator}_{year}` columns (`WEATHER_INDICATORS`).
+- **`load_ERA5Land(...)`** — gathers ERA5-Land with the **ARCO analysis-ready Zarr**
+  stores first (`_load_ARD`, no CDS queue; `HC_ERA5_ARD=0` to disable) and the classic
+  `cdsapi` retrieve (GRIB/CSV) as fallback; the grid extent adapts to the requested
+  province.
 
 ## 🗄️ _db.py — DuckDB persistence (internal)
 

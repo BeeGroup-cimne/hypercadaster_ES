@@ -1240,9 +1240,9 @@ def _safe(s):
 
 def _address_xy(row):
     """(x, y) of the building's address point in the source CRS (EPSG:25831),
-    used to anchor entrance doors. ``address_location`` is a list of Points;
-    falls back to the footprint centroid. Returns None if nothing usable."""
-    addr = row.get("address_location")
+    used to anchor entrance doors. ``postal_addresses_location`` is a list of
+    Points; falls back to the footprint centroid. Returns None if nothing usable."""
+    addr = row.get("postal_addresses_location")
     pt = None
     if addr is not None:
         seq = list(addr) if hasattr(addr, "__iter__") and not hasattr(addr, "geom_type") else [addr]

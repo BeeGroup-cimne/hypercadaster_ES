@@ -12,8 +12,10 @@ A comprehensive Python library for downloading, processing, and analyzing Spanis
 
 ### Key Features
 
-- 🏘️ **Comprehensive Cadastral Data Access**: Download building, parcel, and address data from Spanish cadastral services
+- 🏘️ **Comprehensive Cadastral Data Access**: Download building and parcel data from the Spanish Cadastre, and nationwide address points from CartoCiudad (CNIG)
 - 🗺️ **Multi-source Data Integration**: Merge with census tracts, postal codes, elevation models, and OpenStreetMap data
+- 🧮 **Socioeconomic Enrichment**: INE indicators via `social_ES` (income atlas, population, education, rental & housing prices, electricity) joined per building, plus per-building Essential-Characteristics downscaling
+- 🌦️ **Weather Enrichment**: Annual ERA5-Land climate indicators per building (heating/cooling degree days, precipitation, solar irradiation, temperature, humidity, wind) via `merge(weather_layer=True)`, gathered from the Copernicus analysis-ready (ARCO) Zarr stores
 - 🏗️ **Advanced Building Analysis**: Geometric inference, floor footprint calculation, building space classification, shadow analysis
 - 📊 **Orientation & Environmental Analysis**: Building orientation analysis, street relationships, shadow calculations, terrain analysis
 - 🔌 **External Tool Integration**: Export capabilities for building energy simulation tools (EnergyPlus via eppy+geomeppy)
@@ -98,6 +100,8 @@ For detailed installation instructions and advanced examples, see [Installation 
 - **CAT Files Support**: Detailed building space classification from official cadastral CAT format
 - **Energy Simulation Ready**: Export formats compatible with building energy simulation tools (EnergyPlus IDF via hc.energy.build_energy_model)
 - **POI Proximity Analysis**: Points of interest from OpenStreetMap with distance-based indicators
+- **Socioeconomic Layer**: INE indicators via `social_ES` joined at the finest geographic level (`merge(social_ES_layer=True)`), with English-keyed `ec__*` Essential-Characteristics downscaling when CAT files are used
+- **Weather Layer**: Annual ERA5-Land climate indicators per building (`merge(weather_layer=True)`) — degree days, precipitation, irradiation, temperature, humidity, wind — via the Copernicus analysis-ready (ARCO) Zarr stores with `cdsapi` fallback
 - **Commercial Premises Analysis**: Barcelona-specific ground floor commercial data
 
 ## 👥 Authors & Contributors

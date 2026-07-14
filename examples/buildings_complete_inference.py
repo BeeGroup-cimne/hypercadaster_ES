@@ -62,7 +62,6 @@ for i, municipality in enumerate(cadaster_codes, 1):
         plot_zones_ratio=0.02,          # Plot 2% of zones for visualization
         use_CAT_files=True,             # Use detailed CAT format files for space analysis
         CAT_files_rel_dir="cadaster/CAT_files",   # Directory containing CAT files
-        compact_addresses=True,
         pois_layer=True,
         force_update=force_update,              # wipe central DB rows + cache shards for this code
     )

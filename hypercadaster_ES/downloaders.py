@@ -1,5 +1,8 @@
 import sys
 import gzip
+import re
+import html
+import unicodedata
 import zipfile
 import geopandas as gpd
 import os
@@ -320,14 +323,56 @@ def download_census_tracts(census_tracts_dir, year):
             return
 
 
+def _download_inspire_zip(dest_dir, file_name, url):
+    """Download an INSPIRE municipality zip, working around a Catastro feed bug.
+
+    Municipalities whose name contains a special character (e.g. the ``Ç`` in
+    ``SANT LLORENÇ DE MORUNYS``) are published in the ATOM feed with that
+    character rendered as an extra space, so the enclosure URL points at a
+    directory that does not exist and the server answers with an HTML
+    "página no encontrada" page instead of the zip. The real directory simply
+    drops the offending character (leaving a single space), so if the feed URL
+    does not yield a valid zip we retry with runs of spaces collapsed. The first
+    candidate that downloads to a valid zip is kept; a persistent failure is
+    logged (the municipality is then skipped downstream).
+
+    Returns True if a valid zip was obtained.
+    """
+    candidates = [url]
+    collapsed = re.sub(r" {2,}", " ", url)
+    if collapsed != url:
+        candidates.append(collapsed)
+    dest = os.path.join(dest_dir, file_name)
+    for cand in candidates:
+        download_file(dir=dest_dir, url=cand, file=file_name)
+        if os.path.exists(dest) and zipfile.is_zipfile(dest):
+            return True
+        # Not a valid zip (soft-404 HTML page or a partial file): discard so the
+        # next candidate — or a future re-run — is not skipped by skip_if_exists.
+        if os.path.exists(dest):
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+    sys.stderr.write(
+        f"\nWarning: could not download a valid zip for {file_name} "
+        f"(tried {len(candidates)} URL variant(s)); municipality will be skipped\n")
+    return False
+
+
 def cadaster_downloader(cadaster_dir, cadaster_codes=None):
     """Download INSPIRE-harmonised cadastral data from the Spanish Catastro.
 
-    Fetches the three INSPIRE layers — parcels, addresses and buildings — for
-    each requested municipality, saving per-municipality zips under
-    ``{cadaster_dir}/{layer}/zip/`` and unzipping them to ``.../unzip/``.
-    Municipalities already present are skipped, so re-runs only fetch what is
-    missing.
+    Fetches the INSPIRE parcels and buildings layers for each requested
+    municipality, saving per-municipality zips under ``{cadaster_dir}/{layer}/zip/``
+    and unzipping them to ``.../unzip/``. Municipalities already present are
+    skipped, so re-runs only fetch what is missing.
+
+    .. note::
+        The INSPIRE **Addresses** layer (``ES.SDGC.AD``) is no longer downloaded
+        here: addresses now come from CartoCiudad (see
+        :func:`cartociudad_downloader`). The parcels and buildings layers are
+        still required for building geometry, parcel geometry and inference.
 
     Parameters
     ----------
@@ -343,7 +388,9 @@ def cadaster_downloader(cadaster_dir, cadaster_codes=None):
     """
     inspire_dict = {
         "parcels": "https://www.catastro.hacienda.gob.es/INSPIRE/CadastralParcels/ES.SDGC.CP.atom.xml",
-        "address": "https://www.catastro.hacienda.gob.es/INSPIRE/Addresses/ES.SDGC.AD.atom.xml",
+        # Deprecated: addresses are now sourced from CartoCiudad, not the INSPIRE
+        # Address feed. See cartociudad_downloader / mergers.get_cartociudad_address.
+        # "address": "https://www.catastro.hacienda.gob.es/INSPIRE/Addresses/ES.SDGC.AD.atom.xml",
         "buildings": "https://www.catastro.hacienda.gob.es/INSPIRE/buildings/ES.SDGC.BU.atom.xml"
     }
     for k, v in inspire_dict.items():
@@ -362,12 +409,191 @@ def cadaster_downloader(cadaster_dir, cadaster_codes=None):
                 sys.stderr.flush()
                 sys.stderr.write(f"\r\t{municipality['name']}")
                 sys.stderr.flush()
-                download_file(dir=f"{cadaster_dir}/{k}/zip/",
-                              url=municipality['url'],
-                              file=f"{municipality['url'].split('.')[-2]}.zip")
+                _download_inspire_zip(
+                    dest_dir=f"{cadaster_dir}/{k}/zip/",
+                    file_name=f"{municipality['url'].split('.')[-2]}.zip",
+                    url=municipality['url'])
         sys.stderr.write("\r" + " " * 60)
         if nf:
             utils.unzip_directory(f"{cadaster_dir}/{k}/zip/", f"{cadaster_dir}/{k}/unzip/")
+
+
+# ---------------------------------------------------------------------------
+# CartoCiudad addresses (CNIG Centro de Descargas)
+# ---------------------------------------------------------------------------
+# CartoCiudad replaces the INSPIRE Address feed as the address source. It is
+# distributed as one GeoPackage per province through the CNIG download center.
+# The public download page is JavaScript-driven, but the three underlying
+# endpoints are stable and require no authentication for a single province:
+#   1. POST archivosSerie  (codSerie, numPagina=0) -> HTML listing ALL 52 province
+#      files, each row carrying its province display name and `sec` id. The listed
+#      file is always the most recent monthly edition. (The `codProvincia` filter
+#      exists but its codes do NOT match INE province codes — e.g. 44 returns
+#      Cuenca, 50 returns Teruel — so we match by province name instead.)
+#   2. POST initDescargaDir (secuencial=<sec>)     -> JSON {secuencialDescDir}.
+#   3. POST descargaDir     (secDescDirLA=<id>)    -> the province .zip
+#      (wrapping a .gpkg with a `portalpk_publi` address-point layer).
+CARTOCIUDAD_BASE_URL = "https://centrodedescargas.cnig.es/CentroDescargas"
+CARTOCIUDAD_COD_SERIE = "02122"
+# The download center drops connections from clients without a browser-like
+# User-Agent, so a session with one is reused across the three requests.
+CARTOCIUDAD_USER_AGENT = "Mozilla/5.0 (compatible; hypercadaster_ES)"
+# INE 2-digit province code -> province name as CNIG spells it in the listing.
+# Matching is done on a normalised form (accents/entities/case/punctuation
+# stripped), so the exact spelling here only needs to be close.
+CARTOCIUDAD_PROVINCE_NAMES = {
+    "01": "Araba/Álava", "02": "Albacete", "03": "Alicante/Alacant", "04": "Almería",
+    "05": "Ávila", "06": "Badajoz", "07": "Balears, Illes", "08": "Barcelona",
+    "09": "Burgos", "10": "Cáceres", "11": "Cádiz", "12": "Castellón/Castelló",
+    "13": "Ciudad Real", "14": "Córdoba", "15": "A Coruña", "16": "Cuenca",
+    "17": "Girona", "18": "Granada", "19": "Guadalajara", "20": "Gipuzkoa",
+    "21": "Huelva", "22": "Huesca", "23": "Jaén", "24": "León", "25": "Lleida",
+    "26": "La Rioja", "27": "Lugo", "28": "Madrid", "29": "Málaga", "30": "Murcia",
+    "31": "Navarra", "32": "Ourense", "33": "Asturias", "34": "Palencia",
+    "35": "Las Palmas", "36": "Pontevedra", "37": "Salamanca",
+    "38": "Santa Cruz de Tenerife", "39": "Cantabria", "40": "Segovia",
+    "41": "Sevilla", "42": "Soria", "43": "Tarragona", "44": "Teruel",
+    "45": "Toledo", "46": "Valencia/València", "47": "Valladolid", "48": "Bizkaia",
+    "49": "Zamora", "50": "Zaragoza", "51": "Ceuta", "52": "Melilla",
+}
+
+
+def _normalize_province_name(name):
+    """Normalise a province name for matching (drop accents/entities/punctuation)."""
+    name = html.unescape(name)
+    name = unicodedata.normalize("NFKD", name)
+    name = "".join(c for c in name if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def _cartociudad_name_to_sec(session, timeout=60):
+    """Return a ``{normalised province name: sec}`` map from the CartoCiudad listing.
+
+    Fetches the full (all-provinces) ``archivosSerie`` listing and parses each row's
+    province display name and its ``detalleArchivo?sec=<id>``.
+    """
+    resp = session.post(
+        f"{CARTOCIUDAD_BASE_URL}/archivosSerie",
+        data={"codSerie": CARTOCIUDAD_COD_SERIE, "numPagina": "0"},
+        headers={"X-Requested-With": "XMLHttpRequest"},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    name2sec = {}
+    for row in re.split(r"<tr[ >]", resp.text):
+        mname = re.search(r'txtLeftCenterTablas">([^<]+)</div>', row)
+        msec = re.search(r"detalleArchivo\?sec=(\d+)", row)
+        if mname and msec:
+            name2sec[_normalize_province_name(mname.group(1))] = msec.group(1)
+    return name2sec
+
+
+def cartociudad_downloader(cartociudad_dir, province_codes, timeout=120, max_retries=3):
+    """Download the most recent CartoCiudad address GeoPackage per province.
+
+    For each 2-digit province code, resolves the current file on the CNIG
+    download center, downloads and unzips it, and stores the address GeoPackage
+    as ``{cartociudad_dir}/{province_code}.gpkg``. Provinces whose gpkg already
+    exists are skipped, so re-runs only fetch what is missing. Failures for a
+    single province are logged to stderr rather than raised, so a multi-province
+    run continues past a dead resource.
+
+    Parameters
+    ----------
+    cartociudad_dir : str
+        Destination directory (created if missing).
+    province_codes : list[str]
+        2-digit province codes (e.g. ``["08", "25"]``).
+    timeout : int, default 120
+        Per-request timeout in seconds.
+    max_retries : int, default 3
+        Attempts before giving up on transient failures for a province.
+
+    Returns
+    -------
+    None
+    """
+    os.makedirs(cartociudad_dir, exist_ok=True)
+    # Provinces we still need (skip those already downloaded).
+    needed = [p for p in province_codes
+              if not os.path.exists(os.path.join(cartociudad_dir, f"{p}.gpkg"))]
+    if not needed:
+        return
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": CARTOCIUDAD_USER_AGENT})
+    try:
+        name2sec = _cartociudad_name_to_sec(session, timeout=timeout)
+    except Exception as e:
+        sys.stderr.write(f"Error listing CartoCiudad files: {e}\n")
+        return
+
+    for province_code in needed:
+        gpkg_path = os.path.join(cartociudad_dir, f"{province_code}.gpkg")
+        sys.stderr.write(f"\nDownloading CartoCiudad addresses for province {province_code}\n")
+        prov_name = CARTOCIUDAD_PROVINCE_NAMES.get(province_code)
+        sec = name2sec.get(_normalize_province_name(prov_name)) if prov_name else None
+        if sec is None:
+            sys.stderr.write(
+                f"Warning: no CartoCiudad file found for province {province_code} "
+                f"({prov_name}); its addresses will be unavailable\n")
+            continue
+        for attempt in range(1, max_retries + 1):
+            zip_path = gpkg_path + ".zip.part"
+            try:
+
+                init = session.post(
+                    f"{CARTOCIUDAD_BASE_URL}/initDescargaDir",
+                    data={"secuencial": sec},
+                    headers={"X-Requested-With": "XMLHttpRequest"},
+                    timeout=timeout,
+                )
+                init.raise_for_status()
+                sec_desc = init.json().get("secuencialDescDir")
+                if not sec_desc:
+                    raise requests.exceptions.RequestException("no secuencialDescDir in response")
+
+                with session.post(
+                    f"{CARTOCIUDAD_BASE_URL}/descargaDir",
+                    data={"secDescDirLA": sec_desc},
+                    stream=True,
+                    timeout=timeout,
+                ) as resp:
+                    if resp.status_code in (429, 500, 502, 503, 504):
+                        raise requests.exceptions.RequestException(f"transient status {resp.status_code}")
+                    resp.raise_for_status()
+                    with open(zip_path, "wb") as fh:
+                        for chunk in resp.iter_content(chunk_size=1 << 20):
+                            if chunk:
+                                fh.write(chunk)
+
+                # The zip wraps a single .gpkg (plus a leeme.txt); extract it.
+                with zipfile.ZipFile(zip_path) as zf:
+                    gpkg_member = next(
+                        (m for m in zf.namelist() if m.lower().endswith(".gpkg")), None)
+                    if gpkg_member is None:
+                        raise RuntimeError("no .gpkg inside CartoCiudad zip")
+                    with zf.open(gpkg_member) as src, open(gpkg_path, "wb") as dst:
+                        while True:
+                            block = src.read(1 << 20)
+                            if not block:
+                                break
+                            dst.write(block)
+                break
+            except Exception as e:
+                if attempt == max_retries:
+                    sys.stderr.write(
+                        f"Error downloading CartoCiudad province {province_code} "
+                        f"after {max_retries} attempts: {e}\n")
+                else:
+                    time.sleep(min(2 ** attempt, 30))
+            finally:
+                if os.path.exists(zip_path):
+                    try:
+                        os.remove(zip_path)
+                    except OSError:
+                        pass
+
 
 def read_dataspace_credentials(client_name="hypercadaster_ES", filepath=os.path.expanduser("~/.dataspaces")):
     """
@@ -1793,6 +2019,113 @@ street_type_names = {
     "AR": "ÁREA/ARRABAL",
 }
 street_type_names = PrettyDict(street_type_names)
+
+
+# ---------------------------------------------------------------------------
+# CartoCiudad street-type normalisation
+# ---------------------------------------------------------------------------
+# CartoCiudad's ``tipo_vial`` is inconsistent: it mixes the canonical Catastro
+# names with regional-language variants (Catalan/Valencian/Galician/Basque/
+# Aranese/Asturian/Aragonese), bilingual "SPANISH / REGIONAL" forms, multi-value
+# "X, Y" descriptors, abbreviations, typos and opaque short codes. This normaliser
+# maps each value to the canonical Catastro full name where one exists; genuine
+# Spanish names with no Catastro equivalent (BULEVAR, AUTOPISTA, DISEMINADO,
+# PARAJE, ...) are kept as-is; unrecognised short codes become None. Built from a
+# full scan of all 52 provinces (see the mapping-review CSV for provenance).
+_STREET_TYPE_CANONICAL = {v.split("/")[0].strip() for v in street_type_names.values()} | {"ARRABAL"}
+
+
+def _strip_accents(s):
+    s = unicodedata.normalize("NFKD", s)
+    return "".join(c for c in s if not unicodedata.combining(c))
+
+
+_STREET_TYPE_ACCENTLESS = {_strip_accents(n): n for n in _STREET_TYPE_CANONICAL}
+
+# Regional-language / typo / abbreviation / user-flagged variant -> canonical name.
+# (Genuine Spanish synonyms with no Catastro type are intentionally absent -> kept.)
+CARTOCIUDAD_STREET_TYPE_REGIONAL = {
+    # Catalan / Valencian
+    "CARRER": "CALLE", "AVINGUDA": "AVENIDA", "PLAÇA": "PLAZA", "PLACETA": "PLAZA",
+    "RAVAL": "ARRABAL", "TRAVESSERA": "TRAVESIA", "TRAVESSIA": "TRAVESIA",
+    "BAIXADA": "BAJADA", "PUJADA": "SUBIDA", "BLOC": "BLOQUE", "MASIA": "MASÍA",
+    "MASIES": "MASÍA", "MASIAS": "MASÍA", "TORRENT": "TORRENTE", "MOLL": "MUELLE",
+    "ILLA": "MANZANA", "RACO": "RINCÓN", "RACÓ": "RINCÓN", "DRECERA": "SENDA",
+    "CORRIOL": "SENDA", "PLATJA": "PLAYA", "VEINAT": "BARRIO", "VEÏNAT": "BARRIO",
+    "PARATGE": "PARAJE", "BARRANC": "BARRANCO", "CIRCUMVAL·LACIO": "CIRCUNVALACION",
+    "COMPLEX": "COMPLEJO", "CARRERO": "CALLEJA", "CALEXON": "CALLEJA", "DISSEMINAT": "DISEMINADO",
+    # Aranese
+    "BAISHADA": "BAJADA",
+    # Galician
+    "CORREDOIRA": "CAMINO", "ESTRADA": "CARRETERA", "SERVENTIA": "SENDA",
+    "PRACIÑA": "PLAZA", "RUELA": "CALLEJA", "RUEIRO": "BARRIO",
+    # Asturian / Aragonese / dialectal
+    "CALEYA": "CALLEJA", "CALLIZO": "CALLEJA", "BELENA": "CALLEJA", "BARREDUELA": "CALLEJA",
+    # Basque
+    "KALEA": "CALLE", "KALE": "CALLE", "KARRIKA": "CALLE", "KALEXKA": "CALLEJA",
+    "ETORBIDEA": "AVENIDA", "ENPARANTZA": "PLAZA", "EMPARANTZA": "PLAZA", "AUZO": "BARRIO",
+    "AUZOA": "BARRIO", "BIDE": "CAMINO", "BIDEA": "CAMINO", "IBILBIDE": "PASEO",
+    "IBILBIDEA": "PASEO", "ERREPIDE": "CARRETERA", "ERREPIDEA": "CARRETERA",
+    "MENDI": "MONTE", "ERREKA": "ARROYO", "ALDAPA": "CUESTA", "ZEHARKALEA": "TRAVESIA",
+    "ZEARKALETA": "TRAVESIA", "INGURUA": "ZONA",
+    # typos / abbreviations / plural / user-flagged
+    "AVENGUDA": "AVENIDA", "CASER": "CASERIO", "POLG": "POLIGONO", "CLLJN": "CALLEJÓN",
+    "CANADA": "CAÑADA", "JARDIN": "JARDINES", "CAMPA": "CAMPO", "PARTICULAR": "PARTIDA",
+    "DISEMINADOS": "DISEMINADO",
+}
+# Junk / meaningless values -> None.
+_STREET_TYPE_JUNK = {"", "NONE", "GENERICA", "DESCONOCIDO", "DE", "DE LA", "DE LES"}
+# Best-effort maps for a couple of guessable short codes; the rest -> None.
+_STREET_TYPE_SHORT_CODE_MAP = {"LU": "LUGAR", "ET": "AVENIDA"}
+# Opaque short codes observed across the 52 provinces -> None (no readable type).
+_STREET_TYPE_UNKNOWN_CODES = {
+    "AF", "AI", "AJ", "AO", "AT", "BI", "BT", "BU", "CB", "CC", "CD", "CE", "CK", "CV",
+    "DA", "DH", "DI", "EC", "GJ", "HF", "HG", "HI", "ID", "IT", "JA", "KA", "KL", "KS",
+    "KT", "LA", "LC", "LF", "LT", "MD", "MO", "MU", "NU", "P", "PE", "PV", "QA", "QI",
+    "QJ", "QL", "QN", "RE", "RI", "RN", "RO", "SG", "UN", "VC", "VO", "ZK", "ZU", "CLYON",
+}
+
+
+def _resolve_street_type_token(p):
+    if p in CARTOCIUDAD_STREET_TYPE_REGIONAL:
+        return CARTOCIUDAD_STREET_TYPE_REGIONAL[p]
+    if p in _STREET_TYPE_CANONICAL:
+        return p
+    if p in _STREET_TYPE_ACCENTLESS:            # accent restore: VIA->VÍA, RINCON->RINCÓN
+        return _STREET_TYPE_ACCENTLESS[p]
+    if p in street_type_names:                  # raw Catastro acronym -> full name
+        return street_type_names[p].split("/")[0].strip()
+    return None
+
+
+def normalize_cartociudad_street_type(value):
+    """Normalise a CartoCiudad ``tipo_vial`` value to a canonical street-type name.
+
+    Maps regional-language variants, bilingual ``SPANISH / REGIONAL`` forms,
+    ``X, Y`` descriptors, abbreviations and typos to the canonical Catastro full
+    name; keeps genuine Spanish names that have no Catastro equivalent; and returns
+    None for junk and unrecognised short codes. See
+    :data:`CARTOCIUDAD_STREET_TYPE_REGIONAL` and the mapping-review CSV for details.
+    """
+    if value is None:
+        return None
+    s = " ".join(str(value).upper().split())
+    if s in _STREET_TYPE_JUNK:
+        return None
+    primary = s.split("/")[0].strip()                              # bilingual: keep Spanish side
+    parts = [p.strip() for p in primary.split(",") if p.strip()]   # descriptor: prefer the cadaster part
+    if not parts:
+        return None
+    for p in parts:
+        r = _resolve_street_type_token(p)
+        if r is not None:
+            return r
+    first = parts[0]
+    if first in _STREET_TYPE_SHORT_CODE_MAP:
+        return _STREET_TYPE_SHORT_CODE_MAP[first]
+    if first in _STREET_TYPE_UNKNOWN_CODES:
+        return None
+    return first
 """Cadastral two-letter street-type acronym → full Spanish literal."""
 
 # 16 - Registro de reparto de elementos comunes
