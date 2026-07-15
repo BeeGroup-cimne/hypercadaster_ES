@@ -22,7 +22,9 @@ hypercadaster_es.egg-info/dependency_links.txt
 hypercadaster_es.egg-info/requires.txt
 hypercadaster_es.egg-info/top_level.txt
 tests/test_aggregation.py
+tests/test_agricultural_archetype.py
 tests/test_cat_cache.py
+tests/test_cat_empty_schema.py
 tests/test_code_normalisation.py
 tests/test_codes.py
 tests/test_dem_tiles.py
@@ -31,4 +33,6 @@ tests/test_geometry.py
 tests/test_import_surface.py
 tests/test_live_smoke.py
 tests/test_social.py
+tests/test_theoretical_cat_spaces.py
 tests/test_weather.py
+tests/test_zero_floor_buildings.py
