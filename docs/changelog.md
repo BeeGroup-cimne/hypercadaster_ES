@@ -4,6 +4,78 @@ All notable changes to hypercadaster_ES will be documented in this file. The for
 
 ## [Unreleased]
 
+## [1.2.3] - 2026-07-15
+
+### 🐛 Whole cadastral zones lost when a building had no CAT record
+
+A building absent from the CAT file (rural parcels, undeveloped "solares")
+reached `aggregate_CAT_file_building_spaces` with an empty slice. pandas'
+`groupby(...).apply(...)` never invokes the aggregation on an empty frame and
+passes the *input* columns through instead, so the result carried no `br__*`
+column at all and the downstream aggregation raised
+`KeyError: ['br__building_spaces_by_floor']`. That exception reached the
+zone-level handler, so **a single CAT-less building discarded every building in
+its cadastral zone**. On Lleida (`25900`) this silently dropped **39 of 1086
+zones — 4540 buildings, ~29% of the municipality**.
+
+- `aggregate_CAT_file_building_spaces` now returns empty frames carrying the
+  full column schema (declared with dtypes, so an empty frame stays
+  concat-compatible instead of degrading numeric columns to `object`).
+- The consumer in `process_zone` now reads the per-building aggregation cache
+  through `_get_agg_CAT`, honouring the `None` it stores for buildings with no
+  CAT rows rather than treating it as a cache miss and recomputing on the empty
+  slice.
+
+### 🏚️ Theoretical building space for buildings absent from the CAT file
+
+Such buildings (1426 of 13619 in Lleida — 1392 `2_agriculture`, 31 with no
+usage, 2 residential, 1 industrial) had no building spaces at all: every
+CAT-derived `br__*` column came out NaN, `br__thermal_zones` was empty and no
+energy model could be built. `building_inference.add_theoretical_CAT_spaces`
+now gives each one a single theoretical space:
+
+- `building_space_reference` == `building_reference` (the building *is* its only
+  space);
+- use type mapped from the cadaster `building_use` (`2_agriculture` →
+  `Agricultural`, …), defaulting to `Unknown`;
+- area from the cadaster's official built area (`building_area`, which equals
+  the CAT total built area across floors for buildings that do have CAT data),
+  falling back to the footprint area; all private, no communals;
+- effective year from `year_of_construction`.
+
+Injected in `mergers` *after* the CAT cache read/write, so `cat_building_spaces`
+stays a pure function of the CAT files. Undeveloped-parcel supplements
+("solares", no geometry) are left alone.
+
+### 🚜 Agricultural buildings model as uninsulated warehouses
+
+- New `agricultural` use category: same assumptions as a warehouse (no people,
+  no equipment, no HVAC, vehicle door) but **uninsulated whatever the year**
+  (new `archetype_envelope.uninsulated`, which omits the wall/roof/floor U
+  targets so the solver drops the `INS` layer) and **very leaky**
+  (`infil_ach: 5.0`). Kept out of the `parking` bucket so it does not inherit
+  parking's vehicle-door *sizing* semantics elsewhere.
+- `kind='non_occupied'` for agricultural zones across all five classifiers
+  (`building_inference`, `mergers`, `utils`, and two in `energy`).
+- `_dominant_use_type` now falls back to non-occupied zones when a building has
+  no occupied ones — a barn's only zone is non-occupied, and it would otherwise
+  resolve to the generic `other` archetype.
+
+### 🏗️ BuildingParts declaring no floors at all
+
+`n_floors_above_ground == 0` yields `range(0)` — no floor footprints — so the
+building dropped out of the per-floor analysis and, downstream, out of the CAT
+integration (gated on a non-empty per-floor frame). **55 buildings in Lleida
+lost every CAT attribute this way, 48 of them with real CAT data**, including
+residential buildings with dwellings. Such a part is now read as a single
+storey, and `_augment_building_floors_from_cat` then rebuilds the floors the CAT
+file reports, buffered to their CAT area.
+
+Deliberately narrow — only when a building has no floors above **and** below:
+a 0-floor part *inside* a building that has floors is a canopy/porch (763 in
+Lleida) and stays excluded from the storeys, and the 1 underground-only
+structure gains no spurious ground floor.
+
 ## [1.2.2] - 2026-07-15
 
 ### ⚡ CAT attribute caches in the central DuckDB (big re-run speedup)

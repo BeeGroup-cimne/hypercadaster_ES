@@ -2849,13 +2849,15 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                             # is a pandas DataFrame here (sliced for this zone
                             # in process_building_parts so workers stay polars-
                             # free and can run under `fork` safely). Reuse the
-                            # aggregation cached during floor synthesis.
-                            agg_CAT = _agg_CAT_cache.get(building_reference)
+                            # aggregation cached during floor synthesis, which
+                            # returns None for buildings with no CAT rows at all
+                            # (rural parcels, undeveloped "solares"). Their empty
+                            # aggregation still carries the full column schema, so
+                            # the br__/sbr__ columns come out NaN for them instead
+                            # of going missing and taking the whole zone down.
+                            agg_CAT = _get_agg_CAT(building_reference)
                             if agg_CAT is None:
-                                agg_CAT = aggregate_CAT_file_building_spaces(
-                                    building_CAT_df=buildings_CAT[
-                                        buildings_CAT["building_reference"] == building_reference
-                                    ])
+                                agg_CAT = aggregate_CAT_file_building_spaces(None)
 
                             building_gdf_by_floor = building_gdf_by_floor.drop(columns="geometry")
 
@@ -3402,6 +3404,71 @@ def parse_horizontal_division_buildings_CAT_files(cadaster_code, CAT_files_dir):
     return building_spaces_detailed
 
 
+# Column schema (name -> dtype) of the two frames
+# ``aggregate_CAT_file_building_spaces`` returns. Needed explicitly because
+# pandas' ``groupby(...).apply(...)`` never invokes the aggregation function on
+# an empty frame and passes the *input* columns through instead — so a building
+# with no CAT record (rural parcels, undeveloped "solares") would otherwise
+# yield frames without any ``br__`` column and blow up the whole cadastral zone
+# downstream. Dtypes are declared so an empty frame stays concat-compatible
+# with a populated one instead of degrading numeric columns to ``object``.
+# ``tests/test_cat_empty_schema.py`` pins these against the non-empty output.
+_AGG_CAT_BY_FLOORS_SCHEMA = {
+    "floor_number": "Int32",
+    "use_type": object,
+    "building_reference": object,
+    "br__building_spaces_by_floor": "int64",
+    "br__mean_building_space_area_with_communals_by_floor": float,
+    "br__mean_building_space_area_without_communals_by_floor": float,
+    "br__mean_building_space_communal_area_by_floor": float,
+    "br__mean_building_space_effective_year_by_floor": float,
+    "br__mean_building_space_category_by_floor": float,
+    "br__mean_building_space_economic_value_by_floor": float,
+    "br__area_with_communals_by_floor": float,
+    "br__area_without_communals_by_floor": float,
+    "br__communal_area_by_floor": float,
+    "br__economic_value_by_floor": float,
+    "br__relative_area_with_communals_by_floor": float,
+    "br__relative_area_without_communals_by_floor": float,
+    "br__relative_communal_area_by_floor": float,
+}
+
+_AGG_CAT_BUILDING_SCHEMA = {
+    "use_type": object,
+    "building_reference": object,
+    "br__building_spaces": "int64",
+    "br__floors": object,
+    "br__mean_building_space_area_with_communals": float,
+    "br__mean_building_space_area_without_communals": float,
+    "br__mean_building_space_communal_area": float,
+    "br__mean_building_space_effective_year": float,
+    "br__mean_building_space_category": float,
+    "br__mean_building_space_economic_value": float,
+    "br__area_with_communals": float,
+    "br__area_without_communals": float,
+    "br__communal_area": float,
+    "br__economic_value": float,
+    "br__relative_area_with_communals": float,
+    "br__relative_area_without_communals": float,
+    "br__relative_communal_area": float,
+    "br__building_spaces_reference": object,
+    "br__building_spaces_postal_address": object,
+    "br__building_spaces_inner_address": object,
+    "br__building_spaces_floor_number": object,
+    "br__building_spaces_floors": object,
+    "br__building_spaces_category": object,
+    "br__building_spaces_effective_year": object,
+    "br__building_spaces_area_without_communal": object,
+    "br__building_spaces_area_with_communal": object,
+    "br__building_spaces_economic_value": object,
+    "br__building_spaces_detailed_use_type": object,
+}
+
+
+def _empty_frame(schema):
+    return pd.DataFrame({col: pd.Series(dtype=dt) for col, dt in schema.items()})
+
+
 def aggregate_CAT_file_building_spaces(building_CAT_df):
     """
     Aggregate building space information from CAT file data.
@@ -3419,7 +3486,14 @@ def aggregate_CAT_file_building_spaces(building_CAT_df):
     --------
     dict[str, pandas.DataFrame]
         ``{"by_floors": ..., "building": ...}`` — both pandas DataFrames.
+        Empty input yields empty frames carrying the full column schema.
     """
+    if building_CAT_df is None or len(building_CAT_df) == 0:
+        return {
+            "by_floors": _empty_frame(_AGG_CAT_BY_FLOORS_SCHEMA),
+            "building": _empty_frame(_AGG_CAT_BUILDING_SCHEMA),
+        }
+
     df = building_CAT_df.copy()
 
     # Raw classify outputs include fractional markers (0.5 for ground floor,
@@ -3624,7 +3698,7 @@ def aggregate_CAT_file_building_spaces(building_CAT_df):
     }
 
 
-_NON_OCCUPIED_USE_KEYS = ("parking", "warehouse", "storage", "garage")
+_NON_OCCUPIED_USE_KEYS = ("parking", "warehouse", "storage", "garage", "agricultur")
 
 
 def _synthesize_thermal_zones(row):
@@ -3877,6 +3951,126 @@ def br_attributes_from_CAT(buildings_CAT):
     out = _strip_per_space_leak_columns(out)
     out = _dedup_br_building_spaces_lists(out)
     return out
+
+
+# Cadaster ``currentUse`` (INSPIRE Building layer) -> CAT inferred use type.
+# Only used to give a theoretical building space the building's main usage;
+# "Agricultural" mirrors the CAT 'Z' code already mapped in ``downloaders``,
+# and a missing usage falls back to "Unknown" (the bucket the area pivot in
+# ``mergers`` already uses for null use types).
+_CADASTER_USE_TO_CAT_USE = {
+    "1_residential": "Residential",
+    "2_agriculture": "Agricultural",
+    "3_industrial": "Industrial",
+    "4_1_office": "Offices",
+    "4_2_retail": "Commercial",
+    "4_3_publicServices": "Singular building",
+}
+_THEORETICAL_UNKNOWN_USE = "Unknown"
+
+
+def add_theoretical_CAT_spaces(buildings_CAT, building_gdf, cadaster_code):
+    """Give buildings absent from the CAT file a single theoretical space.
+
+    Rural/agricultural buildings exist in the INSPIRE Building layer but carry
+    no CAT construction record, so they have no building spaces at all: every
+    CAT-derived ``br__*`` column comes out NaN, ``br__thermal_zones`` is empty
+    and no energy model can be built for them (1426 of 13619 buildings in
+    Lleida — mostly ``2_agriculture``).
+
+    For each such building this appends one theoretical space to
+    ``buildings_CAT`` carrying the building's main usage, so the whole CAT
+    pipeline (area pivot, ``br__*`` aggregation, thermal zoning, EnergyPlus)
+    treats it like any other single-space building:
+
+    - ``building_space_reference`` == ``building_reference`` (the building *is*
+      its only space);
+    - use type mapped from the cadaster ``building_use`` via
+      ``_CADASTER_USE_TO_CAT_USE``, defaulting to ``"Unknown"``;
+    - area from the cadaster's own official built area (``building_area``),
+      which equals the CAT total built area across floors for buildings that
+      do have CAT data, falling back to the footprint area when it is absent
+      or zero. All of it is private area (no communals);
+    - effective year from ``year_of_construction`` so the energy archetypes
+      still have an age to work with.
+
+    Only the undeveloped-parcel supplements ("solares", added later in
+    ``mergers`` from CAT dataset 15) are left alone — they have no geometry and
+    are not buildings.
+
+    Parameters
+    ----------
+    buildings_CAT : polars.DataFrame or None
+        Per-space CAT rows; returned unchanged when None.
+    building_gdf : geopandas.GeoDataFrame
+        The INSPIRE Building layer (``building_reference``, ``building_use``,
+        ``building_area``, ``year_of_construction`` + geometry).
+    cadaster_code : str
+        Municipality code, written to the synthetic rows' ``cadaster_code``.
+
+    Returns
+    -------
+    polars.DataFrame
+        ``buildings_CAT`` with the theoretical spaces appended.
+    """
+    if buildings_CAT is None or building_gdf is None or len(building_gdf) == 0:
+        return buildings_CAT
+
+    known = set(buildings_CAT["building_reference"].unique().to_list())
+    missing = building_gdf[~building_gdf["building_reference"].isin(known)]
+    missing = missing[missing["building_reference"].notna()]
+    if missing.empty:
+        return buildings_CAT
+
+    # Official built area (already summed over floors); fall back to the
+    # footprint when the cadaster leaves it null or zero.
+    area = pd.to_numeric(missing.get("building_area"), errors="coerce")
+    fallback = missing.geometry.area
+    area = area.where(area.notna() & (area > 0), fallback).astype(float)
+
+    use = (missing["building_use"] if "building_use" in missing.columns
+           else pd.Series(index=missing.index, dtype=object))
+    use = use.map(lambda v: _CADASTER_USE_TO_CAT_USE.get(v, _THEORETICAL_UNKNOWN_USE)
+                  if v is not None and not (isinstance(v, float) and math.isnan(v))
+                  else _THEORETICAL_UNKNOWN_USE)
+
+    # None (not NaN) for the buildings with no construction year, so the value
+    # casts cleanly into CAT's integer year columns.
+    year = pd.to_numeric(missing.get("year_of_construction"), errors="coerce")
+    year = [None if pd.isna(v) else int(v) for v in year]
+
+    refs = missing["building_reference"].astype(str).tolist()
+    rows = pl.DataFrame({
+        "building_reference": refs,
+        # The building is its own single space.
+        "building_space_reference": refs,
+        # A real address is needed: the per-address floor compaction in
+        # aggregate_CAT_file_building_spaces groups on it and would drop the
+        # row (and lose its floor number) on a null key.
+        "building_space_address": refs,
+        "building_space_floor_name": ["00"] * len(refs),
+        "building_space_year": year,
+        "building_space_effective_year": year,
+        "building_space_total_area": area.to_numpy(),
+        "building_space_total_area_without_communal": area.to_numpy(),
+        "building_space_area_with_communal": area.to_numpy(),
+        "building_space_area_without_communal": area.to_numpy(),
+        "building_space_communal_area": [0.0] * len(refs),
+        "building_spaces_considered": [1] * len(refs),
+        "building_space_use_type": use.tolist(),
+        "building_space_detailed_use_type": use.tolist(),
+        "building_space_inferred_use_type": use.tolist(),
+        "cadaster_code": [str(cadaster_code)] * len(refs),
+    })
+
+    # Match the CAT schema exactly: null out the columns we do not synthesize
+    # and restore column order/dtypes so the concat is a plain vertical append.
+    for col, dtype in buildings_CAT.schema.items():
+        if col not in rows.columns:
+            rows = rows.with_columns(pl.lit(None).cast(dtype).alias(col))
+    rows = rows.select(buildings_CAT.columns).cast(dict(buildings_CAT.schema))
+
+    return pl.concat([buildings_CAT, rows], how="vertical")
 
 
 def undeveloped_parcels_from_CAT(cadaster_code, CAT_files_dir):

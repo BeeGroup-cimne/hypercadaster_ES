@@ -1091,13 +1091,29 @@ def calculate_floor_footprints_chunk(chunk_groups, only_exterior_geometry, min_h
 
         if by_floors==True:
             # Unique levels of floors
-            max_floor = int(gdf_['n_floors_above_ground'].dropna().max())
+            n_above = gdf_['n_floors_above_ground']
+            max_floor = int(n_above.dropna().max())
             min_floor = int(gdf_['n_floors_below_ground'].dropna().max())
+
+            # A building whose every part declares no floors at all — neither
+            # above nor below ground — still has a real BuildingPart footprint.
+            # Taken literally it yields range(0) == no floors, so no footprints,
+            # and the building drops out of the whole per-floor analysis (and,
+            # downstream, out of the CAT integration). Read it as a single
+            # storey instead; the CAT floor count then rebuilds the rest via
+            # ``_augment_building_floors_from_cat``.
+            # Deliberately narrow: a 0-floor part *inside* a building that has
+            # floors is a canopy/porch and must stay excluded from the storeys,
+            # and an underground-only structure must not gain a ground floor.
+            if max_floor == 0 and min_floor == 0:
+                n_above = n_above.fillna(0).where(lambda s: s > 0, 1)
+                max_floor = 1
+
             unique_floors = list(range(max_floor))
             unique_underground_floors = list(range(1,min_floor+1))
 
             for floor in unique_floors:
-                floor_geometries = gdf_[gdf_['n_floors_above_ground'] >= (floor + 1)].reset_index(drop=True)
+                floor_geometries = gdf_[n_above >= (floor + 1)].reset_index(drop=True)
                 try:
                     unioned_geometry = union_geoseries_with_tolerance(floor_geometries.geometry,
                                                                       gap_tolerance=gap_tolerance, resolution=16)
@@ -6469,7 +6485,7 @@ def _thermal_zone_render_kind(z):
     if k in ('communal', 'non_occupied', 'occupied'):
         return k
     ut = str(z.get('use_type', '')).lower()
-    if any(t in ut for t in ('parking', 'warehouse', 'storage', 'garage')):
+    if any(t in ut for t in ('parking', 'warehouse', 'storage', 'garage', 'agricultur')):
         return 'non_occupied'
     det = ' '.join(str(d) for d in (z.get('detailed_use_types') or [])).lower()
     if 'pool' in det or z.get('source') == 'other_construction':

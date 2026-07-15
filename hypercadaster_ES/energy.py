@@ -49,7 +49,7 @@ from hypercadaster_ES import utils
 
 # Use types whose zones are not occupied by people and are placed as a compact
 # end block rather than wrapped around the floor.
-_PARKING_USE_KEYS = ("parking", "warehouse", "storage", "garage")
+_PARKING_USE_KEYS = ("parking", "warehouse", "storage", "garage", "agricultur")
 
 # --------------------------------------------------------------------------- #
 # Configuration — all EnergyPlus model defaults live in energy_config.yaml
@@ -1286,18 +1286,29 @@ def _building_lonlat(row, crs="EPSG:25831"):
 def _dominant_use_type(zones):
     """Dominant occupied use type across spaces, weighted by floor area —
     drives the building archetype's use category."""
-    by_use = {}
-    for s in zones:
-        if s.get("kind") and s["kind"] != "occupied":
-            continue
-        ut = s.get("use_type")
-        area = 0.0
-        for poly in (s.get("floor_polys") or {}).values():
-            try:
-                area += float(poly.area)
-            except Exception:
-                pass
-        by_use[ut] = by_use.get(ut, 0.0) + area
+    def _tally(only_occupied):
+        by_use = {}
+        for s in zones:
+            kind = s.get("kind")
+            if only_occupied:
+                if kind and kind != "occupied":
+                    continue
+            elif kind == "communal":
+                continue
+            ut = s.get("use_type")
+            area = 0.0
+            for poly in (s.get("floor_polys") or {}).values():
+                try:
+                    area += float(poly.area)
+                except Exception:
+                    pass
+            by_use[ut] = by_use.get(ut, 0.0) + area
+        return by_use
+
+    # A building with no occupied zones at all (a barn, a standalone garage) is
+    # still characterised by the use it does have — falling through to None here
+    # would resolve it to the generic "other" archetype instead.
+    by_use = _tally(only_occupied=True) or _tally(only_occupied=False)
     if not by_use:
         return None
     return max(by_use, key=by_use.get)
@@ -1746,8 +1757,10 @@ def _add_cat_shading(idf, remainders, ox, oy, ground_floor_height, floor_height)
 # (``_MAIN_DOOR_SIZE`` / ``_PARKING_DOOR_SIZE``).
 # --------------------------------------------------------------------------- #
 def _zone_is_parking(zone_meta, zname):
+    """True for zones that get a vehicle door instead of a pedestrian one:
+    parking/warehouse, and agricultural sheds (which are entered by vehicle)."""
     s = zone_meta.get(zname.upper())
-    return bool(s) and _use_category(s.get("use_type")) == "parking"
+    return bool(s) and _use_category(s.get("use_type")) in ("parking", "agricultural")
 
 
 def _wall_base(wall):
@@ -2048,6 +2061,11 @@ def _use_category(use_type):
     u = str(use_type or "").lower()
     if any(k in u for k in ("parking", "warehouse", "storage", "garage")):
         return "parking"
+    # Kept out of the "parking" bucket on purpose: an agricultural building is
+    # equally unconditioned, but it must not inherit parking's vehicle doors
+    # (``_is_parking_space`` keys off this category).
+    if "agricultur" in u:
+        return "agricultural"
     if "communal" in u:
         return "communal"
     if any(k in u for k in ("sport", "pool")):
@@ -2176,12 +2194,19 @@ def building_archetype(year=None, use_type=None):
     """Resolve a building archetype from year of construction (Spanish thermal
     code period) and dominant use. Returns a dict with ``period``,
     ``use_category``, the period's ``envelope`` (target U-values + glazing) and
-    the period's window ``infiltration`` (frame/glazing type + ACH)."""
+    the period's window ``infiltration`` (frame/glazing type + ACH).
+
+    Agricultural buildings are the exception to the period rule: a shed is
+    uninsulated whatever year it was built, so it takes the ``uninsulated``
+    envelope instead of its period's."""
     period = _construction_period(year)
+    cat = _use_category(use_type)
+    env_key = "uninsulated" if (cat == "agricultural"
+                                and "uninsulated" in _ARCHETYPE_ENVELOPE) else period
     return {
         "period": period,
-        "use_category": _use_category(use_type),
-        "envelope": dict(_ARCHETYPE_ENVELOPE[period]),
+        "use_category": cat,
+        "envelope": dict(_ARCHETYPE_ENVELOPE[env_key]),
         "infiltration": _window_infiltration(period),
     }
 

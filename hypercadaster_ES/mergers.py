@@ -963,7 +963,7 @@ def join_other_constructions(building_gdf_, cadaster_dir, code):
 # Use-type keywords whose thermal zones are not occupied by people (parking,
 # storage, …). Open-air pools (routed from OtherConstruction) are also marked
 # non-occupied via their source/detailed-use markers below.
-_NON_OCCUPIED_ZONE_USE_KEYS = ("parking", "warehouse", "storage", "garage")
+_NON_OCCUPIED_ZONE_USE_KEYS = ("parking", "warehouse", "storage", "garage", "agricultur")
 
 
 def _thermal_zone_is_non_occupied(z):
@@ -1111,6 +1111,16 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
             if buildings_CAT is None:
                 buildings_CAT = building_inference.parse_horizontal_division_buildings_CAT_files(code, CAT_files_dir)
                 _db_mod_cat.cat_cache_write(results_dir, code, buildings_CAT)
+            # Buildings the CAT file knows nothing about (rural/agricultural,
+            # mostly) get one theoretical space carrying the building's main
+            # usage and official built area, so they flow through the CAT
+            # aggregation, thermal zoning and energy model like any other
+            # single-space building instead of coming out all-NaN. Applied
+            # after the cache read/write on purpose: the cache must stay a pure
+            # function of the CAT files, and this depends on the Building layer.
+            with utils.stage_timer("merge: theoretical CAT spaces for buildings without CAT"):
+                buildings_CAT = building_inference.add_theoretical_CAT_spaces(
+                    buildings_CAT, building_gdf_, code)
         else:
             buildings_CAT = None
 

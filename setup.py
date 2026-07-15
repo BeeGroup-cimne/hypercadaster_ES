@@ -3,7 +3,7 @@ from setuptools import find_packages, setup
 
 HERE = pathlib.Path(__file__).parent
 
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 PACKAGE_NAME = "hypercadaster_es"
 AUTHOR = "Jose Manuel Broto Vispe"
 AUTHOR_EMAIL = "jmbrotovispe@gmail.com"

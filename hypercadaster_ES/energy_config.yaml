@@ -90,6 +90,11 @@ archetype_envelope:
   "1980_2006": {wall_U: 0.95, roof_U: 0.75, floor_U: 0.85, window_U: 3.50, window_shgc: 0.75, window_vt: 0.75}
   "2007_2013": {wall_U: 0.66, roof_U: 0.38, floor_U: 0.49, window_U: 3.00, window_shgc: 0.65, window_vt: 0.70}
   "post2013":  {wall_U: 0.27, roof_U: 0.22, floor_U: 0.34, window_U: 2.00, window_shgc: 0.55, window_vt: 0.65}
+  # Agricultural sheds/barns, whatever their year: no insulation at all. The
+  # wall/roof/floor U targets are deliberately absent — with no target the
+  # solver in _add_constructions drops the INS layer entirely, leaving the bare
+  # construction, rather than us inventing U-values it would then tune towards.
+  "uninsulated": {window_U: 5.70, window_shgc: 0.82, window_vt: 0.80}
 
 # --- Internal loads, setpoints (°C) and conditioning, per use category ----- #
 # ``occ`` names the internal-gains usage fraction schedule (see schedules.occupancy
@@ -102,6 +107,10 @@ loads:
   commercial:  {ppl_per_m2: 0.15,  lights: 14.0, equip: 10.0, infil_ach: 0.5, heat: 21, heat_sb: 16, cool: 24, cool_sb: 28, activity: 130, conditioned: true,  occ: OCC_COMMERCIAL}
   other:       {ppl_per_m2: 0.05,  lights: 8.0,  equip: 8.0,  infil_ach: 0.5, heat: 20, heat_sb: 17, cool: 25, cool_sb: 27, activity: 120, conditioned: true,  occ: OCC_OFFICE}
   parking:     {ppl_per_m2: 0.0,   lights: 2.0,  equip: 0.0,  infil_ach: 1.0, conditioned: false, occ: OCC_LOW}
+  # Rural sheds/barns: same assumptions as a warehouse (which maps to the
+  # `parking` category), but uninsulated (see archetype_envelope.uninsulated)
+  # and very leaky — open eaves, unsealed vehicle doors, no air barrier.
+  agricultural: {ppl_per_m2: 0.0,  lights: 2.0,  equip: 0.0,  infil_ach: 5.0, conditioned: false, occ: OCC_LOW}
   communal:    {ppl_per_m2: 0.0,   lights: 3.0,  equip: 0.0,  infil_ach: 0.5, conditioned: false, occ: OCC_LOW}
   sports:      {ppl_per_m2: 0.0,   lights: 0.0,  equip: 0.0,  infil_ach: 2.0, conditioned: false, occ: OCC_LOW}
 

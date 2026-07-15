@@ -67,70 +67,61 @@ for i, municipality in enumerate(cadaster_codes, 1):
 
     hc.utils.stage_log(
         f"hc.merge() returned {len(gdf_municipality)} rows for {municipality}; "
-        f"starting plots + pickle write"
     )
-
-    # Get a building
-    _test_br = gdf_municipality["building_reference"].iloc[0]
-    pprint.pp(gdf_municipality[gdf_municipality["building_reference"]==_test_br].iloc[0].to_dict())
-
-    # Generate plots for that building
-    hc.utils.plot_building_reference(gdf_municipality,_test_br,output_path=f"{wd}/test.png")
-    # `wd=wd` auto-fetches the heavy shadow / terrain / walls_segments BLOB columns from
-    # the central DuckDB for this one building (excluded from the bulk
-    # `hc.merge` frame for memory reasons — see the [hc.merge] notice at
-    # the end of the run, and `hc.utils.get_heavy_columns_for_building`).
-    hc.utils.plot_building_shadows_analysis(gdf_municipality, _test_br, output_path=f"{wd}/test2.png", wd=wd)
-    hc.utils.plot_building_dem(gdf_municipality, _test_br, output_path=f"{wd}/test3.png", wd=wd)
-    hc.utils.plot_building_geometry(gdf_municipality, _test_br, output_path=f"{wd}/test4.png", wd=wd)
-    hc.utils.plot_building_3d_geometry(gdf_municipality, _test_br, output_path=f"{wd}/test5.png", wd=wd)
-
-    # Create the EnergyPlus model of the building
-    idf = hc.energy.build_energy_model(gdf_municipality, _test_br, wd=wd)
-    hc.energy.plot_idf_geometry(f"{wd}/energyplus/{_test_br}.idf",
-                         output_path=f"{wd}/test6.png",
-                         include_shading=True,
-                         title=_test_br)
-    # Save individual result
-    with hc.utils.stage_timer(
-        f"example: to_pickle gzip ({len(gdf_municipality)} rows -> {individual_filename})"
-    ):
-        gdf_municipality.to_pickle(individual_filename, compression="gzip")
-    print(f"Individual result saved: {individual_filename}")
-    print(f"Buildings processed: {len(gdf_municipality):,}")
 
     all_results.append(gdf_municipality)
 
-if len(cadaster_codes)>1:
+# Combine all results
+print("\n" + "="*60)
+print("COMBINING RESULTS FROM ALL MUNICIPALITIES")
+print("="*60)
 
-    # Combine all results
-    print("\n" + "="*60)
-    print("COMBINING RESULTS FROM ALL MUNICIPALITIES")
-    print("="*60)
+if len(all_results) > 1:
+    print("Concatenating results from all municipalities...")
+    combined_gdf = pd.concat(all_results, ignore_index=True)
+else:
+    combined_gdf = all_results[0]
 
-    if len(all_results) > 1:
-        print("Concatenating results from all municipalities...")
-        combined_gdf = pd.concat(all_results, ignore_index=True)
-    else:
-        combined_gdf = all_results[0]
+# Save combined results
+output_filename = f"{wd}/{'~'.join(cadaster_codes)}_complete_inference.pkl"
+print(f"Saving combined results to: {output_filename}")
+combined_gdf.to_pickle(output_filename, compression="gzip")
 
-    # Save combined results
-    output_filename = f"{wd}/{'~'.join(cadaster_codes)}_complete_inference.pkl"
-    print(f"Saving combined results to: {output_filename}")
-    combined_gdf.to_pickle(output_filename, compression="gzip")
+# Summary statistics
+print("\n" + "="*60)
+print("ANALYSIS COMPLETED")
+print("="*60)
+print(f"Total buildings processed: {len(combined_gdf):,}")
+print(f"Municipalities analyzed: {len(cadaster_codes)}")
+print(f"Municipality breakdown:")
+for municipality in cadaster_codes:
+    count = len(combined_gdf[combined_gdf['cadaster_code'] == municipality])
+    print(f"  - {municipality}: {count:,} buildings")
 
-    # Summary statistics
-    print("\n" + "="*60)
-    print("ANALYSIS COMPLETED")
-    print("="*60)
-    print(f"Total buildings processed: {len(combined_gdf):,}")
-    print(f"Municipalities analyzed: {len(cadaster_codes)}")
-    print(f"Municipality breakdown:")
-    for municipality in cadaster_codes:
-        count = len(combined_gdf[combined_gdf['processing_municipality'] == municipality])
-        print(f"  - {municipality}: {count:,} buildings")
+print(f"\nResults saved with compression to reduce file size.")
+print(f"Individual files: [municipality]_complete_inference.pkl")
+print(f"Combined file: {'~'.join(cadaster_codes)}_complete_inference.pkl")
 
-    print(f"\nResults saved with compression to reduce file size.")
-    print(f"Individual files: [municipality]_complete_inference.pkl")
-    print(f"Combined file: {'~'.join(cadaster_codes)}_complete_inference.pkl")
+### One building analysis
+# Get a building
+_test_br = combined_gdf["building_reference"].iloc[0]
+pprint.pp(combined_gdf[combined_gdf["building_reference"]==_test_br].iloc[0].to_dict())
+
+# Generate plots for that building
+hc.utils.plot_building_reference(combined_gdf,_test_br,output_path=f"{wd}/test.png")
+# `wd=wd` auto-fetches the heavy shadow / terrain / walls_segments BLOB columns from
+# the central DuckDB for this one building (excluded from the bulk
+# `hc.merge` frame for memory reasons — see the [hc.merge] notice at
+# the end of the run, and `hc.utils.get_heavy_columns_for_building`).
+hc.utils.plot_building_shadows_analysis(combined_gdf, _test_br, output_path=f"{wd}/test2.png", wd=wd)
+hc.utils.plot_building_dem(combined_gdf, _test_br, output_path=f"{wd}/test3.png", wd=wd)
+hc.utils.plot_building_geometry(combined_gdf, _test_br, output_path=f"{wd}/test4.png", wd=wd)
+hc.utils.plot_building_3d_geometry(combined_gdf, _test_br, output_path=f"{wd}/test5.png", wd=wd)
+
+# Create the EnergyPlus model of the building
+idf = hc.energy.build_energy_model(combined_gdf, _test_br, wd=wd)
+hc.energy.plot_idf_geometry(f"{wd}/energyplus/{_test_br}.idf",
+                     output_path=f"{wd}/test6.png",
+                     include_shading=True,
+                     title=_test_br)
 
