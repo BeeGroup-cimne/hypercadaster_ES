@@ -19,7 +19,10 @@ affine>=2.4
 snuggs>=1.4
 pygeoif>=0.7
 osmnx<2.1,>=1.8
+pyrosm>=0.6
 networkx>=3.2
+eppy>=0.5.63
+geomeppy>=0.12
 pyarrow>=14.0
 openpyxl>=3.1
 et-xmlfile>=1.1
@@ -51,9 +54,11 @@ regex<2027.0,>=2023.12
 tqdm>=4.66
 six>=1.16
 PyYAML>=6.0
+social_ES>=1.0.0
 
 [dev]
 black>=24.0
 ruff>=0.4
 pytest>=7.0
 pytest-cov>=4.0
+pdoc>=14.0

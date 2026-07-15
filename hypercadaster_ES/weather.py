@@ -1465,6 +1465,10 @@ def join_weather(gdf, era5_dir, years=5, indicators=None, hdd_base=18.0,
         return gdf
 
     year_list = _resolve_weather_years(years)
+    if year_list:
+        sys.stderr.write(
+            f"Joining the Weather data of last {len(year_list)} years "
+            f"({year_list[0]}-{year_list[-1]})\n")
     if not year_list:
         log("no years resolved; skipping weather layer")
         return gdf

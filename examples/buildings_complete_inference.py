@@ -16,18 +16,17 @@ Key features demonstrated:
 
 Author: hypercadaster_ES examples
 """
-import os.path
 import hypercadaster_ES as hc
 import pandas as pd
-import geopandas as gpd
+import pprint
 
 # Configuration
-wd = "/home/gmor/Nextcloud2/Beegroup/data/hypercadaster_ES"
+wd = "/mnt/data2/hypercadaster_ES"
 # Resume mode: reuse the per-zone shards already in results/cache instead of
 # wiping and recomputing the (multi-hour) KPI inference. Set back to True for
 # a clean production run.
 force_update = True
-cadaster_codes = ["25023"] #08900: Barcelona, 25023: Alpicat, 25285: Torrefarrera
+cadaster_codes = ["25900"] #08900: Barcelona, 25023: Alpicat, 25285: Torrefarrera
 
 # Download all required data for all municipalities at once
 print("Downloading cadastral and auxiliary data for all municipalities...")
@@ -71,13 +70,11 @@ for i, municipality in enumerate(cadaster_codes, 1):
         f"starting plots + pickle write"
     )
 
-    import pprint
-    _test_br = '6455445BG9165N'
-    if _test_br not in set(gdf_municipality["building_reference"]):
-        _test_br = gdf_municipality["building_reference"].iloc[0]
+    # Get a building
+    _test_br = gdf_municipality["building_reference"].iloc[0]
     pprint.pp(gdf_municipality[gdf_municipality["building_reference"]==_test_br].iloc[0].to_dict())
-    # df = building_spaces_to_df(gdf_municipality[gdf_municipality["building_reference"]==_test_br].iloc[0].to_dict())
-    # pprint.pp(df.iloc[1].to_dict())
+
+    # Generate plots for that building
     hc.utils.plot_building_reference(gdf_municipality,_test_br,output_path=f"{wd}/test.png")
     # `wd=wd` auto-fetches the heavy shadow / terrain / walls_segments BLOB columns from
     # the central DuckDB for this one building (excluded from the bulk
@@ -87,8 +84,9 @@ for i, municipality in enumerate(cadaster_codes, 1):
     hc.utils.plot_building_dem(gdf_municipality, _test_br, output_path=f"{wd}/test3.png", wd=wd)
     hc.utils.plot_building_geometry(gdf_municipality, _test_br, output_path=f"{wd}/test4.png", wd=wd)
     hc.utils.plot_building_3d_geometry(gdf_municipality, _test_br, output_path=f"{wd}/test5.png", wd=wd)
-    idf = hc.energy.build_energy_model(gdf_municipality, _test_br, wd=wd)
 
+    # Create the EnergyPlus model of the building
+    idf = hc.energy.build_energy_model(gdf_municipality, _test_br, wd=wd)
     hc.energy.plot_idf_geometry(f"{wd}/energyplus/{_test_br}.idf",
                          output_path=f"{wd}/test6.png",
                          include_shading=True,
@@ -135,32 +133,4 @@ if len(cadaster_codes)>1:
     print(f"\nResults saved with compression to reduce file size.")
     print(f"Individual files: [municipality]_complete_inference.pkl")
     print(f"Combined file: {'~'.join(cadaster_codes)}_complete_inference.pkl")
-
-
-
-def building_spaces_to_df(row):
-    prefix = "br__building_spaces_"
-    # keep only per-space columns: prefixed AND inner values are lists
-    # (excludes br__building_spaces_by_floor -> {floor: count} and br__building_spaces -> int)
-    cols = {
-        k[len(prefix):]: v
-        for k, v in row.items()
-        if k.startswith(prefix)
-        and isinstance(v, dict)
-        and all(isinstance(x, list) for x in v.values())
-    }
-    if not cols:
-        return pd.DataFrame()
-
-    rows = []
-    use_types = next(iter(cols.values())).keys()
-    for use_type in use_types:
-        n = len(next(iter(cols.values()))[use_type])
-        for i in range(n):
-            space = {"use_type": use_type, "building_reference": row.get("building_reference")}
-            for name, by_use in cols.items():
-                space[name] = by_use[use_type][i]
-            rows.append(space)
-
-    return pd.DataFrame(rows)
 

@@ -1097,9 +1097,20 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
         if 'building_geometry' in building_gdf_.columns:
             building_gdf_ = assign_building_zones(building_gdf_, cadaster_dir, code)
 
-        # Parse CAT file, if available
+        # Parse CAT file, if available. The parsed per-space table is cached in
+        # the central DuckDB (`cat_building_spaces`, keyed by cadaster_code) and
+        # reused on every re-run — it feeds the (cheap) per-use-type area pivot
+        # below and is the input to the (expensive) per-building aggregation that
+        # is itself cached separately as `cat_building_attributes`. Like the raw
+        # .CAT→parquet cache, these are pure functions of the static CAT files, so
+        # they are reused regardless of `force_update`; clear them with
+        # hc.utils.clear_cat_cache to force a re-parse/re-aggregate.
         if building_parts_inference_using_CAT_files:
-            buildings_CAT = building_inference.parse_horizontal_division_buildings_CAT_files(code, CAT_files_dir)
+            from hypercadaster_ES import _db as _db_mod_cat
+            buildings_CAT = _db_mod_cat.cat_cache_read(results_dir, code)
+            if buildings_CAT is None:
+                buildings_CAT = building_inference.parse_horizontal_division_buildings_CAT_files(code, CAT_files_dir)
+                _db_mod_cat.cat_cache_write(results_dir, code, buildings_CAT)
         else:
             buildings_CAT = None
 
@@ -1491,8 +1502,17 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
                 # CAT yields the full br__* per-building aggregates (building_spaces_*,
                 # area_with_communals, economic_value, ...) without any geometric
                 # inference — fold them in so this path matches the inference path
-                # for all CAT-derived columns.
-                br_cat = building_inference.br_attributes_from_CAT(buildings_CAT)
+                # for all CAT-derived columns. br_attributes_from_CAT is a
+                # per-building aggregation that runs for minutes on a large
+                # municipality (the dominant cost of a no-inference CAT merge), so
+                # its output is cached in the central DuckDB (`cat_building_attributes`,
+                # keyed by cadaster_code) and reused on every re-run. Like the CAT
+                # parse cache it is a pure function of the static CAT files.
+                from hypercadaster_ES import _db as _db_mod_cat
+                br_cat = _db_mod_cat.cat_attrs_read(results_dir, code)
+                if br_cat is None:
+                    br_cat = building_inference.br_attributes_from_CAT(buildings_CAT)
+                    _db_mod_cat.cat_attrs_write(results_dir, code, br_cat)
                 building_gdf_ = building_gdf_.merge(br_cat, on="building_reference", how="left")
 
             use_types = buildings_CAT["building_space_inferred_use_type"].unique().to_list()

@@ -22,6 +22,7 @@ read from that cache.
 import re
 import sys
 import unicodedata
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -40,11 +41,13 @@ ATLAS_INDICATORS = {
     "Average per person gross income": "gross_income_per_person",
     "Average income by unit of consumption": "net_income_per_consumption_unit",
     "Median income by unit of consumption": "median_income_per_consumption_unit",
-    "Source of income: wages": "salary_income_per_person",
-    "Source of income: pensions": "pension_income_per_person",
-    "Source of income: unemployment benefits": "unemployment_income_per_person",
-    "Source of income: other benefits": "other_benefits_income_per_person",
-    "Source of income: other income": "other_income_per_person",
+    # Income by source: these are the % share of household income coming from
+    # each source (not € amounts).
+    "Source of income: wages": "pct_income_source_salary",
+    "Source of income: pensions": "pct_income_source_pension",
+    "Source of income: unemployment benefits": "pct_income_source_unemployment",
+    "Source of income: other benefits": "pct_income_source_other_benefits",
+    "Source of income: other income": "pct_income_source_capital_investments_secondary",
     "Gini Index": "gini_index",
     "Income distribution P80/P20": "income_p80_p20",
     "Average age of the population": "average_age",
@@ -270,6 +273,15 @@ def join_social_ES(gdf, wd, n_years=5, datasets=None, use_CAT_files=False,
             "(`pip install social_ES`)\n")
         return gdf
 
+    # Announce the join (always, regardless of verbose): the ordered set of
+    # datasets and the number of most-recent years being joined.
+    ds_names = [d for d in ALL_DATASETS if d in run_simple]
+    if include_ec:
+        ds_names.append(ESSENTIAL_CHARACTERISTICS)
+    sys.stderr.write(
+        f"Joining the socioeconomic and sociodemographic data of last "
+        f"{n_years} years (datasets: {', '.join(ds_names)})\n")
+
     def log(msg):
         if verbose:
             sys.stderr.write(f"social_ES: {msg}\n")
@@ -423,7 +435,7 @@ def join_essential_characteristics(gdf, wd, prefix=EC_PREFIX, verbose=True):
     type, ``year_of_construction``). Each downscaled variable becomes a
     ``{prefix}{…}`` column (proportions in %, one group summing to 100). Spanish
     INE labels are translated to English snake_case keys at source (via
-    :func:`ec_column_rename_map`), e.g. ``ec__main_dwellings_heating_type_individual``.
+    :func:`ec_column_rename_map`), e.g. ``ec__main_dwellings_heating_individual``.
 
     Only meaningful when the CAT-based building-space aggregation has run
     (``use_CAT_files=True``) — the required ``br__*`` columns are otherwise
@@ -480,8 +492,18 @@ def join_essential_characteristics(gdf, wd, prefix=EC_PREFIX, verbose=True):
 
     try:
         log("EssentialCharacteristicsOfPopulationAndHouseholds ...")
-        proportions = INE.EssentialCharacteristicsOfPopulationAndHouseholds(
-            wd, hypercadaster_ES_input_gdf=work)
+        # social_ES divides each variable by its group row-sum to get a
+        # proportion; groups with a zero row-sum (no dwellings/people of that
+        # kind in a section) yield 0/0 -> NaN and numpy floods stderr with
+        # "invalid value encountered in divide" RuntimeWarnings. The NaN is the
+        # intended result, so silence just that noise around the call.
+        with np.errstate(divide="ignore", invalid="ignore"), \
+                warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", category=RuntimeWarning,
+                message="invalid value encountered in divide")
+            proportions = INE.EssentialCharacteristicsOfPopulationAndHouseholds(
+                wd, hypercadaster_ES_input_gdf=work)
     except Exception as e:  # noqa: BLE001
         sys.stderr.write(
             f"social_ES: essential characteristics failed ({e}); skipping\n")
@@ -498,7 +520,7 @@ def join_essential_characteristics(gdf, wd, prefix=EC_PREFIX, verbose=True):
     ec = ec.loc[:, ~ec.columns.duplicated()]
     ec.columns = [f"{prefix}{c}" for c in ec.columns]
     # Emit the columns with English snake_case keys directly (Spanish INE labels
-    # -> e.g. ec__main_dwellings_heating_type_individual).
+    # -> e.g. ec__main_dwellings_heating_individual).
     ec = ec.rename(columns=ec_column_rename_map(ec.columns))
     ec = ec.reset_index().rename(columns={ec.index.name or "index": "building_reference"})
     if "building_reference" not in ec.columns:
@@ -533,352 +555,352 @@ def join_essential_characteristics(gdf, wd, prefix=EC_PREFIX, verbose=True):
 #
 # The ``ec__*`` columns follow the structure ``ec__{group} - {variable} ~
 # {subclass}``. :func:`rename_ec_columns` translates each of the three parts via
-# the curated dictionaries below and re-joins them as snake_case, underscore-
-# separated, e.g.
+# the curated dictionaries below and re-joins them with underscores, e.g.
 #   ``ec__Viviendas principales - Tipo de calefacción ~ Sí, individual``
-#   -> ``ec__main_dwellings_heating_type_individual``
-# The curated maps hold clean PascalCase words; the assembled body is lowered to
-# snake_case in :func:`translate_ec_column`. Anything not in the dictionaries
-# falls back to an accent-stripped CamelCase of the Spanish text (also snaked;
-# deterministic, never raises), so new INE categories still get a stable key;
-# pass ``warn_unmapped=True`` to list them so the maps can be extended.
+#   -> ``ec__main_dwellings_heating_individual``
+# The curated maps hold the final **short snake_case** values directly (used
+# verbatim), so digit spacing and abbreviations are controlled at the source.
+# Anything not in the dictionaries falls back to an accent-stripped, snake_cased
+# form of the Spanish text (deterministic, never raises), so new INE categories
+# still get a stable key; pass ``warn_unmapped=True`` to list them so the maps
+# can be extended.
 
 _EC_GROUPS = {
-    "Personas": "People",
-    "Personas de 16 años o más": "People16OrOver",
-    "Personas de 16 años o más que conviven con otras personas": "People16OrOverLivingWithOthers",
-    "Personas de 16 años o más que conviven con otras personas y participan en cuidados a personas dependientes dentro del hogar": "People16OrOverCaringForDependentsInHousehold",
-    "Personas de 16 años o más que participan en cuidados a personas dependientes fuera del hogar": "People16OrOverCaringForDependentsOutsideHousehold",
-    "Personas de 16 años o más que viven solas": "People16OrOverLivingAlone",
-    "Personas nacidas en España": "PeopleBornInSpain",
-    "Personas nacidas fuera de España": "PeopleBornOutsideSpain",
-    "Hogares": "Households",
-    "Hogares/personas": "PeopleInHouseholds",
-    "Hogares de una sola persona (unipersonales)": "SinglePersonHouseholds",
-    "Parejas convivientes": "CohabitingCouples",
-    "Hogares/personas en viviendas alquiladas": "PeopleLivingInRentedHomes",
-    "Hogares/personas en viviendas propias": "PeopleLivingInTheirOwnHomes",
-    "Hogares/personas con segunda residencia": "HouseholdsPersonsWithSecondHome",
-    "Hogares/personas con vehículo": "HouseholdsPersonsWithVehicle",
-    "Hogares con vehículo": "HouseholdsWithVehicle",
-    "Hogares/personas con servicio doméstico remunerado": "HouseholdsPersonsWithPaidDomesticService",
-    "Hogares con servicio doméstico remunerado": "HouseholdsWithPaidDomesticService",
-    "Hogares/personas con ayuda externa": "HouseholdsPersonsWithExternalHelp",
-    "Hogares con ayuda externa": "HouseholdsWithExternalHelp",
-    "Viviendas principales": "MainDwellings",
-    "Viviendas principales con calefacción": "MainDwellingsWithHeating",
+    "Personas": "people",
+    "Personas de 16 años o más": "people_16plus",
+    "Personas de 16 años o más que conviven con otras personas": "people_16plus_cohabiting",
+    "Personas de 16 años o más que conviven con otras personas y participan en cuidados a personas dependientes dentro del hogar": "people_16plus_caring_in_hh",
+    "Personas de 16 años o más que participan en cuidados a personas dependientes fuera del hogar": "people_16plus_caring_out_hh",
+    "Personas de 16 años o más que viven solas": "people_16plus_alone",
+    "Personas nacidas en España": "people_born_es",
+    "Personas nacidas fuera de España": "people_born_foreign",
+    "Hogares": "households",
+    "Hogares/personas": "hh_people",
+    "Hogares de una sola persona (unipersonales)": "single_person_hh",
+    "Parejas convivientes": "cohabiting_couples",
+    "Hogares/personas en viviendas alquiladas": "rented_homes",
+    "Hogares/personas en viviendas propias": "owned_homes",
+    "Hogares/personas con segunda residencia": "hh_second_home",
+    "Hogares/personas con vehículo": "hh_vehicle",
+    "Hogares con vehículo": "households_vehicle",
+    "Hogares/personas con servicio doméstico remunerado": "hh_paid_domestic",
+    "Hogares con servicio doméstico remunerado": "households_paid_domestic",
+    "Hogares/personas con ayuda externa": "hh_external_help",
+    "Hogares con ayuda externa": "households_external_help",
+    "Viviendas principales": "main_dwellings",
+    "Viviendas principales con calefacción": "main_dwellings_heated",
 }
 
 _EC_VARIABLES = {
-    "Lugar de trabajo/estudio": "WorkStudyLocation",
-    "Número de desplazamaientos": "NumberOfTrips",
-    "Medio de transporte": "TransportMode",
-    "Tipo de vehículo": "VehicleType",
-    "Tiempo diario": "DailyCommuteTime",
-    "Grado de satisfacción": "SatisfactionLevel",
-    "Grado de participación en las tareas domésticas": "HouseworkParticipation",
-    "Grado de participación en cuidados a menores o dependientes dentro del hogar": "CareParticipationInHousehold",
-    "Grado de participación en cuidados a menores o dependientes fuera del hogar": "CareParticipationOutsideHousehold",
-    "Tipo de dependiente": "DependentType",
-    "Horas diarias dedicadas al cuidado": "DailyCareHours",
-    "Tiene apoyo social": "HasSocialSupport",
-    "Tipo de relación": "RelationshipType",
-    "Lugar de residencia": "ResidenceLocation",
-    "Lugar de nacimiento progenitores": "ParentsBirthplace",
-    "Residencia progenitores": "ParentsResidence",
-    "Nacionalidad progenitores": "ParentsNationality",
-    "Nivel estudios progenitores": "ParentsEducationLevel",
-    "Accede habitualmente a internet": "RegularInternetAccess",
-    "Dispone de perfil en alguna red social": "HasSocialMediaProfile",
-    "Dispone de smartphone": "HasSmartphone",
-    "Realiza compras por internet": "OnlineShopping",
-    "Realiza ventas por internet": "OnlineSelling",
-    "Edad": "Age",
-    "Nacionalidad": "Nationality",
-    "Estado civil": "MaritalStatus",
-    "Nivel educativo": "EducationLevel",
-    "Situación laboral": "EmploymentStatus",
-    "Nivel de ingresos mensuales netos del hogar": "MonthlyNetHouseholdIncomeLevel",
-    "Sexo de la pareja": "CoupleSex",
-    "Nacionalidad de la pareja": "CoupleNationality",
-    "Número de hijos": "NumberOfChildren",
-    "Número de habitaciones de la vivienda": "NumberOfRoomsInDwelling",
-    "Superficie útil de la vivienda": "UsefulFloorArea",
-    "Tipo de edificio": "BuildingType",
-    "Régimen de tenencia de la vivienda": "TenureRegime",
-    "Cuota mensual del alquiler": "MonthlyRent",
-    "Cuota mensual de la hipoteca": "MonthlyMortgage",
-    "Disponen de segunda residencia": "HasSecondHome",
-    "Lugar de la segunda residencia": "SecondHomeLocation",
-    "Días de uso de la segunda residencia al año": "SecondHomeDaysPerYear",
-    "Número de vehículos": "NumberOfVehicles",
-    "Vehículo ecólogico": "EcoFriendlyVehicle",
-    "Separan algún tipo de residuo": "SeparatesWaste",
-    "Tipo de residuos separados": "SeparatedWasteType",
-    "Servicio doméstico remunerado": "PaidDomesticService",
-    "Ayuda externa": "ExternalHelp",
-    "Adaptada a necesidades propias del envejecimiento": "AdaptedForAging",
-    "Problema de aislamiento": "IsolationProblem",
-    "Tipo de calefacción": "HeatingType",
-    "Tipo de combustible": "FuelType",
-    "Sistema de suministro de agua": "WaterSupplySystem",
-    "Tiene sistema de refrigeración": "HasCooling",
-    "Tipo de conexión a internet": "InternetConnectionType",
-    "Tipo de electrodoméstico": "ApplianceType",
-    "Tipo de bombillas": "BulbType",
-    "Aseo con inodoro / Bañera o ducha": "ToiletBathOrShower",
-    "Número de cuartos de baño o aseos": "NumberOfBathrooms",
-    "Cocina independiente de 4 m2 o más": "SeparateKitchen4m2OrMore",
-    "Número de habitaciones": "NumberOfRooms",
-    "Tipo de problemática en la zona": "AreaProblemType",
-    "Tipo de infraestructura o servicio": "InfrastructureServiceType",
-    "Estado de conservación": "ConservationStatus",
-    "Accesibilidad": "Accessibility",
-    "Tipo de instalación": "InstallationType",
-    "Número de plazas de garaje": "NumberOfGarageSpaces",
-    "Tipo de dispositivo de energía renovable": "RenewableEnergyDeviceType",
+    "Lugar de trabajo/estudio": "work_study_place",
+    "Número de desplazamaientos": "n_trips",
+    "Medio de transporte": "transport_mode",
+    "Tipo de vehículo": "vehicle_type",
+    "Tiempo diario": "daily_time",
+    "Grado de satisfacción": "satisfaction",
+    "Grado de participación en las tareas domésticas": "housework_participation",
+    "Grado de participación en cuidados a menores o dependientes dentro del hogar": "participation",
+    "Grado de participación en cuidados a menores o dependientes fuera del hogar": "participation",
+    "Tipo de dependiente": "dependent_type",
+    "Horas diarias dedicadas al cuidado": "daily_care_hours",
+    "Tiene apoyo social": "has_social_support",
+    "Tipo de relación": "relationship_type",
+    "Lugar de residencia": "residence_place",
+    "Lugar de nacimiento progenitores": "parents_birthplace",
+    "Residencia progenitores": "parents_residence",
+    "Nacionalidad progenitores": "parents_nationality",
+    "Nivel estudios progenitores": "parents_education",
+    "Accede habitualmente a internet": "internet_access",
+    "Dispone de perfil en alguna red social": "social_media",
+    "Dispone de smartphone": "smartphone",
+    "Realiza compras por internet": "online_shopping",
+    "Realiza ventas por internet": "online_selling",
+    "Edad": "age",
+    "Nacionalidad": "nationality",
+    "Estado civil": "marital_status",
+    "Nivel educativo": "education",
+    "Situación laboral": "employment",
+    "Nivel de ingresos mensuales netos del hogar": "net_income",
+    "Sexo de la pareja": "couple_sex",
+    "Nacionalidad de la pareja": "couple_nationality",
+    "Número de hijos": "n_children",
+    "Número de habitaciones de la vivienda": "n_rooms",
+    "Superficie útil de la vivienda": "floor_area",
+    "Tipo de edificio": "building_type",
+    "Régimen de tenencia de la vivienda": "tenure",
+    "Cuota mensual del alquiler": "monthly_rent",
+    "Cuota mensual de la hipoteca": "monthly_mortgage",
+    "Disponen de segunda residencia": "has_second_home",
+    "Lugar de la segunda residencia": "second_home_place",
+    "Días de uso de la segunda residencia al año": "second_home_days_year",
+    "Número de vehículos": "n_vehicles",
+    "Vehículo ecólogico": "eco_vehicle",
+    "Separan algún tipo de residuo": "separates_waste",
+    "Tipo de residuos separados": "waste_type",
+    "Servicio doméstico remunerado": "paid_domestic",
+    "Ayuda externa": "external_help",
+    "Adaptada a necesidades propias del envejecimiento": "aging_adapted",
+    "Problema de aislamiento": "isolation_problem",
+    "Tipo de calefacción": "heating",
+    "Tipo de combustible": "fuel",
+    "Sistema de suministro de agua": "water_supply",
+    "Tiene sistema de refrigeración": "has_cooling",
+    "Tipo de conexión a internet": "internet_connection",
+    "Tipo de electrodoméstico": "appliance",
+    "Tipo de bombillas": "bulb",
+    "Aseo con inodoro / Bañera o ducha": "toilet_bath",
+    "Número de cuartos de baño o aseos": "n_bathrooms",
+    "Cocina independiente de 4 m2 o más": "separate_kitchen_4m2plus",
+    "Número de habitaciones": "n_rooms",
+    "Tipo de problemática en la zona": "area_problem",
+    "Tipo de infraestructura o servicio": "infrastructure_service",
+    "Estado de conservación": "conservation",
+    "Accesibilidad": "accessibility",
+    "Tipo de instalación": "installation",
+    "Número de plazas de garaje": "n_garage_spaces",
+    "Tipo de dispositivo de energía renovable": "renewable_device",
 }
 
 _EC_SUBCLASSES = {
     # generic yes/no and counts
-    "Sí": "Yes",
-    "No": "No",
+    "Sí": "yes",
+    "No": "no",
     "0": "0", "1": "1", "2": "2", "3": "3",
-    "4 o más": "4OrMore", "3 o más": "3OrMore", "2 o más": "2OrMore",
+    "4 o más": "4plus", "3 o más": "3plus", "2 o más": "2plus",
     # work / study location
-    "En el municipio en el que resido": "InMunicipalityOfResidence",
-    "En el propio domicilio": "AtOwnHome",
-    "En otro municipio de la misma provincia": "AnotherMunicipalitySameProvince",
-    "En varios municipios (soy comercial, repartidor, taxista...)": "InSeveralMunicipalities",
-    "Otros lugares": "OtherPlaces",
-    "Más de 2": "MoreThan2",
+    "En el municipio en el que resido": "same_muni",
+    "En el propio domicilio": "at_home",
+    "En otro municipio de la misma provincia": "other_muni_same_prov",
+    "En varios municipios (soy comercial, repartidor, taxista...)": "several_munis",
+    "Otros lugares": "other_places",
+    "Más de 2": "over_2",
     # transport
-    "Andando": "OnFoot",
-    "De empresa u otro medio": "CompanyOrOther",
-    "Particular": "Private",
-    "Público": "Public",
-    "Autobús, tren, metro o tranvía": "BusTrainMetroTram",
-    "Coche": "Car",
-    "Moto, bicicleta y otros tipos": "MotorbikeBicycleOther",
+    "Andando": "on_foot",
+    "De empresa u otro medio": "company_or_other",
+    "Particular": "private",
+    "Público": "public",
+    "Autobús, tren, metro o tranvía": "bus_train_metro_tram",
+    "Coche": "car",
+    "Moto, bicicleta y otros tipos": "motorbike_bike_other",
     # daily commute time
-    "90 minutos o más": "90MinOrMore",
-    "Entre 20 y 39 minutos": "20To39Min",
-    "Entre 40 y 59 minutos": "40To59Min",
-    "Entre 60 y 89 minutos": "60To89Min",
-    "Menos de 20 minutos": "LessThan20Min",
+    "90 minutos o más": "90min_plus",
+    "Entre 20 y 39 minutos": "20_39min",
+    "Entre 40 y 59 minutos": "40_59min",
+    "Entre 60 y 89 minutos": "60_89min",
+    "Menos de 20 minutos": "under_20min",
     # satisfaction
-    "Insatisfecho": "Dissatisfied",
-    "Muy satisfecho": "VerySatisfied",
-    "Satisfecho": "Satisfied",
+    "Insatisfecho": "dissatisfied",
+    "Muy satisfecho": "very_satisfied",
+    "Satisfecho": "satisfied",
     # housework / care participation
-    "Me encargo de la mayor parte de las tareas domésticas de las tareas domésticas": "MostOfTasks",
-    "Me encargo de una parte importante de las tareas, compartiéndolas con otra/s personas": "SignificantPartShared",
-    "Me encargo de una pequeña parte de las tareas domésticas": "SmallPart",
-    "No participo habitualmente en las tareas domésticas": "DoesNotParticipate",
-    "Me encargo de la mayor parte de los cuidados": "MostOfCare",
-    "Me encargo de una parte importante de los cuidados, compartiéndolos con otra/s personas": "SignificantPartShared",
-    "Me encargo de una pequeña parte de los cuidados": "SmallPart",
-    "No hay personas menores ni personas dependientes en el hogar": "NoMinorsOrDependents",
-    "No participio habitualmente en los cuidados": "DoesNotParticipate",
-    "No tengo ninguna persona dependiente a mi cargo": "NoDependentsInCharge",
+    "Me encargo de la mayor parte de las tareas domésticas de las tareas domésticas": "most",
+    "Me encargo de una parte importante de las tareas, compartiéndolas con otra/s personas": "significant_shared",
+    "Me encargo de una pequeña parte de las tareas domésticas": "small_part",
+    "No participo habitualmente en las tareas domésticas": "none",
+    "Me encargo de la mayor parte de los cuidados": "most",
+    "Me encargo de una parte importante de los cuidados, compartiéndolos con otra/s personas": "significant_shared",
+    "Me encargo de una pequeña parte de los cuidados": "small_part",
+    "No hay personas menores ni personas dependientes en el hogar": "no_minors_or_dependents",
+    "No participio habitualmente en los cuidados": "none",
+    "No tengo ninguna persona dependiente a mi cargo": "no_dependents",
     # dependent type
-    "Discapacitado/a": "Disabled",
-    "Enfermo/a crónico/a": "ChronicallyIll",
-    "Mayor de 70 años u otro tipo": "Over70OrOther",
-    "Menor de edad": "Minor",
+    "Discapacitado/a": "disabled",
+    "Enfermo/a crónico/a": "chronically_ill",
+    "Mayor de 70 años u otro tipo": "over_70_or_other",
+    "Menor de edad": "minor",
     # daily care hours
-    "6 horas o más": "6HOrMore",
-    "Entre 2 y 6 horas": "2To6H",
-    "Menos de 2 horas": "LessThan2H",
-    "3 horas o más": "3HOrMore",
-    "Entre 1 y 3 horas": "1To3H",
-    "Menos de 1 hora": "LessThan1H",
+    "6 horas o más": "6h_plus",
+    "Entre 2 y 6 horas": "2_6h",
+    "Menos de 2 horas": "under_2h",
+    "3 horas o más": "3h_plus",
+    "Entre 1 y 3 horas": "1_3h",
+    "Menos de 1 hora": "under_1h",
     # relationship type (living alone)
-    "Amigos/as o vecinos/as y otros parientes (que no son hijos/as)": "FriendsNeighborsAndOtherRelatives",
-    "Hijos/as y amigos/as o vecinos/as": "ChildrenAndFriendsNeighbors",
-    "Hijos/as y otras personas (parientes o no)": "ChildrenAndOthers",
-    "Otros parientes (que no son hijos/as)": "OtherRelatives",
-    "Sólo amigos/as o vecinos/as": "OnlyFriendsNeighbors",
-    "Sólo hijos/as": "OnlyChildren",
+    "Amigos/as o vecinos/as y otros parientes (que no son hijos/as)": "friends_neighbors_relatives",
+    "Hijos/as y amigos/as o vecinos/as": "children_friends_neighbors",
+    "Hijos/as y otras personas (parientes o no)": "children_others",
+    "Otros parientes (que no son hijos/as)": "other_relatives",
+    "Sólo amigos/as o vecinos/as": "only_friends_neighbors",
+    "Sólo hijos/as": "only_children",
     # residence location
-    "En el mismo municipio": "SameMunicipality",
-    "Fuera de la provincia": "OutsideProvince",
+    "En el mismo municipio": "same_muni",
+    "Fuera de la provincia": "outside_prov",
     # parents birthplace / residence
-    "España pero distinta comunidad autónoma": "SpainDifferentRegion",
-    "Misma comunidad autónoma pero distinta provincia": "SameRegionDifferentProvince",
-    "Misma provincia pero distinto municipio": "SameProvinceDifferentMunicipality",
-    "Mismo municipio": "SameMunicipality",
-    "Ningún progenitor ha nacido en España": "NoParentBornInSpain",
-    "Distinto país": "DifferentCountry",
-    "Mismo país": "SameCountry",
-    "Mismo hogar": "SameHousehold",
-    "Mismo municipio pero distinto hogar": "SameMunicipalityDifferentHousehold",
-    "Ningún progenitor reside en España": "NoParentResidesInSpain",
-    "Diferente nacionalidad": "DifferentNationality",
-    "Misma nacionalidad": "SameNationality",
+    "España pero distinta comunidad autónoma": "es_other_region",
+    "Misma comunidad autónoma pero distinta provincia": "same_region_other_prov",
+    "Misma provincia pero distinto municipio": "same_prov_other_muni",
+    "Mismo municipio": "same_muni",
+    "Ningún progenitor ha nacido en España": "no_parent_born_es",
+    "Distinto país": "other_country",
+    "Mismo país": "same_country",
+    "Mismo hogar": "same_hh",
+    "Mismo municipio pero distinto hogar": "same_muni_other_hh",
+    "Ningún progenitor reside en España": "no_parent_resides_es",
+    "Diferente nacionalidad": "different_nationality",
+    "Misma nacionalidad": "same_nationality",
     # parents education level
-    "Mayor nivel de estudios que sus progenitores": "HigherThanParents",
-    "Menor nivel de estudios que sus progenitores": "LowerThanParents",
-    "Mismo nivel de estudios que sus progenitores": "SameAsParents",
+    "Mayor nivel de estudios que sus progenitores": "higher_than_parents",
+    "Menor nivel de estudios que sus progenitores": "lower_than_parents",
+    "Mismo nivel de estudios que sus progenitores": "same_as_parents",
     # age (single-person households)
-    "De 30 a 39 años": "30To39",
-    "De 40 a 49 años": "40To49",
-    "De 50 a 59 años": "50To59",
-    "De 60 a 69 años": "60To69",
-    "De 70 a 79 años": "70To79",
-    "De 80 y más años": "80OrOver",
-    "Menos de 30 años": "LessThan30",
+    "De 30 a 39 años": "30_39",
+    "De 40 a 49 años": "40_49",
+    "De 50 a 59 años": "50_59",
+    "De 60 a 69 años": "60_69",
+    "De 70 a 79 años": "70_79",
+    "De 80 y más años": "80plus",
+    "Menos de 30 años": "under_30",
     # nationality / marital status
-    "Española": "Spanish",
-    "Extranjera": "Foreign",
-    "Casado/a": "Married",
-    "Separado/a o divorciado/a": "SeparatedOrDivorced",
-    "Soltero/a": "Single",
-    "Viudo/a": "Widowed",
+    "Española": "spanish",
+    "Extranjera": "foreign",
+    "Casado/a": "married",
+    "Separado/a o divorciado/a": "separated_divorced",
+    "Soltero/a": "single",
+    "Viudo/a": "widowed",
     # education level
-    "Educación primaria e inferior": "PrimaryOrBelow",
-    "Educación superior": "Tertiary",
-    "Primera etapa de educación secundaria y similar": "LowerSecondary",
-    "Segunda etapa de educación secundaria y educación postsecundaria no superior": "UpperSecondary",
+    "Educación primaria e inferior": "primary_or_below",
+    "Educación superior": "tertiary",
+    "Primera etapa de educación secundaria y similar": "lower_secondary",
+    "Segunda etapa de educación secundaria y educación postsecundaria no superior": "upper_secondary",
     # employment status
-    "Jubilado/a, prejubilado/a o incapacitado/a permamentemente para trabajar": "RetiredOrDisabled",
-    "No trabaja": "NotWorking",
-    "Ocupado/a": "Employed",
+    "Jubilado/a, prejubilado/a o incapacitado/a permamentemente para trabajar": "retired_or_disabled",
+    "No trabaja": "not_working",
+    "Ocupado/a": "employed",
     # income levels (single-person households)
-    "3.000 euros o más": "3000EurOrMore",
-    "De 1.000 euros a menos de 1.500 euros": "1000To1500Eur",
-    "De 1.500 euros a menos de 2.000 euros": "1500To2000Eur",
-    "De 2.000 euros a menos de 3.000 euros": "2000To3000Eur",
-    "Menos de 1.000 euros": "LessThan1000Eur",
+    "3.000 euros o más": "ge_3000eur",
+    "De 1.000 euros a menos de 1.500 euros": "1000_1500eur",
+    "De 1.500 euros a menos de 2.000 euros": "1500_2000eur",
+    "De 2.000 euros a menos de 3.000 euros": "2000_3000eur",
+    "Menos de 1.000 euros": "under_1000eur",
     # couple sex / nationality
-    "Pareja de distinto sexo": "DifferentSex",
-    "Pareja del mismo sexo": "SameSex",
-    "Ambos españoles": "BothSpanish",
-    "Ambos extranjeros": "BothForeign",
-    "Español/a y extranjero/a": "SpanishAndForeign",
+    "Pareja de distinto sexo": "different_sex",
+    "Pareja del mismo sexo": "same_sex",
+    "Ambos españoles": "both_spanish",
+    "Ambos extranjeros": "both_foreign",
+    "Español/a y extranjero/a": "spanish_and_foreign",
     # number of children
-    "0 hijos conviviendo": "0Cohabiting",
-    "0 hijos conviviendo menores de 25 años": "0CohabitingUnder25",
-    "Algún hijo conviviendo": "SomeCohabiting",
-    "Algún hijo conviviendo menor de 25 años": "SomeCohabitingUnder25",
-    "Ningún hijo conviviendo menor de 25 años": "NoneCohabitingUnder25",
+    "0 hijos conviviendo": "0_cohabiting",
+    "0 hijos conviviendo menores de 25 años": "0_cohabiting_under25",
+    "Algún hijo conviviendo": "some_cohabiting",
+    "Algún hijo conviviendo menor de 25 años": "some_cohabiting_under25",
+    "Ningún hijo conviviendo menor de 25 años": "none_cohabiting_under25",
     # useful floor area
-    "Hasta 45 m2": "UpTo45m2",
-    "Entre 46 y 60 m2": "46To60m2",
-    "Menos de 60 m2": "LessThan60m2",
-    "Entre 61 y 75 m2": "61To75m2",
-    "Entre 76 y 90 m2": "76To90m2",
-    "Entre 91 y 105 m2": "91To105m2",
-    "Entre 106 y 120 m2": "106To120m2",
-    "Entre 121 y 150 m2": "121To150m2",
-    "Más de 150 m2": "MoreThan150m2",
+    "Hasta 45 m2": "le_45m2",
+    "Entre 46 y 60 m2": "46_60m2",
+    "Menos de 60 m2": "under_60m2",
+    "Entre 61 y 75 m2": "61_75m2",
+    "Entre 76 y 90 m2": "76_90m2",
+    "Entre 91 y 105 m2": "91_105m2",
+    "Entre 106 y 120 m2": "106_120m2",
+    "Entre 121 y 150 m2": "121_150m2",
+    "Más de 150 m2": "over_150m2",
     # building type
-    "Edificio de 2 o más viviendas": "MultiFamily",
-    "Vivienda unifamiliar (chalet, adosado, pareado...)": "SingleFamily",
+    "Edificio de 2 o más viviendas": "multi_family",
+    "Vivienda unifamiliar (chalet, adosado, pareado...)": "single_family",
     # tenure regime
-    "Alquilada": "Rented",
-    "Cedida gratis o a bajo precio (por otro hogar, pagada por la empresa...) u otra forma": "CededOrOther",
-    "Propia por herencia o donación": "OwnedInheritedOrGifted",
-    "Propia, por compra, con pagos pendientes (hipotecas)": "OwnedWithMortgage",
-    "Propia, por compra, totalmente pagada": "OwnedFullyPaid",
+    "Alquilada": "rented",
+    "Cedida gratis o a bajo precio (por otro hogar, pagada por la empresa...) u otra forma": "ceded_or_other",
+    "Propia por herencia o donación": "owned_inherited",
+    "Propia, por compra, con pagos pendientes (hipotecas)": "owned_with_mortgage",
+    "Propia, por compra, totalmente pagada": "owned_fully_paid",
     # rent / mortgage brackets
-    "Menos de 200 euros": "LessThan200Eur",
-    "De 200 euros a menos de 500 euros": "200To500Eur",
-    "De 500 euros a menos de 700 euros": "500To700Eur",
-    "De 700 euros a menos de 1.000 euros": "700To1000Eur",
-    "De 1.000 euros o más": "1000EurOrMore",
+    "Menos de 200 euros": "under_200eur",
+    "De 200 euros a menos de 500 euros": "200_500eur",
+    "De 500 euros a menos de 700 euros": "500_700eur",
+    "De 700 euros a menos de 1.000 euros": "700_1000eur",
+    "De 1.000 euros o más": "ge_1000eur",
     # second home
-    "En el mismo municipio que la primera residencia": "SameMunicipalityAsPrimary",
-    "En otra CCAA": "AnotherRegion",
-    "En otra provincia, pero en la misma CCAA": "AnotherProvinceSameRegion",
-    "60 o más días": "60OrMoreDays",
-    "Entre 15 y 29 días": "15To29Days",
-    "Entre 30 y 59 días": "30To59Days",
-    "Menos de 15 días": "LessThan15Days",
+    "En el mismo municipio que la primera residencia": "same_muni_as_primary",
+    "En otra CCAA": "other_region",
+    "En otra provincia, pero en la misma CCAA": "other_prov_same_region",
+    "60 o más días": "60plus_days",
+    "Entre 15 y 29 días": "15_29days",
+    "Entre 30 y 59 días": "30_59days",
+    "Menos de 15 días": "under_15days",
     # eco vehicle
-    "No tiene vehículo ecológico (híbrido o eléctrico)": "No",
-    "Tiene algún vehículo ecológico (híbrido o eléctrico)": "Yes",
+    "No tiene vehículo ecológico (híbrido o eléctrico)": "no",
+    "Tiene algún vehículo ecológico (híbrido o eléctrico)": "yes",
     # separated waste type
-    "Envases": "Packaging",
-    "Orgánico": "Organic",
-    "Papel": "Paper",
-    "Vidrio": "Glass",
+    "Envases": "packaging",
+    "Orgánico": "organic",
+    "Papel": "paper",
+    "Vidrio": "glass",
     # paid domestic service / external help
-    "No dispone de servicio doméstico": "No",
-    "Sí, dispone de servicio doméstico": "Yes",
-    "No dispone de ayudas externas no remuneradas": "None",
-    "Sí, dispone de ayudas de familiares, parientes, amigos, vecinos": "FromFamilyOrFriends",
-    "Sí, dispone de ayudas de otros, como servicios sociales o una ONG": "FromSocialServicesOrNGO",
+    "No dispone de servicio doméstico": "no",
+    "Sí, dispone de servicio doméstico": "yes",
+    "No dispone de ayudas externas no remuneradas": "none",
+    "Sí, dispone de ayudas de familiares, parientes, amigos, vecinos": "family_or_friends",
+    "Sí, dispone de ayudas de otros, como servicios sociales o una ONG": "social_services_or_ngo",
     # heating type
-    "No tiene calefacción": "None",
-    "No tiene instalación de calefacción pero sí algún aparato que permite calentar alguna habitación (por ejemplo radiadores eléctricos)": "NoInstallationButAppliance",
-    "Sí, colectiva": "CollectiveCentral",
-    "Sí, individual": "Individual",
+    "No tiene calefacción": "none",
+    "No tiene instalación de calefacción pero sí algún aparato que permite calentar alguna habitación (por ejemplo radiadores eléctricos)": "no_install_but_appliance",
+    "Sí, colectiva": "collective",
+    "Sí, individual": "individual",
     # fuel type
-    "Electricidad": "Electricity",
-    "Gas natural": "NaturalGas",
-    "Otros": "Other",
-    "Petróleo o derivados (gasoil, fueloil, gasolina...)": "OilDerivatives",
+    "Electricidad": "electricity",
+    "Gas natural": "natural_gas",
+    "Otros": "other",
+    "Petróleo o derivados (gasoil, fueloil, gasolina...)": "oil_derivatives",
     # water supply
-    "Agua corriente por abastecimiento privado o particular del edificio": "PrivateSupply",
-    "Agua corriente por abastecimiento público": "PublicSupply",
+    "Agua corriente por abastecimiento privado o particular del edificio": "private_supply",
+    "Agua corriente por abastecimiento público": "public_supply",
     # internet connection
-    "Conexión fija": "Fixed",
-    "Conexión fija y móvil": "FixedAndMobile",
-    "Conexión móvil": "Mobile",
-    "Sin conexión": "NoConnection",
+    "Conexión fija": "fixed",
+    "Conexión fija y móvil": "fixed_and_mobile",
+    "Conexión móvil": "mobile",
+    "Sin conexión": "none",
     # appliances
-    "Horno": "Oven",
-    "Lavadora": "WashingMachine",
-    "Lavavajillas": "Dishwasher",
-    "Microondas": "Microwave",
-    "Secadora": "Dryer",
-    "Vitocerámica/Inducción": "CeramicInductionHob",
+    "Horno": "oven",
+    "Lavadora": "washing_machine",
+    "Lavavajillas": "dishwasher",
+    "Microondas": "microwave",
+    "Secadora": "dryer",
+    "Vitocerámica/Inducción": "ceramic_induction_hob",
     # bulbs
-    "Bajo consumo": "LowConsumption",
-    "Halógena": "Halogen",
-    "Led": "Led",
+    "Bajo consumo": "low_consumption",
+    "Halógena": "halogen",
+    "Led": "led",
     # toilet / bath
-    "Aseo con inodoro": "ToiletWithWC",
-    "Bañera o ducha": "BathOrShower",
+    "Aseo con inodoro": "toilet",
+    "Bañera o ducha": "bath_or_shower",
     # area problems
-    "Contaminación o malos olores": "PollutionOrOdors",
-    "Delincuencia": "Crime",
-    "Malas comunicaciones": "PoorTransportLinks",
-    "Molestias relacionadas con actividades turísticas o locales de hostelería": "TourismOrHospitalityNuisance",
-    "Poca limpieza en las calles": "DirtyStreets",
-    "Pocas zonas verdes": "FewGreenAreas",
-    "Ruidos exteriores": "OutdoorNoise",
+    "Contaminación o malos olores": "pollution_odors",
+    "Delincuencia": "crime",
+    "Malas comunicaciones": "poor_transport",
+    "Molestias relacionadas con actividades turísticas o locales de hostelería": "tourism_nuisance",
+    "Poca limpieza en las calles": "dirty_streets",
+    "Pocas zonas verdes": "few_green_areas",
+    "Ruidos exteriores": "outdoor_noise",
     # nearby infrastructure / services
-    "Colegio": "School",
-    "Farmacia": "Pharmacy",
-    "Hospital, centros de salud o ambulatorio": "HospitalOrHealthCenter",
-    "Servicios de restauración (bares, restaurantes...)": "FoodServices",
-    "Supermercado": "Supermarket",
+    "Colegio": "school",
+    "Farmacia": "pharmacy",
+    "Hospital, centros de salud o ambulatorio": "hospital_health_center",
+    "Servicios de restauración (bares, restaurantes...)": "food_services",
+    "Supermercado": "supermarket",
     # conservation status
-    "Excelente": "Excellent",
-    "Muy bueno": "VeryGood",
-    "Bueno": "Good",
-    "Normal": "Normal",
-    "Regular": "Fair",
-    "Malo": "Bad",
+    "Excelente": "excellent",
+    "Muy bueno": "very_good",
+    "Bueno": "good",
+    "Normal": "normal",
+    "Regular": "fair",
+    "Malo": "bad",
     # accessibility
-    "Es accesible": "Accessible",
-    "No es accesible": "NotAccessible",
+    "Es accesible": "accessible",
+    "No es accesible": "not_accessible",
     # installation type
-    "Agua caliente central": "CentralHotWater",
-    "Ascensor": "Elevator",
-    "Dispositivo de energía renovable": "RenewableEnergyDevice",
-    "Garaje": "Garage",
-    "Gas por tubería": "PipedGas",
+    "Agua caliente central": "central_hot_water",
+    "Ascensor": "elevator",
+    "Dispositivo de energía renovable": "renewable_device",
+    "Garaje": "garage",
+    "Gas por tubería": "piped_gas",
     # garage spaces
-    "De 3 a 20": "3To20",
-    "De 21 a 50": "21To50",
-    "Más de 50": "MoreThan50",
+    "De 3 a 20": "3_20",
+    "De 21 a 50": "21_50",
+    "Más de 50": "over_50",
     # renewable energy device type
-    "No dispone de dispositivo de energía renovable": "None",
-    "Un único tipo de dispositivo: Energía solar fotovoltaica, eólica, biomasa, etc": "SingleDeviceSolarPvWindBiomass",
-    "Un único tipo de dispositivo: Energía solar térmica": "SingleDeviceSolarThermal",
+    "No dispone de dispositivo de energía renovable": "none",
+    "Un único tipo de dispositivo: Energía solar fotovoltaica, eólica, biomasa, etc": "solar_pv_wind_biomass",
+    "Un único tipo de dispositivo: Energía solar térmica": "solar_thermal",
 }
 
 
@@ -898,20 +920,23 @@ def _clean_ec_part(text):
 def _translate_ec_part(text, mapping, unmapped=None):
     cleaned = _clean_ec_part(text)
     if cleaned in mapping:
+        # Curated values are authored directly in the final short snake_case.
         return mapping[cleaned]
     if unmapped is not None and cleaned:
         unmapped.add(cleaned)
-    return _camelize(cleaned)
+    # Unmapped fragments fall back to an accent-stripped, snake_cased form.
+    return utils.to_snake_case(_camelize(cleaned))
 
 
 def translate_ec_column(col, unmapped=None):
     """Translate one ``ec__…`` Spanish column name to English snake_case.
 
     Parses ``ec__{group} - {variable} ~ {subclass}`` and joins the translated
-    parts as ``ec__{group}_{variable}_{subclass}`` (snake_case, ``ec__``
-    namespace prefix), e.g. ``ec__main_dwellings_heating_type_individual``.
-    Non-``ec__`` names are returned unchanged. Unknown parts fall back to
-    :func:`_camelize` (and are collected in ``unmapped`` when a set is passed).
+    parts as ``ec__{group}_{variable}_{subclass}`` (short snake_case, ``ec__``
+    namespace prefix), e.g. ``ec__main_dwellings_heating_individual``.
+    Non-``ec__`` names are returned unchanged. Unknown parts fall back to a
+    snake_cased :func:`_camelize` (and are collected in ``unmapped`` when a set
+    is passed).
     """
     if not isinstance(col, str) or not col.startswith("ec__"):
         return col
@@ -928,9 +953,9 @@ def translate_ec_column(col, unmapped=None):
         _translate_ec_part(variable, _EC_VARIABLES, unmapped) if gsep else "",
         _translate_ec_part(subclass, _EC_SUBCLASSES, unmapped) if sep else "",
     ]
-    # Curated maps hold clean PascalCase words; snake_case the joined body and
-    # re-prepend the ``ec__`` namespace (kept literal, not snaked).
-    return "ec__" + utils.to_snake_case("_".join(p for p in parts if p))
+    # Parts are already snake_case (mapped verbatim, or snaked in the fallback);
+    # join them and re-prepend the ``ec__`` namespace (kept literal).
+    return "ec__" + "_".join(p for p in parts if p)
 
 
 def ec_column_rename_map(columns, warn_unmapped=False):
@@ -940,7 +965,7 @@ def ec_column_rename_map(columns, warn_unmapped=False):
     to the same target) are disambiguated with a ``_2``, ``_3``… suffix so no
     column is silently dropped. With ``warn_unmapped=True``, Spanish group/
     variable/subclass fragments missing from the dictionaries are reported to
-    stderr (they still get an accent-stripped CamelCase fallback).
+    stderr (they still get an accent-stripped, snake_cased fallback).
     """
     unmapped = set() if warn_unmapped else None
     mapping, seen = {}, {}
@@ -967,7 +992,7 @@ def rename_ec_columns(df, warn_unmapped=False):
     --------
     >>> gdf = hc.social.rename_ec_columns(gdf)
     # 'ec__Viviendas principales - Tipo de calefacción ~ Sí, individual'
-    #   -> 'ec__main_dwellings_heating_type_individual'
+    #   -> 'ec__main_dwellings_heating_individual'
     """
     mapping = ec_column_rename_map(df.columns, warn_unmapped=warn_unmapped)
     return df.rename(columns=mapping)

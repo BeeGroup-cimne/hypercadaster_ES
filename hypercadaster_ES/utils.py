@@ -5481,6 +5481,21 @@ def get_heavy_columns_for_building(wd, cadaster_code, building_reference,
     )
 
 
+def clear_cat_cache(wd, cadaster_code=None):
+    """Invalidate the cached CAT data so the next ``merge`` recomputes it.
+
+    Clears both central-DuckDB CAT caches: the parsed per-space table
+    (``cat_building_spaces``) and the per-building ``br__*`` aggregates
+    (``cat_building_attributes``). Both are pure functions of the static CAT
+    files, so they are reused on every run regardless of ``force_update`` — call
+    this after replacing the CAT files to force a re-parse. Pass
+    ``cadaster_code`` to clear a single municipality, or leave it ``None`` to
+    clear all. Returns the total number of cached rows removed.
+    """
+    from hypercadaster_ES import _db
+    return _db.cat_cache_clear(results_dir_(wd), cadaster_code)
+
+
 def read_addresses_indicators(cadaster_code, wd):
     """Read basic building indicators for a municipality.
 

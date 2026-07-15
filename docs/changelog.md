@@ -4,6 +4,61 @@ All notable changes to hypercadaster_ES will be documented in this file. The for
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-07-15
+
+### ⚡ CAT attribute caches in the central DuckDB (big re-run speedup)
+
+A no-inference CAT merge over a whole province took ~1 h of "CAT" time. Profiling
+showed the cost is **not** the CAT file read (~1 s even for a 160k-space
+municipality) but `br_attributes_from_CAT` — a per-building aggregation that runs
+~99 s for a 21k-space municipality (minutes for the largest). Both are now cached
+in `results/building_results.duckdb`, keyed by `cadaster_code`:
+
+- **`cat_building_spaces`** — the parsed per-space CAT table
+  (`parse_horizontal_division_buildings_CAT_files`).
+- **`cat_building_attributes`** — the per-building `br__*` aggregates
+  (`br_attributes_from_CAT` output); complex dict/list columns are pickled.
+
+Measured on the full Lleida province (231 municipalities, 831k spaces / 145k
+buildings): the cold aggregation costs **71 min** in total — 938 s for Lleida
+city (`25900`) alone — while the cached re-read of the same municipality takes
+**2.6 s (~366×)**; smaller ones land at ~0.6–0.9 s (~99 s → 0.6 s, ~165× for
+`25049`). Cached output is identical, nested `br__*` dict/list values included.
+Like the raw `.CAT`→parquet cache, both caches are pure
+functions of the static CAT files, so they are **reused regardless of
+`force_update`** (the first run populates them). Clear them after replacing CAT
+files with `hc.utils.clear_cat_cache(wd[, cadaster_code])`.
+
+- Writes are idempotent per municipality and degrade gracefully — any cache
+  read/write error falls back to a normal parse/aggregate and never breaks the
+  merge.
+- New helpers: `_db.cat_cache_read/write`, `_db.cat_attrs_read/write`,
+  `_db.cat_cache_clear`, `utils.clear_cat_cache`.
+
+### 🔤 Shorter `ec__*` names + income-source fixes (breaking for these columns)
+
+- **`ec__*` Essential Characteristics** columns are now **shorter snake_case**,
+  same `group_variable_subclass` hierarchy. The curated Spanish→English maps hold
+  the final short values directly, so digit brackets are cleanly separated
+  (fixes e.g. `ec__households_useful_floor_area_up_to45m2` →
+  `ec__households_floor_area_le_45m2`, `..._heating_type_individual` →
+  `..._heating_individual`).
+- **Income Atlas "source of income"** indicators are **percentages**, not €, and
+  renamed accordingly: `so__salary_income_per_person` →
+  `so__pct_income_source_salary`, `…pension…` → `so__pct_income_source_pension`,
+  `…unemployment…` → `so__pct_income_source_unemployment`,
+  `so__other_benefits_income_per_person` → `so__pct_income_source_other_benefits`,
+  `so__other_income_per_person` → `so__pct_income_source_capital_investments_secondary`.
+
+### 🔊 Logging & warnings
+
+- `merge()` now announces each contextual join on stderr regardless of `verbose`:
+  `Joining the socioeconomic and sociodemographic data of last N years (datasets: …)`
+  and `Joining the Weather data of last N years (YYYY-YYYY)`.
+- Silenced the flood of `RuntimeWarning: invalid value encountered in divide`
+  emitted by the third-party `social_ES` package during the `ec__*` downscaling
+  (harmless 0/0 → NaN for empty section groups).
+
 ## [1.2.1] - 2026-07-14
 
 ### 🏷️ Namespaced, snake_case contextual columns (breaking)

@@ -375,7 +375,15 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
         Parallel worker processes for the inference (``-1`` = all cores).
     force_update : bool, default False
         Recompute and overwrite cached DuckDB tables instead of reusing existing
-        (already-processed zones are otherwise skipped on re-runs).
+        (already-processed zones are otherwise skipped on re-runs). Note this does
+        **not** re-read/re-aggregate the CAT files: with ``use_CAT_files=True`` the
+        parsed per-space table (``cat_building_spaces``) and the expensive
+        per-building ``br__*`` aggregates (``cat_building_attributes``, the
+        dominant cost of a CAT merge) are cached in the central DuckDB keyed by
+        ``cadaster_code`` and reused on every run. Like the raw ``.CAT``→parquet
+        cache, they are pure functions of the static CAT files. To force a CAT
+        re-parse/re-aggregate (e.g. after replacing the CAT files), clear them
+        with :func:`hypercadaster_ES.utils.clear_cat_cache`.
     cleanup_shards : bool, default True
         Delete the per-zone shard DuckDB files after ingesting them into the
         central database.

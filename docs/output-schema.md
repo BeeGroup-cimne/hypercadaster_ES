@@ -358,7 +358,7 @@ recent `social_ES_years` (default 5) are kept per dataset.
 | Column pattern | Level | Description |
 |----------------|-------|-------------|
 | `so__net_income_per_household_{year}`, `so__net_income_per_person_{year}`, `so__net_income_per_consumption_unit_{year}`, `so__gross_income_per_household_{year}`, `so__gross_income_per_person_{year}`, `so__median_income_per_consumption_unit_{year}` | Section | Income Atlas — mean/median income (€) |
-| `so__salary_income_per_person_{year}`, `so__pension_income_per_person_{year}`, `so__unemployment_income_per_person_{year}`, `so__other_benefits_income_per_person_{year}`, `so__other_income_per_person_{year}` | Section | Income Atlas — income by source (€) |
+| `so__pct_income_source_salary_{year}`, `so__pct_income_source_pension_{year}`, `so__pct_income_source_unemployment_{year}`, `so__pct_income_source_other_benefits_{year}`, `so__pct_income_source_capital_investments_secondary_{year}` | Section | Income Atlas — **% share** of household income by source (not €) |
 | `so__gini_index_{year}`, `so__income_p80_p20_{year}`, `so__average_age_{year}`, `so__average_household_size_{year}`, `so__pct_spanish_{year}`, `so__pct_single_person_households_{year}`, `so__pct_over_65_{year}`, `so__pct_under_18_{year}`, `so__population_{year}` | Section | Income Atlas — inequality & demographics |
 | `so__pct_foreign_nationality_{year}`, `so__pct_foreign_born_{year}`, `so__pct_male_{year}`, `so__pct_under_15_{year}`, `so__pct_working_age_{year}`, `so__pct_65_plus_{year}` | Section | Population Census — population shares (%) |
 | `so__pct_edu_primary_or_below_{year}`, `so__pct_edu_lower_secondary_{year}`, `so__pct_edu_upper_secondary_{year}`, `so__pct_edu_tertiary_{year}`, `so__pct_employed_{year}`, `so__pct_unemployed_{year}`, `so__pct_student_{year}`, `so__pct_pensioner_{year}`, `so__pct_other_inactive_{year}` | Section | Education & Employment Census (%) |
@@ -375,9 +375,9 @@ When `use_CAT_files=True` and the `essential_characteristics` dataset is selecte
 (default when `social_ES_datasets=None`), the INE *Essential Characteristics of
 Population and Households* survey is downscaled to each building as `ec__*`
 proportion columns (percentages; each variable group sums to 100). Column names
-are **English snake_case**, `ec__{group}_{variable}_{subclass}`, e.g.
-`ec__main_dwellings_heating_type_individual`,
-`ec__people_in_households_number_of_vehicles_3_or_more`. The survey is published only
+are **short English snake_case**, `ec__{group}_{variable}_{subclass}`, e.g.
+`ec__main_dwellings_heating_individual`,
+`ec__hh_people_n_vehicles_3plus`. The survey is published only
 for larger municipalities (~147 nationwide), so these columns populate only there.
 
 ## 🌦️ Weather Indicators (weather_layer=True)

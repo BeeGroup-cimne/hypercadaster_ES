@@ -139,6 +139,8 @@ lifecycle, schema DDL, CRS sidecar, and GeoDataFrame ↔ DuckDB round-trips.
 | `buildings` | Final merged building GeoDataFrame per municipality |
 | `br_results` | Building-reference inference output (shadows, wall segments) |
 | `sbr_results` | Space-reference inference output |
+| `cat_building_spaces` | Parsed CAT per-space table, cached per `cadaster_code` (feeds the area pivot / inference) |
+| `cat_building_attributes` | Per-building `br__*` CAT aggregates (`br_attributes_from_CAT` output), cached per `cadaster_code` — reused on every re-run (the ~99 s→0.4 s/municipality speedup); clear with `hc.utils.clear_cat_cache` |
 | `aux_building_parts` | Building parts + proximity flags |
 | `aux_footprints` | Floor footprints |
 | `_meta`, `zone_status` | CRS store and per-zone progress ledger |

@@ -44,10 +44,10 @@ use_CAT_files = True               # Use detailed CAT format files (also gates e
 CAT_files_rel_dir = "cadaster/CAT_files"    # Directory containing CAT files
 pois_layer = True                  # POIs from OpenStreetMaps
 social_ES_layer = True             # INE socioeconomic enrichment (runs before POIs)
-social_ES_years = 5                # Most-recent N years per dataset -> so__{indicator}_{year}
+social_ES_years = 10                # Most-recent N years per dataset -> so__{indicator}_{year}
 social_ES_datasets = None          # All datasets; essential_characteristics included (use_CAT_files=True)
 weather_layer = True               # Weather from ERA5-Land data
-weather_years = 5                  # Most-recent N years per weather indicators -> we__{indicator}_{year}
+weather_years = 10                  # Most-recent N years per weather indicators -> we__{indicator}_{year}
 force_update = False
 cleanup_shards = True
 

@@ -120,14 +120,17 @@ def test_essential_characteristics_required_cols():
 def test_translate_ec_column_examples():
     cases = {
         "ec__Personas de 16 años o más - Lugar de trabajo/estudio ~ En el municipio en el que resido":
-            "ec__people16_or_over_work_study_location_in_municipality_of_residence",
+            "ec__people_16plus_work_study_place_same_muni",
         "ec__Viviendas principales - Tipo de calefacción ~ Sí, individual":
-            "ec__main_dwellings_heating_type_individual",
+            "ec__main_dwellings_heating_individual",
         "ec__Hogares/personas en viviendas propias, - Cuota mensual de la hipoteca ~ De 1.000 euros o más":
-            "ec__people_living_in_their_own_homes_monthly_mortgage_1000_eur_or_more",
+            "ec__owned_homes_monthly_mortgage_ge_1000eur",
         # trailing "(%)" is stripped
         "ec__Viviendas principales - Tipo de electrodoméstico ~ Vitocerámica/Inducción (%)":
-            "ec__main_dwellings_appliance_type_ceramic_induction_hob",
+            "ec__main_dwellings_appliance_ceramic_induction_hob",
+        # digit spacing: number brackets are cleanly separated (le_45m2, not le45m2)
+        "ec__Hogares - Superficie útil de la vivienda ~ Hasta 45 m2":
+            "ec__households_floor_area_le_45m2",
         # non-ec columns are untouched
         "so__net_income_per_household_2020": "so__net_income_per_household_2020",
         "geometry": "geometry",
@@ -145,11 +148,11 @@ def test_rename_ec_columns_frame():
     })
     out = social.rename_ec_columns(df)
     # Distinct groups -> distinct English names, no collision, data preserved.
-    assert "ec__households_number_of_vehicles_3_or_more" in out.columns
-    assert "ec__people_in_households_number_of_vehicles_3_or_more" in out.columns
+    assert "ec__households_n_vehicles_3plus" in out.columns
+    assert "ec__hh_people_n_vehicles_3plus" in out.columns
     assert out.columns.duplicated().sum() == 0
     assert out["so__net_income_per_household_2020"].iloc[0] == 1.0
-    assert out["ec__households_number_of_vehicles_3_or_more"].iloc[0] == 10.0
+    assert out["ec__households_n_vehicles_3plus"].iloc[0] == 10.0
 
 
 def test_translate_ec_column_idempotent():

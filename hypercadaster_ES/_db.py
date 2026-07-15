@@ -97,6 +97,231 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
 
 
 # ---------------------------------------------------------------------------
+# CAT-file attribute cache — the parsed per-space building table
+# ---------------------------------------------------------------------------
+# Reading + transforming the CAT files (parse_horizontal_division_buildings_
+# CAT_files) is the dominant fixed cost of a no-inference CAT merge — ~1 h for a
+# whole province. Its output (one row per building space, all primitive columns,
+# no geometry) is cached here keyed by cadaster_code so re-runs skip the parse.
+CAT_SPACES_TABLE = "cat_building_spaces"
+
+
+def _table_exists(con: duckdb.DuckDBPyConnection, table: str) -> bool:
+    return con.execute(
+        "SELECT 1 FROM information_schema.tables WHERE table_name = ?",
+        [table],
+    ).fetchone() is not None
+
+
+def cat_cache_read(results_dir: str, cadaster_code: str):
+    """Return the cached CAT building-space frame for one municipality, or None.
+
+    Reads back the exact per-space table produced by
+    ``parse_horizontal_division_buildings_CAT_files`` and stored by
+    :func:`cat_cache_write`, as a polars DataFrame (``cadaster_code`` column
+    dropped). Returns ``None`` when the cache table or the municipality's rows are
+    absent — or on any error, so a stale/corrupt cache degrades to a re-parse
+    instead of breaking the merge.
+    """
+    path = db_path(results_dir)
+    if not os.path.exists(path):
+        return None
+    con = None
+    try:
+        con = duckdb.connect(path, read_only=True)
+        if not _table_exists(con, CAT_SPACES_TABLE):
+            return None
+        df = con.execute(
+            f'SELECT * FROM "{CAT_SPACES_TABLE}" WHERE cadaster_code = ?',
+            [str(cadaster_code)],
+        ).pl()
+        if df.height == 0:
+            return None
+        return df.drop("cadaster_code")
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"CAT cache read failed for {cadaster_code} ({e}); re-parsing\n")
+        return None
+    finally:
+        if con is not None:
+            con.close()
+
+
+def cat_cache_clear(results_dir: str, cadaster_code: Optional[str] = None) -> int:
+    """Invalidate the CAT caches so the next merge re-parses and re-aggregates.
+
+    Clears both CAT caches (``cat_building_spaces`` per-space parse and
+    ``cat_building_attributes`` per-building aggregates): the rows for one
+    ``cadaster_code`` (or every row / the whole tables when ``cadaster_code is
+    None``). Returns the total number of rows removed across both tables (0 when
+    neither exists). Use after replacing the CAT files, since the caches are
+    otherwise reused regardless of ``force_update``.
+    """
+    path = db_path(results_dir)
+    if not os.path.exists(path):
+        return 0
+    con = None
+    removed = 0
+    try:
+        con = open_db(results_dir)
+        for tbl in (CAT_SPACES_TABLE, CAT_ATTRS_TABLE):
+            if not _table_exists(con, tbl):
+                continue
+            if cadaster_code is None:
+                removed += con.execute(f'SELECT COUNT(*) FROM "{tbl}"').fetchone()[0]
+                con.execute(f'DROP TABLE "{tbl}"')
+            else:
+                removed += con.execute(
+                    f'SELECT COUNT(*) FROM "{tbl}" WHERE cadaster_code = ?',
+                    [str(cadaster_code)]).fetchone()[0]
+                con.execute(
+                    f'DELETE FROM "{tbl}" WHERE cadaster_code = ?',
+                    [str(cadaster_code)])
+        return int(removed)
+    finally:
+        if con is not None:
+            con.close()
+
+
+def cat_cache_write(results_dir: str, cadaster_code: str, buildings_cat) -> None:
+    """Store one municipality's parsed CAT building-space frame in the central DB.
+
+    Idempotent per ``cadaster_code``: any existing rows for the municipality are
+    replaced (so a re-parse refreshes the cache). The table is created on first
+    use and its schema extended (``ADD COLUMN``) if a later municipality carries a
+    column not seen before. ``buildings_cat`` is the polars frame returned by
+    ``parse_horizontal_division_buildings_CAT_files``. Any failure is swallowed
+    with a warning — caching is an optimisation and must never break the merge.
+    """
+    import polars as pl
+
+    if buildings_cat is None or getattr(buildings_cat, "height", 0) == 0:
+        return
+    code = str(cadaster_code)
+    con = None
+    try:
+        df = buildings_cat
+        if "cadaster_code" in df.columns:
+            df = df.drop("cadaster_code")
+        df = df.with_columns(pl.lit(code).alias("cadaster_code"))
+
+        con = open_db(results_dir)
+        con.register("_cat_cache_tmp", df.to_arrow())
+        if not _table_exists(con, CAT_SPACES_TABLE):
+            con.execute(
+                f'CREATE TABLE "{CAT_SPACES_TABLE}" AS SELECT * FROM _cat_cache_tmp'
+            )
+        else:
+            existing = {r[0] for r in con.execute(
+                f'DESCRIBE "{CAT_SPACES_TABLE}"').fetchall()}
+            for name, ty in ((r[0], r[1]) for r in
+                             con.execute('DESCRIBE _cat_cache_tmp').fetchall()):
+                if name not in existing:
+                    con.execute(
+                        f'ALTER TABLE "{CAT_SPACES_TABLE}" ADD COLUMN "{name}" {ty}')
+            con.execute(
+                f'DELETE FROM "{CAT_SPACES_TABLE}" WHERE cadaster_code = ?', [code])
+            con.execute(
+                f'INSERT INTO "{CAT_SPACES_TABLE}" BY NAME SELECT * FROM _cat_cache_tmp')
+        con.unregister("_cat_cache_tmp")
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"CAT cache write failed for {cadaster_code} ({e}); "
+                         f"continuing without caching\n")
+    finally:
+        if con is not None:
+            con.close()
+
+
+# ---------------------------------------------------------------------------
+# CAT per-building attribute cache — the expensive br_attributes_from_CAT output
+# ---------------------------------------------------------------------------
+# The real cost of a no-inference CAT merge is not the CAT parse (~1 s even for a
+# 160k-space municipality) but ``br_attributes_from_CAT`` — a per-building
+# aggregation that runs for minutes on a large municipality. Its output (one row
+# per building, with many complex ``br__*`` dict/list columns) is cached here,
+# keyed by cadaster_code, and reused on every run. Complex columns are pickled to
+# BLOB by ``write_df_safe`` and rehydrated by ``read_df_safe``.
+CAT_ATTRS_TABLE = "cat_building_attributes"
+
+
+def cat_attrs_read(results_dir: str, cadaster_code: str):
+    """Return the cached per-building CAT attribute frame for a municipality.
+
+    The pandas frame produced by ``br_attributes_from_CAT`` (``cadaster_code``
+    column dropped), or ``None`` when absent — or on any error, so a stale/corrupt
+    cache degrades to a recompute instead of breaking the merge.
+    """
+    path = db_path(results_dir)
+    if not os.path.exists(path):
+        return None
+    con = None
+    try:
+        con = open_shard_read(path)
+        if not _table_exists(con, CAT_ATTRS_TABLE):
+            return None
+        df = read_df_safe(con, CAT_ATTRS_TABLE,
+                          where="cadaster_code = ?", params=[str(cadaster_code)])
+        if df is None or len(df) == 0:
+            return None
+        return df.drop(columns=["cadaster_code"])
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"CAT attrs cache read failed for {cadaster_code} "
+                         f"({e}); recomputing\n")
+        return None
+    finally:
+        if con is not None:
+            con.close()
+
+
+def cat_attrs_write(results_dir: str, cadaster_code: str, br_df) -> None:
+    """Store one municipality's per-building CAT attribute frame in the central DB.
+
+    Idempotent per ``cadaster_code`` (existing rows are replaced). ``br_df`` is the
+    pandas frame returned by ``br_attributes_from_CAT``; its complex ``br__*``
+    columns are pickled by ``write_df_safe``. Any failure is swallowed with a
+    warning — caching must never break the merge.
+    """
+    if br_df is None or len(br_df) == 0:
+        return
+    code = str(cadaster_code)
+    con = None
+    try:
+        df = br_df.copy()
+        df["cadaster_code"] = code
+        con = open_db(results_dir)
+        if not _table_exists(con, CAT_ATTRS_TABLE):
+            write_df_safe(con, CAT_ATTRS_TABLE, df, if_exists="replace")
+        else:
+            # Align to the existing column set/order so the positional INSERT in
+            # write_df_safe(append) stays correct even if a municipality's frame
+            # is ordered differently or misses a column.
+            existing = [r[0] for r in con.execute(
+                f'DESCRIBE "{CAT_ATTRS_TABLE}"').fetchall()]
+            for c in existing:
+                if c not in df.columns:
+                    df[c] = None
+            extra = [c for c in df.columns if c not in existing]
+            if extra:
+                # Unexpected new column(s): fall back to a full rewrite so nothing
+                # is silently dropped (schema stays a superset).
+                con.execute(
+                    f'DELETE FROM "{CAT_ATTRS_TABLE}" WHERE cadaster_code = ?', [code])
+                prev = read_df_safe(con, CAT_ATTRS_TABLE)
+                combined = pd.concat([prev, df], ignore_index=True)
+                write_df_safe(con, CAT_ATTRS_TABLE, combined, if_exists="replace")
+            else:
+                df = df[existing]
+                con.execute(
+                    f'DELETE FROM "{CAT_ATTRS_TABLE}" WHERE cadaster_code = ?', [code])
+                write_df_safe(con, CAT_ATTRS_TABLE, df, if_exists="append")
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"CAT attrs cache write failed for {cadaster_code} "
+                         f"({e}); continuing without caching\n")
+    finally:
+        if con is not None:
+            con.close()
+
+
+# ---------------------------------------------------------------------------
 # CRS sidecar — the spatial extension does not store per-table CRS itself
 # ---------------------------------------------------------------------------
 
