@@ -137,6 +137,7 @@ short codes become `None`. The full mapping (with per-province provenance) is in
 | `building_area_offices` | Float | Office space area |
 | `building_area_warehouse_parking` | Float | Storage/parking area |
 | `building_area_industrial` | Float | Industrial space area |
+| `building_area_agricultural` | Float | Agricultural building area (rural sheds/barns; from the synthesized space for buildings absent from the CAT file) |
 | `building_area_religious` | Float | Religious buildings area |
 | `building_area_cultural` | Float | Cultural facilities area |
 | `building_area_healthcare_and_charity` | Float | Healthcare facilities area |
@@ -145,6 +146,7 @@ short codes become `None`. The full mapping (with per-province provenance) is in
 | `building_area_leisure_and_hospitality` | Float | Hotels, restaurants area |
 | `building_area_singular_building` | Float | Special/unique buildings area |
 | `building_area_urbanization_and_landscaping_works_undeveloped_land` | Float | Landscaping area |
+| `building_area_unknown` | Float | Area of spaces whose use type could not be resolved |
 
 ## 🔍 Advanced Building Space Analysis (building_inference=True and CAT files)
 
