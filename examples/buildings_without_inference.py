@@ -12,8 +12,9 @@ Key features demonstrated:
 - National auxiliary layers (postal codes, census tracts, elevation)
 - CAT files + POI enrichment + address compaction, inference disabled
 - ``social_ES`` socioeconomic layer: per-building INE income-atlas / population /
-  education / rental & housing price / electricity indicators, plus the CAT-gated
-  Essential Characteristics downscaling (``ec__*`` columns)
+  education / dwelling-stock / empty & secondary dwellings / rental & housing
+  price / electricity indicators, plus the CAT-gated Essential Characteristics
+  downscaling (``ec__*`` columns)
 
 Author: hypercadaster_ES examples
 """
@@ -98,4 +99,4 @@ else:
     print(f"Analysis completed. {len(gdf)} building spaces records were read.")
 
 import pprint
-pprint.pp(gdf.iloc[10].to_dict())
+pprint.pp(gdf[gdf["municipality_name"]=="LLEIDA"].iloc[0].to_dict())

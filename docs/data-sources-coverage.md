@@ -104,20 +104,39 @@ Spain's official statistical organization providing demographic and administrati
 
 #### **Socioeconomic & Demographic Indicators** *(via the `social_ES` package, `social_ES_layer=True`)*
 - **Source**: INE statistical operations, downloaded and cached whole-Spain under `{wd}/INE/…`
-- **Datasets & finest level joined onto each building**:
+- **Requires**: `social_ES >= 1.0.3`
+- **Datasets & finest level joined onto each building** — each indicator is taken
+  from exactly one of them, so nothing is published twice under two names:
   - **Household Income Distribution Atlas** — census **section** (net/gross income
-    per household·person·consumption-unit, income by source, Gini, P80/P20, and
-    demographic headline indicators), 2015–2023
-  - **Population Census** — census **section** (foreign nationality/birth, sex,
-    broad age-band shares)
+    per household·person·consumption-unit, a 2010-€ deflated series, income by
+    source, Gini, P80/P20, mean age and household structure), 2015–2023
+  - **Population Census** — census **section** (resident head count; foreign
+    nationality/birth, born-in-municipality, sex and broad age-band shares), 2021–2025
   - **Education & Employment Census** — census **section** (education level and
     labour-force status shares), 2021–2024
-  - **Household Rental Price Index** — **municipality**, 2011–2024
+  - **Dwellings and Population Census** — census **section** (dwelling stock,
+    main-dwelling share, tenure of the main dwellings, households), 2021
+  - **Empty and Secondary Dwellings Census** — **municipality**, the
+    main/secondary/**empty** split harmonised across the 2001, 2011 and 2021
+    censuses. Nationwide: INE withholds the split for small municipalities and
+    `social_ES` models it there (province-calibrated), flagging those rows in
+    `so__dwelling_use_predicted_{year}`
+  - **Household Rental Price Index** — **district** where INE publishes it, the
+    **municipal** series elsewhere, 2011–2024
   - **Housing Price Index** — **province** (quarterly → annual mean), 2007–2025
   - **Aggregated Electricity Consumption** — **district** (consumption percentiles), 2021
   - **Essential Characteristics of Population and Households** — per-building
-    downscaling to `ec__*` proportions (requires `use_CAT_files=True`); the INE
-    survey is published only for ~147 larger municipalities nationwide
+    downscaling to `ec__{variable}~{class}` proportion columns (requires
+    `use_CAT_files=True`); a curated 27 of the ~70 variables by default, the ones
+    the census layer and the cadaster do not already cover — heating type and
+    fuel, cooling, insulation, renewables, conservation status, accessibility,
+    vehicles, housing cost burden (`ec_variables=None` keeps all ~256 columns).
+    The INE survey is published only for ~147 larger municipalities nationwide
+  - **Time Use Survey (EET 2009-2010)** — not joined as columns: a weekly
+    **household occupancy agenda** per census tract (168 hourly
+    `Sleeping`/`WithActivity`/`NonOccupied` states), matched by autonomous
+    community and by the tract's `so__household_income_group_{year}` band and read
+    by the energy model — `social.time_use_household_occupancy(wd, tract)`
 - **Output columns**: `so__{indicator}_{year}` (`so__` namespace prefix,
   snake_case indicator, year as suffix); most recent `social_ES_years`
   (default 5) kept per dataset

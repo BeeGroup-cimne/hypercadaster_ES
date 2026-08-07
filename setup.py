@@ -3,7 +3,7 @@ from setuptools import find_packages, setup
 
 HERE = pathlib.Path(__file__).parent
 
-VERSION = "1.2.3"
+VERSION = "1.3.0"
 PACKAGE_NAME = "hypercadaster_es"
 AUTHOR = "Jose Manuel Broto Vispe"
 AUTHOR_EMAIL = "jmbrotovispe@gmail.com"
@@ -57,6 +57,7 @@ INSTALL_REQUIRES = [
     "arrow>=1.4.0",
     "fastkml>=1.4.0",
     "lxml>=6.0.2",
+    "duckdb>=1.5.3",
 
     # --- Web / HTTP ---
     "requests>=2.31,<3.0",
@@ -75,6 +76,7 @@ INSTALL_REQUIRES = [
     "kiwisolver>=1.4",
     "fonttools>=4.53",
     "pillow>=10.2",
+    "folium>=0.20.0",
 
     # --- CLI & packaging helpers ---
     "click>=8.1",
@@ -94,7 +96,9 @@ INSTALL_REQUIRES = [
     "PyYAML>=6.0",
 
     # --- Socioeconomic INE datasets (EUPL-1.2) ---
-    "social_ES>=1.0.0",
+    # 1.0.3 emits the Essential-Characteristics variables already translated to
+    # English snake_case and adds the dwellings / empty-and-secondary censuses.
+    "social_ES>=1.0.3",
 ]
 
 

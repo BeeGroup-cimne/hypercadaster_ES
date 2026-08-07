@@ -845,9 +845,22 @@ def join_other_constructions(building_gdf_, cadaster_dir, code):
     path = f"{cadaster_dir}/buildings/unzip/A.ES.SDGC.BU.{code}.otherconstruction.gml"
     if not os.path.exists(path):
         return building_gdf_
+    # A municipality with no detached constructions still ships the GML, as an
+    # empty FeatureCollection — and OGR then reports no layers at all rather than
+    # an empty ``OtherConstruction`` one. That is the ordinary "nothing to join"
+    # case, indistinguishable in its result from an empty layer, so it must not
+    # warn; reading straight away would raise "Layer 'OtherConstruction' could
+    # not be opened" on every such municipality.
+    try:
+        layers = set(gpd.list_layers(path)["name"])
+    except Exception as _e:  # noqa: BLE001 - unreadable file: warn below, once
+        sys.stderr.write(f"Could not read OtherConstruction for {code}: {_e}\n")
+        return building_gdf_
+    if "OtherConstruction" not in layers:
+        return building_gdf_
     try:
         oc = gpd.read_file(path, layer="OtherConstruction")
-    except Exception as _e:
+    except Exception as _e:  # noqa: BLE001 - the layer is there but unreadable
         sys.stderr.write(f"Could not read OtherConstruction for {code}: {_e}\n")
         return building_gdf_
     if oc.empty or "localId" not in oc.columns:
@@ -1944,7 +1957,7 @@ def join_by_census_tracts(gdf, census_tract_dir, columns=None, geometry_column =
     """Spatially join INE census-tract codes onto buildings.
 
     Reads ``validated_census_{year}.gpkg`` and assigns each building the census
-    section/district it falls within (``within`` predicate).
+    census-tract/district it falls within (``within`` predicate).
 
     Parameters
     ----------
@@ -1953,7 +1966,7 @@ def join_by_census_tracts(gdf, census_tract_dir, columns=None, geometry_column =
     census_tract_dir : str
         Directory holding the validated census GPKG.
     columns : dict, optional
-        Source→output column rename map (defaults to CUSEC→section_code,
+        Source→output column rename map (defaults to CUSEC→census_tract_code,
         CUDIS→district_code, geometry→census_geometry).
     geometry_column : str, default "census_geometry"
         Name of the census geometry column after renaming.
@@ -1963,11 +1976,11 @@ def join_by_census_tracts(gdf, census_tract_dir, columns=None, geometry_column =
     Returns
     -------
     geopandas.GeoDataFrame
-        ``gdf`` with ``section_code`` and ``district_code`` added.
+        ``gdf`` with ``census_tract_code`` and ``district_code`` added.
     """
     if columns is None:
         columns = {
-            "CUSEC": "section_code",
+            "CUSEC": "census_tract_code",
             "CUDIS": "district_code",
             "geometry": "census_geometry"
         }
@@ -1983,21 +1996,21 @@ def join_by_census_tracts(gdf, census_tract_dir, columns=None, geometry_column =
     return census_gdf
 
 
-def _ine_census2021_sections(wd):
-    """Section-level INE 2021 Census indicators, loaded directly from the main
+def _ine_census2021_census_tracts(wd):
+    """Census-tract-level INE 2021 Census indicators, loaded directly from the main
     ``C2021_Indicadores`` file and cached under ``{wd}/INE/Census2021_main``.
 
     Loaded here rather than via ``social_ES.INECensus2021`` because that helper
     additionally pulls supplementary INE files whose column layout INE has since
     changed (it currently raises ``KeyError: 'Municipio de residencia'``). The
-    main indicators file already carries every field we need at section
-    granularity. Returns a DataFrame keyed by ``section_code`` (CUSEC =
-    province+municipality+district+section)."""
+    main indicators file already carries every field we need at census-tract
+    granularity. Returns a DataFrame keyed by ``census_tract_code`` (CUSEC =
+    province+municipality+district+census tract)."""
     path = os.path.join(wd, "INE", "Census2021_main")
     os.makedirs(path, exist_ok=True)
-    fn = os.path.join(path, "sections.tsv")
+    fn = os.path.join(path, "census_tracts.tsv")
     if os.path.exists(fn):
-        return pd.read_csv(fn, sep="\t", dtype={"section_code": str})
+        return pd.read_csv(fn, sep="\t", dtype={"census_tract_code": str})
     import requests
     from io import StringIO
     r = requests.get("https://www.ine.es/censos2021/C2021_Indicadores.csv",
@@ -2018,35 +2031,35 @@ def _ine_census2021_sections(wd):
     }
     for c in ("cpro", "cmun", "dist", "secc"):
         raw[c] = raw[c].astype(str).str.strip()
-    raw["section_code"] = raw["cpro"] + raw["cmun"] + raw["dist"] + raw["secc"]
-    keep = ["section_code"] + [c for c in rename if c in raw.columns]
+    raw["census_tract_code"] = raw["cpro"] + raw["cmun"] + raw["dist"] + raw["secc"]
+    keep = ["census_tract_code"] + [c for c in rename if c in raw.columns]
     out = raw[keep].rename(columns=rename)
     out.to_csv(fn, sep="\t", index=False)
     return out
 
 
 def join_sociodemographics(gdf, wd, year=None):
-    """Join INE section-level sociodemographic/socioeconomic indicators onto each
-    building by its census section (``section_code``, added by
+    """Join INE census-tract-level sociodemographic/socioeconomic indicators onto each
+    building by its census tract (``census_tract_code``, added by
     ``join_by_census_tracts``) → per-building columns
 
-      * ``br__population_mean_age``            — mean age of the section (years)
-      * ``br__population_share_over_64``       — % of the section aged >= 65
-      * ``br__population_share_under_16``      — % of the section aged < 16
+      * ``br__population_mean_age``            — mean age of the census tract (years)
+      * ``br__population_share_over_64``       — % of the census tract aged >= 65
+      * ``br__population_share_under_16``      — % of the census tract aged < 16
       * ``br__average_household_size``         — mean people per household
-      * ``br__total_households``               — households in the section
+      * ``br__total_households``               — households in the census tract
 
-    Source: the INE 2021 Population & Housing Census section indicators
-    (``_ine_census2021_sections``). These feed the residential occupant-behaviour
+    Source: the INE 2021 Population & Housing Census census-tract indicators
+    (``_ine_census2021_census_tracts``). These feed the residential occupant-behaviour
     assignment in the energy model (``energy._assign_residential_user``). Degrades
-    gracefully: on any missing column / failed download / absent ``section_code``
+    gracefully: on any missing column / failed download / absent ``census_tract_code``
     the frame is returned unchanged (behaviour then falls back to per-dwelling
     area estimates + default demographic buckets)."""
-    if "section_code" not in gdf.columns:
-        sys.stderr.write("sociodemographics: no section_code column; skipping\n")
+    if "census_tract_code" not in gdf.columns:
+        sys.stderr.write("sociodemographics: no census_tract_code column; skipping\n")
         return gdf
     try:
-        census = _ine_census2021_sections(wd)
+        census = _ine_census2021_census_tracts(wd)
     except Exception as e:
         sys.stderr.write(f"sociodemographics: INE Census 2021 fetch failed ({e}); skipping\n")
         return gdf
@@ -2065,7 +2078,7 @@ def join_sociodemographics(gdf, wd, year=None):
     avg_size = size_from_dist.where(size_from_dist.notna(), size_from_people)
 
     socio = pd.DataFrame({
-        "_sd_key": census["section_code"].astype(str),
+        "_sd_key": census["census_tract_code"].astype(str),
         "br__population_mean_age": _num("Average age"),
         "br__population_share_over_64": _num("Percentage of people over 64 years of age"),
         "br__population_share_under_16": _num("Percentage of people under 16 years"),
@@ -2074,17 +2087,17 @@ def join_sociodemographics(gdf, wd, year=None):
     })
     socio = socio[socio["_sd_key"].str.len() >= 8].drop_duplicates("_sd_key")
 
-    # ``section_code`` may be a scalar or (after address compaction) a 1-element
+    # ``census_tract_code`` may be a scalar or (after address compaction) a 1-element
     # list; normalise to a scalar string key for the merge without mutating it.
     def _scalar(v):
         if isinstance(v, (list, tuple, np.ndarray)):
             v = v[0] if len(v) else None
         return None if v is None else str(v)
     gdf = gdf.copy()
-    gdf["_sd_key"] = gdf["section_code"].map(_scalar)
+    gdf["_sd_key"] = gdf["census_tract_code"].map(_scalar)
     n_match = gdf["_sd_key"].isin(socio["_sd_key"]).sum()
     gdf = gdf.merge(socio, on="_sd_key", how="left").drop(columns="_sd_key")
-    sys.stderr.write(f"sociodemographics: matched {n_match}/{len(gdf)} buildings to section demographics\n")
+    sys.stderr.write(f"sociodemographics: matched {n_match}/{len(gdf)} buildings to census-tract demographics\n")
     return gdf
 
 
@@ -2097,7 +2110,7 @@ def get_census_gdf(census_tract_dir, columns=None, geometry_column="geometry", y
         Directory holding the validated census GPKG.
     columns : dict, optional
         Source→output rename map (defaults to municipality/province/autonomous
-        community names plus section/district codes and geometry).
+        community names plus census-tract/district codes and geometry).
     geometry_column : str, default "geometry"
         Active geometry column after renaming.
     year : int, default 2022
@@ -2116,7 +2129,7 @@ def get_census_gdf(census_tract_dir, columns=None, geometry_column="geometry", y
             "NMUN": "municipality_name",
             "NPRO": "province_name",
             "NCA": "autonomous_community_name",
-            "CUSEC": "section_code",
+            "CUSEC": "census_tract_code",
             "CUDIS": "district_code",
             "geometry": "geometry"
         }
@@ -2603,3 +2616,203 @@ def aggregate_to_h3(gdf, resolution=10, aggregations=None,
     agg["geometry"] = agg["__h3"].map(_hex_geom)
     agg = agg.rename(columns={"__h3": cell_id_col})
     return gpd.GeoDataFrame(agg, geometry="geometry", crs="EPSG:4326")
+
+
+# --------------------------------------------------------------------------- #
+# Census-tract aggregations — ``ctagg__*``
+# --------------------------------------------------------------------------- #
+#
+# Some of what the energy simulations need is a property of the TRACT, not of the
+# building: most importantly the occupancy density, which is the tract's census
+# population divided by the residential floor area of *every* building in it.
+# Deriving that at simulation time meant the caller had to keep the whole
+# municipality frame around and hand it in, and a frame filtered down to one
+# building silently produced a rate as many times too high as the tract has
+# buildings — a wrong number that still looked plausible.
+#
+# Computing it once here, while the whole frame is in hand, and writing it onto
+# every building as ``ctagg__*`` makes each row self-sufficient: a single-row
+# frame carries its tract's context with it and simulates correctly on its own.
+
+# Namespace prefix for the census-tract aggregations.
+CTAGG_PREFIX = "ctagg__"
+
+# The aggregation is only trustworthy when the frame holds the whole tract. This
+# is the share of the tract's 2021-census main dwellings that the frame's own
+# building spaces account for, below which ``ctagg__complete_tract`` is False and
+# the density columns are left NaN rather than published wrong.
+CTAGG_MIN_COVERAGE = 0.5
+
+
+def _residential_space_stats(row, use_category):
+    """``(area_m2, n_dwellings)`` of a building's RESIDENTIAL spaces — the same
+    non-communal per-dwelling areas the energy model tiles into thermal zones."""
+    from hypercadaster_ES.energy import _building_spaces
+    area, n = 0.0, 0
+    for sp in _building_spaces(row):
+        if use_category(sp.get("use_type")) != "residential":
+            continue
+        try:
+            a = float(sp.get("area"))
+        except (TypeError, ValueError):
+            continue
+        if a > 0 and np.isfinite(a):
+            area += a
+            n += 1
+    return area, n
+
+
+def _tract_population_column(gdf):
+    """Name of the social_ES tract population column (``so__population_{year}``),
+    most recent year when several are present; ``None`` when absent."""
+    best, best_year = None, -1
+    for c in list(getattr(gdf, "columns", [])):
+        m = re.fullmatch(r"so__population(?:_(\d{4}))?", str(c).lower())
+        if not m:
+            continue
+        year = int(m.group(1)) if m.group(1) else 0
+        if year >= best_year:
+            best, best_year = c, year
+    return best
+
+
+def _tract_census_dwellings_column(gdf):
+    """Name of the 2021-census main-dwelling count column
+    (``so__dwellings_main_{year}``) used as the coverage yardstick, or ``None``."""
+    for c in sorted(getattr(gdf, "columns", []), reverse=True):
+        if re.fullmatch(r"so__dwellings_main(?:_\d{4})?", str(c).lower()):
+            return c
+    return None
+
+
+def join_census_tract_aggregations(gdf, prefix=CTAGG_PREFIX, verbose=True):
+    """Aggregate the frame by census tract and write the result onto every building.
+
+    Adds, as ``{prefix}{name}`` (default ``ctagg__``), the tract-level quantities
+    the energy simulations need but cannot derive from a single building:
+
+    ``buildings`` / ``residential_buildings``
+        How many buildings of the tract are in this frame, and how many of them
+        carry residential space.
+    ``residential_area_m2`` / ``dwellings``
+        Summed non-communal residential floor area and dwelling count over the
+        tract — the denominators everything below divides by.
+    ``population``
+        The tract's census head count, from ``so__population_{year}`` (the most
+        recent year joined by the social layer).
+    ``people_per_m2``
+        ``population / residential_area_m2`` — the occupancy density that drives
+        the DHW demand in ``energy.run_behavior_scenarios``. This is the column
+        that makes a one-building frame simulate correctly on its own.
+    ``people_per_dwelling``
+        ``population / dwellings`` — mean household size as the cadaster counts
+        dwellings (compare against ``so__average_household_size_{year}``, which
+        the census counts its own way).
+    ``dwelling_coverage`` / ``complete_tract``
+        The share of the 2021 census's main dwellings for the tract that this
+        frame's spaces account for, and whether it clears
+        :data:`CTAGG_MIN_COVERAGE`. A frame holding part of a tract — a district,
+        a sample, one building — would otherwise publish a density as many times
+        too high as the tract is under-represented, so the two density columns are
+        left NaN when coverage is short, and only the raw counts are emitted.
+
+    Requires ``census_tract_code`` (from ``census_layer=True``) and the CAT-based
+    ``br__building_spaces_*`` columns (``use_CAT_files=True``); ``population`` and
+    the coverage check additionally need ``social_ES_layer=True``. Anything
+    missing degrades to a no-op or to the columns that can be computed, never to
+    an error.
+
+    Returns ``gdf`` with the columns added.
+    """
+    def log(msg):
+        if verbose:
+            sys.stderr.write(f"census-tract aggregations: {msg}\n")
+
+    cols = list(getattr(gdf, "columns", []))
+    if "census_tract_code" not in cols:
+        log("no census_tract_code column; skipping (needs census_layer=True)")
+        return gdf
+    if "br__building_spaces_reference" not in cols:
+        log("no CAT building spaces; skipping (needs use_CAT_files=True)")
+        return gdf
+
+    from hypercadaster_ES.energy import _use_category
+    from hypercadaster_ES.social import _scalar
+
+    pop_col = _tract_population_column(gdf)
+    cen_col = _tract_census_dwellings_column(gdf)
+
+    # One pass over the frame: per-building residential area/dwellings, keyed by
+    # tract. The population and census-dwelling figures are tract constants
+    # already joined onto every row, so the first non-null wins.
+    area_by, dw_by, n_by, res_n_by, pop_by, cen_by = {}, {}, {}, {}, {}, {}
+    for _, row in gdf.iterrows():
+        sec = _scalar(row.get("census_tract_code"))
+        if sec is None:
+            continue
+        sec = str(sec).strip()
+        if not sec:
+            continue
+        area, n_dw = _residential_space_stats(row, _use_category)
+        area_by[sec] = area_by.get(sec, 0.0) + area
+        dw_by[sec] = dw_by.get(sec, 0) + n_dw
+        n_by[sec] = n_by.get(sec, 0) + 1
+        if n_dw:
+            res_n_by[sec] = res_n_by.get(sec, 0) + 1
+        for col, store in ((pop_col, pop_by), (cen_col, cen_by)):
+            if col and sec not in store:
+                try:
+                    v = float(row.get(col))
+                    if np.isfinite(v) and v > 0:
+                        store[sec] = v
+                except (TypeError, ValueError):
+                    pass
+
+    if not area_by:
+        log("no buildings with a census_tract_code; skipping")
+        return gdf
+
+    records = {}
+    for sec, area in area_by.items():
+        dwellings = dw_by.get(sec, 0)
+        population = pop_by.get(sec)
+        census_dw = cen_by.get(sec)
+        coverage = (dwellings / census_dw) if (census_dw and dwellings) else np.nan
+        # Without the census yardstick there is nothing to check the frame
+        # against, so the density is published on the assumption that the frame
+        # holds the tract — which is what a whole-municipality merge does.
+        complete = True if np.isnan(coverage) else bool(coverage >= CTAGG_MIN_COVERAGE)
+        density = (population / area) if (population and area > 1e-6) else np.nan
+        per_dwelling = (population / dwellings) if (population and dwellings) else np.nan
+        records[sec] = {
+            f"{prefix}buildings": n_by.get(sec, 0),
+            f"{prefix}residential_buildings": res_n_by.get(sec, 0),
+            f"{prefix}residential_area_m2": round(area, 2),
+            f"{prefix}dwellings": dwellings,
+            f"{prefix}population": population if population else np.nan,
+            f"{prefix}people_per_m2": round(density, 6) if complete else np.nan,
+            f"{prefix}people_per_dwelling": round(per_dwelling, 3) if complete else np.nan,
+            f"{prefix}dwelling_coverage": round(coverage, 3) if not np.isnan(coverage) else np.nan,
+            f"{prefix}complete_tract": complete,
+        }
+
+    agg = pd.DataFrame.from_dict(records, orient="index")
+    agg.index.name = "_ctagg_key"
+    agg = agg.reset_index()
+
+    gdf = gdf.copy(deep=False)
+    key = gdf["census_tract_code"].map(_scalar)
+    key = key.where(key.isna(), key.astype(str).str.strip())
+    gdf["_ctagg_key"] = key
+    new_cols = [c for c in agg.columns if c != "_ctagg_key"]
+    gdf = gdf.drop(columns=[c for c in new_cols if c in gdf.columns], errors="ignore")
+    gdf = gdf.merge(agg, on="_ctagg_key", how="left")
+    gdf = gdf.drop(columns=["_ctagg_key"], errors="ignore")
+
+    n_partial = sum(1 for r in records.values() if not r[f"{prefix}complete_tract"])
+    log(f"{len(records)} census tract(s), {len(new_cols)} columns"
+        + ("" if pop_col else "; no so__population column -> densities are NaN "
+                             "(needs social_ES_layer=True)")
+        + (f"; {n_partial} tract(s) only partly in the frame -> their densities "
+           f"left NaN" if n_partial else ""))
+    return gdf

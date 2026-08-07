@@ -25,7 +25,7 @@ Author: hypercadaster_ES examples
 
 import pandas as pd
 from hypercadaster_ES import interoperability
-import social_ES.utils_INE as sc
+from social_ES import INE
 import geopandas as gpd
 from shapely.geometry import Point
 
@@ -87,26 +87,29 @@ gdf_irec = gdf_irec.drop(columns=["index_right"])
 
 print("Integrating social demographic data...")
 # Load INE (Spanish Statistical Institute) social demographic data
-atlas = sc.INERentalDistributionAtlas(wd)
-atlas = atlas["Sections"]  # Use census section level data
+atlas = INE.HouseholdIncomeDistributionAtlas(wd)
+atlas = atlas["Census tracts"]  # Use census tract level data
 
-# Create unique census tract identifier
-atlas["census_tract"] = atlas["Municipality code"] + atlas["District code"] + atlas["Section code"]
+# Create unique census tract identifier (CUSEC): 5-digit municipality + 2-digit
+# district + 3-digit tract, zero-padded so it matches hypercadaster's code.
+atlas["census_tract"] = (atlas["Municipality code"].astype(str).str.strip().str.zfill(5)
+                         + atlas["District code"].astype(str).str.strip().str.zfill(2)
+                         + atlas["Census tract code"].astype(str).str.strip().str.zfill(3))
 
 # Use most recent available data (2022)
 atlas = atlas[atlas["Year"] == 2022]
 
 # Merge household size data with building data
 gdf_irec = gdf_irec.merge(
-    atlas[["census_tract", "Tamaño medio del hogar"]],
-    left_on="CensusTract", 
-    right_on="census_tract", 
+    atlas[["census_tract", "Average size of the household"]],
+    left_on="CensusTract",
+    right_on="census_tract",
     how="left"
 )
 
 # Clean up and rename columns
 gdf_irec.drop(columns=["census_tract"], inplace=True)
-gdf_irec.rename(columns={"Tamaño medio del hogar": "NumberOfPeoplePerHousehold"}, inplace=True)
+gdf_irec.rename(columns={"Average size of the household": "NumberOfPeoplePerHousehold"}, inplace=True)
 
 print("Adding energy performance data...")
 # Load energy performance certificate (EPC) prediction results

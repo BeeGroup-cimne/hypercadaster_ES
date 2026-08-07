@@ -334,6 +334,64 @@ def _safe_nanmean(values):
     return float(finite.mean()) if finite.size else float("nan")
 
 
+# The taller ``ground_floor_height`` is used only for buildings with at least this
+# many floors above ground (matching ``energy._GROUND_FLOOR_MIN_FLOORS``); smaller
+# buildings use the regular ``floor_height`` for the ground storey too. Applied to
+# the analysed building's shadow eye levels and wall-typing floor elevations.
+GROUND_FLOOR_MIN_FLOORS = 5
+
+# A wall segment is typed ``terrain_contact`` only when at least this fraction of
+# its AREA (length × storey height) sits below the terrain surface (DEM). Sampled
+# along the segment; below-ground floors are always terrain contact.
+TERRAIN_CONTACT_MIN_FRACTION = 0.75
+
+
+def _effective_ground_floor_height(n_floors_above_ground, ground_floor_height,
+                                   floor_height, building_use=None):
+    """``ground_floor_height`` when the building has >= GROUND_FLOOR_MIN_FLOORS
+    floors above ground OR is an industrial/agricultural building (which always
+    needs the taller ground storey for machinery/vehicle clearance); else
+    ``floor_height``."""
+    try:
+        n = int(n_floors_above_ground)
+    except (TypeError, ValueError):
+        n = 0
+    if n >= GROUND_FLOOR_MIN_FLOORS or utils.is_tall_ground_floor_use(building_use):
+        return ground_floor_height
+    return floor_height
+
+
+def _wall_buried_area_fraction(segment, dem_sampler, floor_base_elev, floor_top_elev):
+    """Fraction of a wall segment's AREA (length × storey height) that sits below
+    the terrain surface. The DEM is sampled along the segment; at each sample the
+    buried fraction of the wall height is ``clamp((terrain − floor_base) /
+    (floor_top − floor_base), 0, 1)`` and the mean over the length is the buried
+    area fraction (0 = terrain at/below the floor base everywhere, 1 = terrain
+    at/above the floor top everywhere). Returns 0.0 when the DEM can't be sampled.
+    """
+    span = max(floor_top_elev - floor_base_elev, 1e-6)
+    n = max(3, int(segment.length) + 1)
+    xs, ys = [], []
+    for t in np.linspace(0.0, 1.0, n):
+        p = segment.interpolate(float(t), normalized=True)
+        xs.append(p.x)
+        ys.append(p.y)
+    try:
+        elevs = dem_sampler(xs, ys)
+    except Exception:
+        return 0.0
+    fracs = []
+    for e in elevs:
+        try:
+            fe = float(e)
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(fe):
+            continue
+        fracs.append(min(max((fe - floor_base_elev) / span, 0.0), 1.0))
+    return (sum(fracs) / len(fracs)) if fracs else 0.0
+
+
 # Per-space CAT columns that leak into br_results in multi-building zones
 # as all-NaN `_x` / `_y` pairs from an unintended merge. Strip them so the
 # building-level output stays at the building grain.
@@ -1666,6 +1724,19 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                 else:
                     current_building_elevation = 0.0
 
+                # Taller ground floor for buildings with >= 5 floors above ground OR
+                # industrial/agricultural buildings (the same rule as the EnergyPlus
+                # model); used for this building's shadow eye levels and wall-typing
+                # floor elevations.
+                _n_ag_bld = (building_gdf_item['n_floors_above_ground']
+                             if 'n_floors_above_ground' in building_gdf_item.columns else 0)
+                _bld_use = (building_gdf_item['building_use'].iloc[0]
+                            if 'building_use' in building_gdf_item.columns
+                            and len(building_gdf_item) else None)
+                eff_ground_floor_height = _effective_ground_floor_height(
+                    utils._coerce_scalar_float(_n_ag_bld, 0.0),
+                    ground_floor_height, floor_height, _bld_use)
+
                 # Per-adjacent-sbr roof elevation. `gdf_aux_footprints_` was
                 # filtered above to the buildings touching ours; elevation
                 # lives on `gdf_zone` rows keyed by single_building_reference.
@@ -1817,12 +1888,12 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                         # - floor_top_elev: top-of-slab elevation, used by the
                         #   terrain_contact below-DEM test.
                         if floor == 0:
-                            eye_level_floor = current_building_elevation + ground_floor_height / 2.0
-                            floor_top_elev = current_building_elevation + ground_floor_height
+                            eye_level_floor = current_building_elevation + eff_ground_floor_height / 2.0
+                            floor_top_elev = current_building_elevation + eff_ground_floor_height
                         elif floor > 0:
-                            eye_level_floor = (current_building_elevation + ground_floor_height
+                            eye_level_floor = (current_building_elevation + eff_ground_floor_height
                                                + (floor - 0.5) * floor_height)
-                            floor_top_elev = (current_building_elevation + ground_floor_height
+                            floor_top_elev = (current_building_elevation + eff_ground_floor_height
                                               + floor * floor_height)
                         else:
                             # Below ground: floor -1 spans [elev - fh, elev],
@@ -1835,7 +1906,7 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                         # height (not just floor 0) to shelter this wall.
                         floor_base_elev = utils.floor_base_elevation(
                             current_building_elevation, floor,
-                            ground_floor_height, floor_height)
+                            eff_ground_floor_height, floor_height)
 
                         for geom in walls:
 
@@ -1911,23 +1982,23 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                                             segment_assigned = "patios"
                                             break
 
-                                    # 2. TERRAIN_CONTACT — basement OR midpoint
-                                    # below the floor's top-of-slab per DEM.
+                                    # 2. TERRAIN_CONTACT — basement, OR at least
+                                    # TERRAIN_CONTACT_MIN_FRACTION of the wall's AREA
+                                    # (length × storey height) sits below the terrain.
+                                    # The DEM is sampled along the segment; at each
+                                    # sample the buried height fraction is
+                                    # clamp((terrain − floor_base)/(floor_top −
+                                    # floor_base), 0, 1) and the mean over the length
+                                    # is the buried AREA fraction.
                                     if segment_assigned is None:
                                         is_terrain = False
                                         if floor < 0:
                                             is_terrain = True
                                         elif dem_sampler is not None:
-                                            mid = segment.interpolate(0.5, normalized=True)
-                                            try:
-                                                terrain_elev = float(
-                                                    dem_sampler([mid.x], [mid.y])[0]
-                                                )
-                                            except (TypeError, ValueError, Exception):
-                                                terrain_elev = None
-                                            if (terrain_elev is not None
-                                                    and not math.isnan(terrain_elev)
-                                                    and terrain_elev > floor_top_elev):
+                                            if _wall_buried_area_fraction(
+                                                    segment, dem_sampler,
+                                                    floor_base_elev, floor_top_elev
+                                            ) >= TERRAIN_CONTACT_MIN_FRACTION:
                                                 is_terrain = True
                                         if is_terrain:
                                             terrain_contact_wall[floor] += round(segment.length, 2)
@@ -2272,9 +2343,9 @@ def process_zone(gdf_zone, zone_reference, gdf_footprints_global, parcels_gdf, s
                         # ground-floor height; eye = DEM + g/2. Upper floors
                         # are floor_height tall; eye = DEM + g + (f - 0.5) * h.
                         if floor == 0:
-                            eye_level = current_building_elevation + ground_floor_height / 2.0
+                            eye_level = current_building_elevation + eff_ground_floor_height / 2.0
                         else:
-                            eye_level = (current_building_elevation + ground_floor_height
+                            eye_level = (current_building_elevation + eff_ground_floor_height
                                          + (floor - 0.5) * floor_height)
 
                         # Only consider neighbours that exist at this floor for
@@ -3698,7 +3769,7 @@ def aggregate_CAT_file_building_spaces(building_CAT_df):
     }
 
 
-_NON_OCCUPIED_USE_KEYS = ("parking", "warehouse", "storage", "garage", "agricultur")
+_NON_OCCUPIED_USE_KEYS = ("parking", "warehouse", "storage", "garage", "agriculture")
 
 
 def _synthesize_thermal_zones(row):

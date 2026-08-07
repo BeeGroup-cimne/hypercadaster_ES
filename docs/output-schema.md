@@ -355,32 +355,183 @@ codes added by `census_layer`. Column names follow `so__{indicator}_{year}`
 (`so__` namespace prefix, snake_case indicator, year as a **suffix**); the most
 recent `social_ES_years` (default 5) are kept per dataset.
 
+Every indicator comes from exactly **one** dataset — the one publishing it at the
+finest geography over the longest run of years — so no figure appears twice under
+two names.
+
 ### Section/district/municipality/province indicators
 
 | Column pattern | Level | Description |
 |----------------|-------|-------------|
-| `so__net_income_per_household_{year}`, `so__net_income_per_person_{year}`, `so__net_income_per_consumption_unit_{year}`, `so__gross_income_per_household_{year}`, `so__gross_income_per_person_{year}`, `so__median_income_per_consumption_unit_{year}` | Section | Income Atlas — mean/median income (€) |
+| `so__net_income_per_household_{year}`, `so__net_income_per_person_{year}`, `so__net_income_per_consumption_unit_{year}`, `so__gross_income_per_household_{year}`, `so__gross_income_per_person_{year}`, `so__median_income_per_consumption_unit_{year}` | Section | Income Atlas — mean/median income (€, nominal) |
+| `so__net_income_per_household_2010eur_{year}` | Section | Income Atlas — household net income deflated to **2010 €** (comparable across years) |
 | `so__pct_income_source_salary_{year}`, `so__pct_income_source_pension_{year}`, `so__pct_income_source_unemployment_{year}`, `so__pct_income_source_other_benefits_{year}`, `so__pct_income_source_capital_investments_secondary_{year}` | Section | Income Atlas — **% share** of household income by source (not €) |
-| `so__gini_index_{year}`, `so__income_p80_p20_{year}`, `so__average_age_{year}`, `so__average_household_size_{year}`, `so__pct_spanish_{year}`, `so__pct_single_person_households_{year}`, `so__pct_over_65_{year}`, `so__pct_under_18_{year}`, `so__population_{year}` | Section | Income Atlas — inequality & demographics |
-| `so__pct_foreign_nationality_{year}`, `so__pct_foreign_born_{year}`, `so__pct_male_{year}`, `so__pct_under_15_{year}`, `so__pct_working_age_{year}`, `so__pct_65_plus_{year}` | Section | Population Census — population shares (%) |
-| `so__pct_edu_primary_or_below_{year}`, `so__pct_edu_lower_secondary_{year}`, `so__pct_edu_upper_secondary_{year}`, `so__pct_edu_tertiary_{year}`, `so__pct_employed_{year}`, `so__pct_unemployed_{year}`, `so__pct_student_{year}`, `so__pct_pensioner_{year}`, `so__pct_other_inactive_{year}` | Section | Education & Employment Census (%) |
-| `so__rental_price_index_{year}` | Municipality | Household rental price index |
+| `so__gini_index_{year}`, `so__income_p80_p20_{year}`, `so__average_age_{year}`, `so__average_household_size_{year}`, `so__pct_single_person_households_{year}` | Section | Income Atlas — inequality & household structure |
+| `so__household_income_group_{year}` | Section | Income Atlas — Time Use Survey household income band (1 = ≤1,200 €/month, 2 = 1,201–2,000 €, 3 = 2,001–3,000 €, 4 = >3,000 €, on income deflated to 2010 €). Join key into the survey's weekly occupancy agenda — see [Time Use occupancy](#-time-use-occupancy-agenda) |
+| `so__population_{year}` | Section | Population Census — resident head count |
+| `so__pct_foreign_nationality_{year}`, `so__pct_foreign_born_{year}`, `so__pct_born_same_municipality_{year}`, `so__pct_woman_{year}`, `so__pct_under_15_{year}`, `so__pct_working_age_{year}`, `so__pct_65_plus_{year}` | Section | Population Census — population shares (%) |
+| `so__pct_edu_lte_primary_or_below_{year}`, `so__pct_edu_lte_lower_secondary_{year}`, `so__pct_edu_lte_upper_secondary_{year}`, `so__pct_edu_lte_tertiary_{year}` | Section | Education & Employment Census — **cumulative** attainment: % of the population aged 16+ that reached **at most** that level. Monotonically increasing; `lte_tertiary` = 100 |
+| `so__pct_employed_{year}`, `so__pct_unemployed_{year}`, `so__pct_student_{year}`, `so__pct_pensioner_{year}`, `so__pct_other_inactive_{year}` | Section | Education & Employment Census — labour force status (%) |
+| `so__dwellings_2021`, `so__dwellings_main_2021`, `so__households_2021` | Section | 2021 Dwellings Census — dwelling stock and households (counts) |
+| `so__pct_dwellings_main_2021` | Section | 2021 Dwellings Census — main dwellings as % of all dwellings |
+| `so__pct_main_dwellings_owned_2021`, `so__pct_main_dwellings_rented_2021`, `so__pct_main_dwellings_other_tenure_2021` | Section | 2021 Dwellings Census — tenure of the main dwellings (%, sums to 100) |
+| `so__municipality_dwellings_{2001,2011,2021}` | Municipality | Empty & Secondary Dwellings — municipal dwelling stock at each census |
+| `so__pct_dwellings_use_main_{year}`, `so__pct_dwellings_use_secondary_{year}`, `so__pct_dwellings_use_empty_{year}` | Municipality | Empty & Secondary Dwellings — main/secondary/**empty** split harmonised across the 2001, 2011 and 2021 censuses (%, sums to 100) |
+| `so__dwelling_use_predicted_{year}` | Municipality | 1.0 where that split was **modelled** by `social_ES` (INE withholds it for small municipalities), 0.0 where published |
+| `so__rental_price_index_{year}` | District, else Municipality | Household rental price index — by district where INE publishes it, municipal series elsewhere |
 | `so__housing_price_index_total_{year}`, `so__housing_price_index_new_{year}`, `so__housing_price_index_second_hand_{year}` | Province | Housing price index (annual mean) |
 | `so__electricity_consumption_p10_{year}`…`p90_{year}` | District | Electricity-consumption percentiles (kWh) |
 
 Coverage reflects INE publication scope (e.g. rental index and electricity exist
 only for some municipalities/districts); unmatched buildings get `NaN`.
 
+> **Empty and secondary dwellings.** 2021 replaced the census agent's judgement
+> at the door with a classification derived from each dwelling's yearly
+> electricity consumption, so a change between 2011 and 2021 mixes a real change
+> in use with the change of instrument — most visibly in tourist municipalities.
+> Where INE withholds the split (the 2011 secondary/empty split below 2,000
+> inhabitants, the 2021 classification below 1,000), `social_ES` models it from
+> what is published everywhere and calibrates each province to the figure INE
+> gives for it; those rows are flagged in `so__dwelling_use_predicted_{year}` and
+> should be left out of anything turning on a single small municipality.
+
 ### Essential Characteristics of Households and People downscaling — `ec__*` (use_CAT_files=True only)
 
 When `use_CAT_files=True` and the `essential_characteristics` dataset is selected
 (default when `social_ES_datasets=None`), the INE *Essential Characteristics of
 Population and Households* survey is downscaled to each building as `ec__*`
-proportion columns (percentages; each variable group sums to 100). Column names
-are **short English snake_case**, `ec__{group}_{variable}_{subclass}`, e.g.
-`ec__main_dwellings_heating_individual`,
-`ec__hh_people_n_vehicles_3plus`. The survey is published only
-for larger municipalities (~147 nationwide), so these columns populate only there.
+proportion columns (percentages; each variable group sums to 100).
+
+Column names are exactly the ones `social_ES` (≥ 1.0.3) returns — short English
+snake_case, with the class a column measures joined to its variable by a `~` —
+with only the namespace prefix added:
+
+`ec__{variable}~{class}`, e.g. `ec__main_dwellings_heating_type~individual`,
+`ec__main_dwellings_conservation_status~good`, `ec__households_vehicles_number~3plus`.
+
+Reading a column name therefore tells you unambiguously which variable it belongs
+to (everything left of the `~`) and which class of it the proportion measures.
+
+> ⚠️ **Breaking change (1.2.4).** These used to be flattened to
+> `ec__{variable}_{class}` (a plain underscore). Frames merged by an earlier
+> release keep the old spelling; re-run `hc.merge` to get the new one. The energy
+> model reads both.
+
+**Only a curated selection is emitted by default** — 27 of the ~70 variables
+`social_ES` publishes, chosen because they say something the `so__` census layer
+and the cadaster do not already say. In particular the survey is the *only*
+source for the dwelling's energy systems:
+
+| Group | Variables |
+|-------|-----------|
+| Dwelling energy systems | `main_dwellings_heating_type`, `main_dwellings_heating_fuel`, `main_dwellings_has_cooling`, `main_dwellings_insulation_issues`, `main_dwellings_renewable_device`, `main_dwellings_installations`, `main_dwellings_lighting_type`, `main_dwellings_domestic_appliances_type`, `main_dwellings_water_supply` |
+| Condition & accessibility | `main_dwellings_conservation_status`, `main_dwellings_accessibility_status`, `main_dwellings_adapted_to_elderly` |
+| Dwelling interior | `main_dwellings_n_bathrooms`, `main_dwellings_kitchen_sized_4m2plus`, `main_dwellings_n_rooms`, `main_dwellings_internet_connection` |
+| Presence & absence | `households_second_home_ownership`, `households_secondary_second_home_occupancy`, `people16plus_work_or_study_place`, `people16plus_transport_daily_time` |
+| Mobility & vehicles | `households_vehicles_number`, `households_vehicles_eco`, `people16plus_transport_mode` |
+| Housing cost burden | `households_rented_monthly_rent`, `households_owned_monthly_mortgage` |
+| Household composition | `households_n_children` |
+| Neighbourhood quality | `main_dwellings_surroundings_issues` |
+
+Dropped on purpose because a better source already covers them: tenure, building
+type and floor area (`so__pct_main_dwellings_*` / the cadaster), the
+single-person-household block (`so__pct_single_person_households` plus the `so__`
+income / education / labour columns), the parents' origin and nationality blocks
+(`so__pct_foreign_*` / `so__pct_born_*`), and the individual digital-access
+questions (`main_dwellings_internet_connection` covers it at dwelling level).
+
+Pass `social_ES.EC_SELECTED_VARIABLES` your own sequence — or `None` for all ~70
+variables (~256 columns) — through `hc.merge(social_ES_ec_variables=…)` /
+`social.join_social_ES(ec_variables=…)`.
+
+The survey is published only for larger municipalities (~147 nationwide), so these
+columns populate only there.
+
+### 🕒 Time Use occupancy agenda
+
+Not a column: `hypercadaster_ES.social.time_use_household_occupancy(wd,
+census_tract_code)` returns a census tract's **weekly household occupancy agenda**
+from the INE Time Use Survey (EET 2009-2010) via
+`social_ES.INE.TimeUseSurvey` → `WeeklyScheduleHouseholdOccupancy`. The tract is
+matched to a survey cell by its autonomous community and by its
+`so__household_income_group_{year}` band, and the cell's dominant occupancy state
+at each of the 168 hours of the week is returned (hour 0 = Monday 00:00):
+
+| State | Meaning |
+|-------|---------|
+| `Sleeping` | at home, asleep |
+| `WithActivity` | at home, awake and doing something |
+| `NonOccupied` | out (paid work, study, social life, sport, travel …) |
+
+```python
+agenda = hc.social.time_use_household_occupancy(wd, "0801901001")
+agenda["states"][:24]                      # Monday, hour by hour
+agenda["shares"]["NonOccupied"][8]         # % of households out at Monday 08:00
+agenda["household_income_group_label"]     # e.g. "2,001 to 3,000 €"
+```
+
+The energy model reads it to give its `aware` and `unaware` residential dwellings
+a measured occupancy agenda — see `residential_behavior.time_use_occupancy` in
+`energy_config.yaml`. Returns `None` for tracts the income atlas does not cover,
+in which case the stylised residential profile is used instead.
+
+## 🧮 Census-Tract Aggregations — `ctagg__*` (census_tract_aggregations=True, default)
+
+The frame aggregated **by census tract** and written back onto every building, so
+each row carries its tract's context. These are the tract-level quantities the
+energy simulations need but cannot derive from one building — which is why they
+are computed here, while the whole frame is in hand, rather than at simulation
+time from whatever subset the caller still holds.
+
+| Column | Description |
+|--------|-------------|
+| `ctagg__buildings` | Buildings of the tract present in this frame |
+| `ctagg__residential_buildings` | How many of them carry residential space |
+| `ctagg__residential_area_m2` | Σ non-communal residential floor area of the tract |
+| `ctagg__dwellings` | Σ residential building spaces (dwellings) of the tract |
+| `ctagg__population` | Tract head count, from `so__population_{year}` |
+| `ctagg__people_per_m2` | `population / residential_area_m2` — the occupancy density driving the **DHW demand** in `energy.run_behavior_scenarios` |
+| `ctagg__people_per_dwelling` | `population / dwellings` — mean household size as the cadaster counts dwellings (cf. `so__average_household_size_{year}`, counted the census's own way) |
+| `ctagg__dwelling_coverage` | Share of the tract's 2021-census main dwellings (`so__dwellings_main_2021`) this frame's spaces account for |
+| `ctagg__complete_tract` | Whether coverage clears 50 % (`mergers.CTAGG_MIN_COVERAGE`) |
+
+**What reads it.** `ctagg__people_per_m2` is the single occupancy figure behind
+every people-driven quantity of the energy model:
+
+- **`People` internal gains** — metabolic heat, and the cooling load and comfort
+  that follow from it (`loads.residential_occupancy_from_census`, on by default);
+- **DHW demand** (`dhw_demand_kwh_m2`) — litres per person per CTE DB-HE HE4;
+- **household size** — the occupants each dwelling is modelled with.
+
+Each dwelling gets `max(1, round(density × its area))` occupants, so a dwelling is
+never modelled as empty, and the zone density is that head count over the
+residential floor area — gains and DHW therefore describe exactly the same people.
+The normative `cte` scenario keeps the `loads.residential.ppl_per_m2` default
+instead: it is a standards-compliance case, not a description of who lives there.
+
+**Why it matters.** `ctagg__people_per_m2` is what lets a one-building frame be
+simulated on its own:
+
+```python
+one = gdf[gdf["building_reference"] == ref]      # carries its tract's density
+hc.energy.run_behavior_scenarios(one, wd=wd, weather_year=2022)
+```
+
+Deriving that density from `one` instead would divide the whole tract's
+population by a single building's floor area — a rate as many times too high as
+the tract has buildings, and one that looks perfectly plausible in the output.
+
+**Partial frames publish no density.** When `ctagg__dwelling_coverage` falls below
+50 %, the frame demonstrably holds only part of the tract, so
+`ctagg__people_per_m2` and `ctagg__people_per_dwelling` are left **NaN** and
+`ctagg__complete_tract` is False — the counts are still emitted. Without
+`so__dwellings_main_2021` there is no yardstick to check against, so the frame is
+assumed to hold the tract (what a whole-municipality merge does).
+
+Requires `census_layer=True` (for `census_tract_code`) and `use_CAT_files=True`
+(for `br__building_spaces_*`); `ctagg__population`, the densities and the coverage
+check additionally need `social_ES_layer=True`. Anything missing degrades to a
+no-op or to the columns that can be computed.
 
 ## 🌦️ Weather Indicators (weather_layer=True)
 

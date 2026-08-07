@@ -204,6 +204,9 @@ heavy = hc.utils.get_heavy_columns_for_building(
 
 ## ☀️ EnergyPlus Integration (Optional)
 
+> 📖 **[Energy Model & Scenarios](energy-model.md)** explains how the model is built
+> and how the occupant-behaviour scenarios work.
+
 For building energy simulation workflows:
 
 ```python

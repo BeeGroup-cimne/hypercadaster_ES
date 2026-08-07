@@ -1538,6 +1538,30 @@ def _coerce_scalar_float(value, default=0.0):
         return default
 
 
+def is_tall_ground_floor_use(building_use):
+    """Whether a building's use forces the TALLER ground-floor storey regardless of
+    how many floors it has. Industrial and agricultural buildings (warehouses, sheds,
+    workshops) need the machinery/vehicle clearance of the taller ground floor even
+    when they are single-storey. ``building_use`` is the cadastral use string
+    (e.g. ``"3_industrial"``, ``"2_agriculture"``)."""
+    u = str(building_use or "").lower()
+    return "industrial" in u or "agricultur" in u
+
+
+def effective_ground_floor_height(n_floors_above_ground, ground_floor_height,
+                                  floor_height, building_use=None):
+    """The ground storey height to use: the taller ``ground_floor_height`` when the
+    building has ≥ 5 floors above ground OR is an industrial/agricultural building
+    (``is_tall_ground_floor_use``); otherwise the regular ``floor_height``."""
+    try:
+        n = int(n_floors_above_ground)
+    except (TypeError, ValueError):
+        n = 0
+    if n >= 5 or is_tall_ground_floor_use(building_use):
+        return ground_floor_height
+    return floor_height
+
+
 def floor_base_elevation(ground_elevation, floor, ground_floor_height=5.0, floor_height=3.0):
     """Absolute elevation (m) of the slab at the bottom of `floor`.
 
@@ -2256,7 +2280,8 @@ def compute_floor_shadow_region(building_geom, nearby_buildings,
                                 orientation_interval=5, sample_step=2.5,
                                 terrain_profile=None,
                                 terrain_profile_distances=None,
-                                centroid=None, buffer_disk=None):
+                                centroid=None, buffer_disk=None,
+                                terrain_coverage_threshold=0.75):
     """Return a single (Multi)Polygon representing the area blocked from the
     floor's eye level, in plan view, within `max_distance` of the building.
 
@@ -2330,6 +2355,7 @@ def compute_floor_shadow_region(building_geom, nearby_buildings,
         sample_distances = [float(d) for d in
                             np.arange(sample_step, max_distance + 1e-6, sample_step)]
         boundary_pts = []
+        blocked_dirs = 0                 # directions where terrain rises above eye
         for theta in angles:
             sin_a, cos_a = math.sin(theta), math.cos(theta)
             # Batch DEM sampling along the ray.
@@ -2349,14 +2375,24 @@ def compute_floor_shadow_region(building_geom, nearby_buildings,
                 if np.isfinite(fe) and fe > threshold:
                     block_d = d
                     break
+            if block_d < max_distance - 1e-9:
+                blocked_dirs += 1
             boundary_pts.append((centroid.x + block_d * sin_a,
                                  centroid.y + block_d * cos_a))
-        try:
-            visibility_polygon = Polygon(boundary_pts).buffer(0)
-            if visibility_polygon.is_empty:
+        # Only treat the terrain as a shadow caster for this floor once it
+        # substantially ENCLOSES the building — the terrain rises above the eye
+        # level in at least ``terrain_coverage_threshold`` of the swept
+        # directions. Below that, a few local rises are not a terrain contour
+        # shadow, so the visibility polygon is the full disk (no terrain shadow).
+        if blocked_dirs < terrain_coverage_threshold * n_angles:
+            visibility_polygon = buffer_disk    # not terrain-enclosed → no terrain shadow
+        else:
+            try:
+                visibility_polygon = Polygon(boundary_pts).buffer(0)
+                if visibility_polygon.is_empty:
+                    visibility_polygon = buffer_disk
+            except Exception:
                 visibility_polygon = buffer_disk
-        except Exception:
-            visibility_polygon = buffer_disk
     else:
         visibility_polygon = buffer_disk
 
@@ -3960,7 +3996,7 @@ def compact_addresses(
     geolocation_cols=['address_location'],
     admin_cols=[
         'district_code', 'district_name', 'postal_code', 'population_entity',
-        'neighborhood_code', 'neighborhood_name', 'section_code'
+        'neighborhood_code', 'neighborhood_name', 'census_tract_code'
     ],
     create_full_street_names=True,
     use_unique_for_admin=True):
@@ -4116,16 +4152,22 @@ def compact_addresses(
 
 
 def _best_address_match_index(address, ref_labels):
-    """Index of the ``ref_labels`` entry most similar to ``address`` (or None)."""
+    """Index of the ``ref_labels`` entry most similar to ``address`` (or None).
+
+    The street TYPE prefix is stripped from both sides before comparison
+    (``downloaders.strip_street_type``) so a CAT ``CALLE URBANIZACION DEVESA PARK``
+    still harmonises to a CartoCiudad ``URBANIZACION DEVESA PARK`` — the street
+    NAME (and number) is what should drive the match, not the type token."""
     import difflib
+    from hypercadaster_ES import downloaders
     if not isinstance(address, str) or not ref_labels:
         return None
-    a = address.upper()
+    a = downloaders.strip_street_type(address)
     best_i, best_r = None, -1.0
     for i, lab in enumerate(ref_labels):
         if not isinstance(lab, str):
             continue
-        r = difflib.SequenceMatcher(None, a, lab.upper()).ratio()
+        r = difflib.SequenceMatcher(None, a, downloaders.strip_street_type(lab)).ratio()
         if r > best_r:
             best_r, best_i = r, i
     return best_i
@@ -4318,18 +4360,23 @@ def plot_building_shadows_analysis(gdf, building_reference, output_path=None, in
 def _floor_eye_levels(shadow_data, floor_height, ground_floor_height=5.0):
     """Absolute eye-level elevations (m) for each floor of the analyzed building.
 
-    floor 0 sits at ground+ground_floor_height/2; subsequent floors at
-    ground+ground_floor_height+(i-1)*floor_height + floor_height/2. This
-    matches `floor_base_elevation` semantics used by the inference side.
+    floor 0 sits at ground+g/2; subsequent floors at ground+g+(i-1)*floor_height
+    + floor_height/2, where ``g`` is the (taller) ground-floor height — applied
+    only to buildings with >= 5 floors above ground (else ``floor_height``),
+    matching ``building_inference`` and ``floor_base_elevation``.
     """
     ground = float(shadow_data.get('elevation', 0.0) or 0.0)
-    n = int(shadow_data.get('max_neighbor_floors', shadow_data.get('building_n_floors', 1)) or 1)
+    n_bld = int(shadow_data.get('building_n_floors', 1) or 1)
+    n = int(shadow_data.get('max_neighbor_floors', n_bld) or 1)
+    # >=5-floors rule, OR industrial/agricultural (always the taller ground floor).
+    g = effective_ground_floor_height(n_bld, ground_floor_height, floor_height,
+                                      shadow_data.get('building_use'))
     levels = []
     for i in range(n):
         if i == 0:
-            levels.append(ground + ground_floor_height / 2.0)
+            levels.append(ground + g / 2.0)
         else:
-            levels.append(ground + ground_floor_height + (i - 1) * floor_height + floor_height / 2.0)
+            levels.append(ground + g + (i - 1) * floor_height + floor_height / 2.0)
     return levels
 
 
@@ -5136,6 +5183,11 @@ def _extract_shadow_data(building_row):
                 break
             except (TypeError, ValueError):
                 pass
+
+    # Building use drives the taller-ground-floor rule for industrial/agricultural
+    # buildings (see ``effective_ground_floor_height``).
+    if 'building_use' in building_row.index:
+        shadow_data['building_use'] = building_row['building_use']
 
     return shadow_data if shadow_data else None
 
@@ -6493,6 +6545,23 @@ def _thermal_zone_render_kind(z):
     return 'occupied'
 
 
+def _zone_legend_category(z):
+    """Coarse category for grouping thermal zones in the 3-D legend / toggle menu
+    (one entry per category instead of one per zone). Occupied zones group by use
+    type; the rest by role."""
+    kind = _thermal_zone_render_kind(z)
+    if kind == 'communal':
+        return 'Communal core'
+    if kind == 'non_occupied':
+        if z.get('is_pool'):
+            return 'Pool'
+        ut = str(z.get('use_type', '')).lower()
+        if any(t in ut for t in ('parking', 'warehouse', 'garage', 'storage')):
+            return 'Parking / warehouse'
+        return 'Non-occupied'
+    return str(z.get('use_type') or 'Occupied')
+
+
 def _append_prism_mesh(bucket, region, z_bot, z_top, ox, oy):
     """Append a closed extruded prism of `region` (between z_bot and z_top) to
     a Mesh3d vertex/face `bucket` (dict of x/y/z/i/j/k lists), offset by ox/oy.
@@ -6814,20 +6883,298 @@ def plot_building_geometry(gdf, building_reference, output_path=None, wd=None, d
     return fig
 
 
+def _zone_use_colour(use_type, mapping):
+    """Stable colour for an occupied zone's use type — assigns the next palette
+    colour the first time a use type is seen, so the legend stays consistent."""
+    key = str(use_type or "Other").strip() or "Other"
+    if key not in mapping:
+        mapping[key] = _THERMAL_ZONE_PALETTE[len(mapping) % len(_THERMAL_ZONE_PALETTE)]
+    return mapping[key]
+
+
+def _thermal_zone_label(zone, building_reference):
+    """Short label identifying the BUILDING SPACE behind a thermal zone. Every
+    space of a parcel shares the 14-char cadastral parcel prefix (``3444707BG9034S``)
+    — useless to display — so show the DISTINGUISHING building-space suffix
+    (``0003IL``); the communal core is labelled plainly."""
+    if zone.get('kind') == 'communal' or zone.get('zone_id') == 'communal_core':
+        return 'communal'
+    ref = str(zone.get('reference') or zone.get('zone_id') or '').split('|')[-1]
+    if not ref:
+        return ''
+    parcel = str(building_reference or '')
+    if parcel and ref.startswith(parcel) and len(ref) > len(parcel):
+        return ref[len(parcel):]           # the space discriminator (e.g. 0003IL)
+    return ref[-6:] if len(ref) > 6 else ref
+
+
+def _add_polygon_patch(ax, poly, ox, oy, facecolor, edgecolor, alpha=0.75,
+                       hatch=None, lw=1.0, zorder=2):
+    """Fill a shapely (Multi)Polygon on ``ax`` (offset by ox/oy), honouring holes
+    via a compound matplotlib Path."""
+    from matplotlib.path import Path as _Path
+    from matplotlib.patches import PathPatch as _PathPatch
+    if poly is None or getattr(poly, "is_empty", True):
+        return
+    polys = list(poly.geoms) if hasattr(poly, "geoms") else [poly]
+    for p in polys:
+        if not hasattr(p, "exterior"):
+            continue
+        verts, codes = [], []
+        for ring in [p.exterior] + list(p.interiors):
+            cc = list(ring.coords)
+            if len(cc) < 3:
+                continue
+            verts.extend([(x - ox, y - oy) for x, y, *_ in cc])
+            codes.extend([_Path.MOVETO] + [_Path.LINETO] * (len(cc) - 2) + [_Path.CLOSEPOLY])
+        if not verts:
+            continue
+        patch = _PathPatch(_Path(verts, codes), facecolor=facecolor,
+                           edgecolor=edgecolor, alpha=alpha, hatch=hatch,
+                           linewidth=lw, zorder=zorder)
+        ax.add_patch(patch)
+
+
+def plot_building_thermal_zones(gdf, building_reference, output_path=None, wd=None,
+                                dpi=150):
+    """2-D per-floor plan of the estimated thermal-zone distribution.
+
+    One subplot per floor; every thermal zone (dwelling / premise / parking /
+    communal core) is drawn as a filled polygon from the on-demand geometry of
+    ``energy.synthesize_space_geometry`` — the SAME partition the 3-D view and the
+    EnergyPlus model use. All zones use SOLID fills (no hatching, which would be
+    confused with the zone-division lines): occupied zones are coloured by use
+    type, the communal circulation core is brown, non-occupied zones (parking /
+    warehouse / pools) are grey, and any Housing zone that could not secure the
+    minimum main-façade frontage is outlined in red (``facade_deficit``). Each
+    zone is labelled with its reference and floor area.
+
+    Parameters
+    ----------
+    gdf : DataFrame / GeoDataFrame
+        Output of ``hc.merge``.
+    building_reference : str
+    output_path : str, optional
+        Save path (.png / .pdf / …). Displays interactively when None.
+    wd : str, optional
+        Working directory — used to auto-fetch the heavy BLOB columns
+        (``br__thermal_zones``, ``br__building_footprint_by_floor``,
+        ``br__wall_segments``) from the central DuckDB.
+    dpi : int, default 150
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    from matplotlib.gridspec import GridSpec
+    from hypercadaster_ES import energy as _energy
+
+    building_data = gdf[gdf['building_reference'] == building_reference]
+    if building_data.empty:
+        print(f"No data found for building {building_reference}")
+        return None
+    row = building_data.iloc[0].copy()
+
+    # ---- Auto-fetch heavy columns from DuckDB --------------------------------
+    heavy_cols = ['br__thermal_zones', 'br__building_footprint_by_floor',
+                  'br__wall_segments']
+    missing = [c for c in heavy_cols
+               if c not in row.index or row.get(c) is None]
+    if wd is not None and missing:
+        cadaster_code = row.get('cadaster_code')
+        if cadaster_code is not None:
+            try:
+                fetched = get_heavy_columns_for_building(
+                    wd, str(cadaster_code), building_reference,
+                    table='br_results', columns=missing,
+                )
+                for col, val in fetched.items():
+                    row[col] = val
+            except Exception as _e:
+                print(f"Warning: could not fetch heavy columns: {_e}")
+
+    # Decode any bytearray/bytes values (WKB geometry or pickled objects).
+    def _robust_decode(v):
+        if not isinstance(v, (bytes, bytearray, memoryview)):
+            return v
+        b = bytes(v)
+        try:
+            from shapely import wkb as _swkb
+            return _swkb.loads(b, include_srid=True)
+        except Exception:
+            pass
+        try:
+            import pickle as _pkl
+            return _pkl.loads(b)
+        except Exception:
+            pass
+        return v
+
+    for _col in list(row.index):
+        if isinstance(row[_col], (bytes, bytearray, memoryview)):
+            row[_col] = _robust_decode(row[_col])
+
+    try:
+        zones = _energy.synthesize_space_geometry(row)
+    except Exception as _e:
+        print(f"Could not synthesize zone geometry: {_e}")
+        return None
+    if not zones:
+        print(f"No thermal-zone geometry available for building {building_reference}")
+        return None
+
+    # Footprint outline per floor (context) from the same source synthesis uses.
+    fp_by_floor = _energy._footprints_by_floor(row)
+
+    # Gather floors and shared extent across all zone polygons + footprints.
+    floors_set, all_xs, all_ys = set(), [], []
+    for z in zones:
+        for fl, poly in (z.get('floor_polys') or {}).items():
+            if poly is None or getattr(poly, 'is_empty', True):
+                continue
+            floors_set.add(int(fl))
+            minx, miny, maxx, maxy = poly.bounds
+            all_xs.extend([minx, maxx]); all_ys.extend([miny, maxy])
+    for fl, poly in fp_by_floor.items():
+        floors_set.add(int(fl))
+        minx, miny, maxx, maxy = poly.bounds
+        all_xs.extend([minx, maxx]); all_ys.extend([miny, maxy])
+    if not floors_set or not all_xs:
+        print(f"No thermal-zone geometry available for building {building_reference}")
+        return None
+
+    cx = (min(all_xs) + max(all_xs)) / 2
+    cy = (min(all_ys) + max(all_ys)) / 2
+    half = max(max(all_xs) - min(all_xs), max(all_ys) - min(all_ys)) / 2 * 1.15 + 1.0
+    ox, oy = cx, cy
+    x_lim = (cx - half - ox, cx + half - ox)
+    y_lim = (cy - half - oy, cy + half - oy)
+
+    floor_keys = sorted(floors_set)
+    n_floors = max(1, len(floor_keys))
+    n_cols = min(4, n_floors)
+    n_rows = math.ceil(n_floors / n_cols)
+
+    fig = plt.figure(figsize=(4.5 * n_cols, 4.0 * n_rows + 1.2))
+    gs = GridSpec(n_rows, n_cols, hspace=0.45, wspace=0.35)
+
+    use_colours = {}          # use_type -> colour (filled lazily, drives legend)
+    saw_communal = saw_nonocc = saw_deficit = False
+
+    for idx, floor in enumerate(floor_keys):
+        r, c = divmod(idx, n_cols)
+        ax = fig.add_subplot(gs[r, c])
+        ax.set_aspect('equal')
+        ax.set_xlim(*x_lim); ax.set_ylim(*y_lim)
+
+        fpoly = fp_by_floor.get(floor)
+        if fpoly is not None:
+            for g in (list(fpoly.geoms) if hasattr(fpoly, 'geoms') else [fpoly]):
+                if hasattr(g, 'exterior'):
+                    xs = [p[0] - ox for p in g.exterior.coords]
+                    ys = [p[1] - oy for p in g.exterior.coords]
+                    ax.plot(xs, ys, color='#BBBBBB', lw=0.8, ls=':', zorder=1)
+
+        # Dense floors (many small dwellings, e.g. a row of attached houses) turn
+        # per-zone labels into stacked noise — drop labels there and let the fills
+        # carry the distribution.
+        n_labelable = sum(1 for z in zones
+                          if (z.get('floor_polys') or {}).get(floor) is not None
+                          and _thermal_zone_render_kind(z) != 'non_occupied')
+        label_floor = n_labelable <= 20
+
+        for z in zones:
+            poly = (z.get('floor_polys') or {}).get(floor)
+            if poly is None or getattr(poly, 'is_empty', True):
+                continue
+            kind = _thermal_zone_render_kind(z)
+            deficit = bool(z.get('facade_deficit'))
+            if kind == 'communal':
+                fc = _THERMAL_ZONE_COMMUNAL_COLOUR
+                saw_communal = True
+            elif kind == 'non_occupied':
+                fc = _THERMAL_ZONE_NON_OCCUPIED_COLOUR
+                saw_nonocc = True
+            else:
+                fc = _zone_use_colour(z.get('use_type'), use_colours)
+            edge = '#D62728' if deficit else '#333333'
+            lw = 2.0 if deficit else 0.8
+            saw_deficit = saw_deficit or deficit
+            # SOLID fills only — no hatching, which would be confused with the
+            # thermal-zone division lines. Categories are told apart by colour.
+            _add_polygon_patch(ax, poly, ox, oy, fc, edge, alpha=0.72, lw=lw)
+            # Label reference + area at the zone centroid. Skip tiny/non-occupied
+            # zones and whole dense floors so the plot doesn't turn into stacked
+            # text — the fills + legend already identify them.
+            if not label_floor or poly.area < 6.0 or kind == 'non_occupied':
+                continue
+            try:
+                cpt = poly.representative_point()
+                ax.annotate(f"{_thermal_zone_label(z, building_reference)}"
+                            f"\n{poly.area:.0f} m²",
+                            (cpt.x - ox, cpt.y - oy), ha='center', va='center',
+                            fontsize=6, color='#111111', zorder=3)
+            except Exception:
+                pass
+
+        ax.set_title(f'Floor {floor}', fontsize=10, pad=5)
+        ax.tick_params(labelsize=7)
+        ax.grid(True, alpha=0.2, linestyle=':')
+        ax.set_xlabel('ΔX (m)', fontsize=7); ax.set_ylabel('ΔY (m)', fontsize=7)
+
+    for idx in range(n_floors, n_rows * n_cols):
+        r, c = divmod(idx, n_cols)
+        fig.add_subplot(gs[r, c]).set_visible(False)
+
+    legend_patches = [mpatches.Patch(facecolor=col, edgecolor='#333333', label=use)
+                      for use, col in sorted(use_colours.items())]
+    if saw_communal:
+        legend_patches.append(mpatches.Patch(
+            facecolor=_THERMAL_ZONE_COMMUNAL_COLOUR, edgecolor='#333333',
+            label='Communal core'))
+    if saw_nonocc:
+        legend_patches.append(mpatches.Patch(
+            facecolor=_THERMAL_ZONE_NON_OCCUPIED_COLOUR, edgecolor='#333333',
+            label='Non-occupied (parking/pool)'))
+    if saw_deficit:
+        legend_patches.append(mpatches.Patch(
+            facecolor='none', edgecolor='#D62728', lw=2.0,
+            label='Façade frontage < 3 m'))
+    if legend_patches:
+        fig.legend(handles=legend_patches, loc='lower center',
+                   ncol=min(5, len(legend_patches)), fontsize=8,
+                   bbox_to_anchor=(0.5, 0.0), frameon=True)
+
+    fig.suptitle(f'Thermal-zone floor plan — {building_reference}', fontsize=12)
+    fig.tight_layout(rect=[0, 0.05, 1, 0.96])
+
+    if output_path:
+        plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Thermal-zone floor plan saved to {output_path}")
+    else:
+        plt.show()
+    return fig
+
+
 def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None,
-                               floor_height=3.0, show_thermal_zones=True,
-                               terrain_interp='tin'):
+                               floor_height=3.0, ground_floor_height=5.0,
+                               show_thermal_zones=True, terrain_interp='tin'):
     """Interactive 3-D view of a building's geometry with terrain and neighbour shadows.
+
+    ``ground_floor_height`` (default 5.0 m) is the TALLER ground storey; upper
+    storeys use ``floor_height`` (default 3.0 m). All heights come from
+    ``floor_base_elevation`` so the shades/zones/walls sit at the SAME elevations
+    the shadow analysis used (which assumes a 5 m ground floor) — otherwise the
+    neighbour-shadow contours render too low.
 
     Renders three layers in a single plotly scene:
       1. **Terrain**  — ``br__terrain_grid`` as a coloured heightmap surface
          (recentred on the building centroid).
       2. **Building shades** — ``br__shadows`` per-floor blocked-region polygons
-         from neighbouring buildings, shown as semi-transparent horizontal planes
-         at the corresponding floor height  (floor × floor_height).
+         from neighbouring buildings, shown as semi-transparent planes at each
+         floor's slab elevation (``floor_base_elevation``, taller ground floor).
       3. **Wall segments** — ``br__wall_segments`` extruded into vertical rectangles
-         spanning *floor* × floor_height to (floor+1) × floor_height, coloured by
-         wall type.
+         spanning each floor's slab to the one above (``floor_base_elevation``),
+         coloured by wall type.
 
     All three axes use the same metre scale (1:1:1 aspect ratio).
 
@@ -6935,7 +7282,9 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
 
     traces = []
     all_x, all_y, all_z = [], [], []   # relative coords for range calc
-    tz_trace_info = []                  # [(trace_index, label)] for the zone menu
+    tz_cat_traces = {}                  # category -> [trace_index] for the zone menu
+    tz_cat_shown = set()                # categories already given a legend entry
+    _shade_legend_shown = set()         # collapse per-floor shades to one entry
     terrain_trace_idx = None            # index of the terrain surface trace
 
     # ---- Layer 1: Terrain DEM surface (smooth thin-plate spline, no pixels) --
@@ -7008,10 +7357,28 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
         ground_z = 0.0
     oz = ground_z
 
+    # Floor slab elevations (ground-relative): the ground floor is taller, matching
+    # the shadow analysis and the EnergyPlus ``_floor_z`` — a flat ``fl*floor_height``
+    # would place every upper floor (and its shadow contour) too low. The taller
+    # ground floor applies to buildings with >= 5 floors above ground OR to
+    # industrial/agricultural buildings (the same rule the EnergyPlus model uses);
+    # other smaller buildings use ``floor_height`` for every storey.
+    try:
+        _n_ag = int(row.get('br__floors_above_ground'))
+    except (TypeError, ValueError):
+        _fp_floors = row.get('br__building_footprint_by_floor')
+        _n_ag = (1 + max((int(r[1]) for r in _fp_floors if int(r[1]) >= 0), default=0)
+                 if isinstance(_fp_floors, (list, tuple)) and _fp_floors else 1)
+    _eff_gfh = effective_ground_floor_height(_n_ag, ground_floor_height, floor_height,
+                                             row.get('building_use'))
+
+    def _fb(fl):
+        return floor_base_elevation(0.0, fl, _eff_gfh, floor_height)
+
     # ---- Layer 2: Shadow boundary panels (buffer circle edges excluded) -------
-    # Each floor's shadow polygon boundary is extruded ±floor_height/2 around
-    # the floor mid-height.  Segments that lie on the analysis buffer circle
-    # (artefacts of the search radius, not real buildings) are filtered out.
+    # Each floor's shadow polygon boundary is extruded between the floor's slab and
+    # the one above.  Segments that lie on the analysis buffer circle (artefacts of
+    # the search radius, not real buildings) are filtered out.
     shadows_geom = row.get('br__shadows')
     if isinstance(shadows_geom, dict) and shadows_geom:
         try:
@@ -7054,8 +7421,8 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
             for floor_idx, poly in sorted(shadows_geom.items()):
                 if poly is None or (hasattr(poly, 'is_empty') and poly.is_empty):
                     continue
-                z_bot_rel = floor_idx * floor_height
-                z_top_rel = floor_idx * floor_height + floor_height
+                z_bot_rel = _fb(floor_idx)
+                z_top_rel = _fb(floor_idx + 1)
                 z_mid_rel = (z_bot_rel + z_top_rel) / 2
                 colour = shade_colours[floor_idx % len(shade_colours)]
 
@@ -7089,10 +7456,12 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
                         x=sx, y=sy, z=sz,
                         i=si, j=sj, k=sk,
                         color=colour, opacity=0.35,
-                        name=f'Shade floor {floor_idx}',
-                        showlegend=True, flatshading=True,
+                        name='Neighbour shades', legendgroup='shades',
+                        showlegend=('shades' not in _shade_legend_shown),
+                        flatshading=True,
                         hovertemplate=f'Floor {floor_idx}<br>h={z_mid_rel:.1f} m<extra></extra>',
                     ))
+                    _shade_legend_shown.add('shades')
         except Exception:
             pass  # shades are nice-to-have
 
@@ -7124,8 +7493,8 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
         except Exception:
             continue
 
-        z_bot_rel = floor * floor_height
-        z_top_rel = (floor + 1) * floor_height
+        z_bot_rel = _fb(floor)
+        z_top_rel = _fb(floor + 1)
 
         bucket = type_verts.setdefault(wtype, {'x': [], 'y': [], 'z': [],
                                                 'i': [], 'j': [], 'k': []})
@@ -7242,7 +7611,7 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
             # otherwise floor 0 at ground level (z = 0).
             base_lowest = floor_union.get(min_floor)
             if base_lowest is not None and not base_lowest.is_empty:
-                struct_regions.append((base_lowest, 'terrain', min_floor * floor_height))
+                struct_regions.append((base_lowest, 'terrain', _fb(min_floor)))
 
             # Iterate every interface from the lowest floor up to the roof,
             # below-ground floors included.
@@ -7250,7 +7619,7 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
                 a = floor_union.get(_f)
                 if a is None or a.is_empty:
                     continue
-                z_top = (_f + 1) * floor_height        # top-of-floor slab level
+                z_top = _fb(_f + 1)                    # top-of-floor slab level
                 above = floor_union.get(_f + 1)
                 if above is None or above.is_empty:
                     # Topmost present floor — its top is roof (above ground) or
@@ -7319,25 +7688,31 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
                     is_pool = bool(_zone.get('is_pool'))
                     for _fl, _poly in sorted(_zone.get('floor_polys', {}).items()):
                         if is_pool:                       # water surface at floor level
-                            _zt = _fl * floor_height
+                            _zt = _fb(_fl)            # water surface at floor level
                             _append_prism_mesh(bkt, _poly, _zt - 1.2, _zt, ox, oy)
                         else:
-                            _append_prism_mesh(bkt, _poly,
-                                               _fl * floor_height,
-                                               (_fl + 1) * floor_height, ox, oy)
+                            _append_prism_mesh(bkt, _poly, _fb(_fl), _fb(_fl + 1), ox, oy)
                     if not bkt['x']:
                         continue
-                    label = f"Zone: {_zone.get('use_type')}|{_zone.get('reference', '')}"
+                    # Group zones by CATEGORY in the legend/menu (one entry per use
+                    # type / role) — a per-zone legend of hundreds of items would
+                    # squeeze the 3-D scene to nothing. Only the first zone of each
+                    # category carries the legend entry; the whole group toggles
+                    # together (legend ``groupclick`` + the per-category menu).
+                    _cat = _zone_legend_category(_zone)
+                    _hover = f"{_zone.get('use_type')}|{_zone.get('reference', '')}"
                     traces.append(go.Mesh3d(
                         x=bkt['x'], y=bkt['y'], z=bkt['z'],
                         i=bkt['i'], j=bkt['j'], k=bkt['k'],
                         color=colour, opacity=0.45,
-                        name=label, showlegend=True, flatshading=True,
-                        visible='legendonly',   # start hidden; toggle via menu
-                        hovertemplate=f'{label}<extra></extra>',
+                        name=_cat, legendgroup=_cat,
+                        showlegend=(_cat not in tz_cat_shown), flatshading=True,
+                        visible='legendonly',   # start hidden; toggle via menu/legend
+                        hovertemplate=f'{_hover}<extra></extra>',
                     ))
                     all_x.extend(bkt['x']); all_y.extend(bkt['y']); all_z.extend(bkt['z'])
-                    tz_trace_info.append((len(traces) - 1, label))
+                    tz_cat_shown.add(_cat)
+                    tz_cat_traces.setdefault(_cat, []).append(len(traces) - 1)
         except Exception:
             pass  # structural slabs are nice-to-have
 
@@ -7394,7 +7769,8 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
             aspectmode='data',
             camera=dict(eye=dict(x=1.5, y=-1.5, z=1.0)),
         ),
-        legend=dict(title='Layer', x=0.01, y=0.99),
+        legend=dict(title='Layer', x=0.01, y=0.99, groupclick='togglegroup',
+                    itemsizing='constant'),
         margin=dict(l=0, r=0, b=60, t=40),
     )
 
@@ -7421,20 +7797,19 @@ def plot_building_3d_geometry(gdf, building_reference, output_path=None, wd=None
     # ---- Thermal-zone checkbox menu -----------------------------------------
     # Each zone gets a toggle button: `args` shows it, `args2` hides it again
     # (Plotly applies args/args2 on alternating clicks → checkbox behaviour).
-    if tz_trace_info:
-        zone_buttons = [dict(
-            label=label,
-            method='restyle',
-            args=[{'visible': True}, [idx]],
-            args2=[{'visible': 'legendonly'}, [idx]],
-        ) for idx, label in tz_trace_info]
-        all_idx = [idx for idx, _ in tz_trace_info]
+    if tz_cat_traces:
+        # One toggle per CATEGORY (use type / role), not per zone — otherwise the
+        # menu is a scroll-list of hundreds of buttons that hides the plot.
+        all_idx = [i for idxs in tz_cat_traces.values() for i in idxs]
         zone_buttons = [
             dict(label='✓ Show all zones', method='restyle',
                  args=[{'visible': True}, all_idx]),
             dict(label='✗ Hide all zones', method='restyle',
                  args=[{'visible': 'legendonly'}, all_idx]),
-        ] + zone_buttons
+        ] + [dict(label=cat, method='restyle',
+                  args=[{'visible': True}, idxs],
+                  args2=[{'visible': 'legendonly'}, idxs])
+             for cat, idxs in tz_cat_traces.items()]
         updatemenus.append(dict(
             type='buttons', direction='down', showactive=False,
             x=1.02, xanchor='left', y=0.85, yanchor='top',

@@ -441,7 +441,7 @@ def input_files_for_IREC_simulations(gdf):
                 "BuildingReference": row["building_reference"],
                 "BuildingType": classify_building_type(building_spaces, row["br__detached"]),
                 "Location": row["location"],
-                "CensusTract": row["section_code"],
+                "CensusTract": row["census_tract_code"],
                 "PostalCode": row["postal_code"],
                 "AllParcelOrientations": row['br__parcel_orientations'],
                 "MainParcelOrientation": row['br__parcel_main_orientation'],

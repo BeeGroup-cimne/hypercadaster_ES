@@ -223,6 +223,8 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
           plot_zones_ratio=0.01, use_CAT_files=False, CAT_files_rel_dir="CAT_files",
           pois_layer=False, sociodemographic_layer=False,
           social_ES_layer=False, social_ES_years=5, social_ES_datasets=None,
+          social_ES_ec_variables=social.EC_SELECTED_VARIABLES,
+          census_tract_aggregations=True,
           weather_layer=False, weather_years=5, weather_indicators=None,
           weather_hdd_base=18.0, weather_cdd_base=21.0, weather_bbox=None,
           floor_height=3.0, ground_floor_height=5.0, num_workers=-1,
@@ -259,7 +261,7 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
     postal_code_layer : bool, default True
         Join the Spanish postal code (``postal_code``) each building falls in.
     census_layer : bool, default True
-        Join INE census-tract identifiers (``section_code``, ``district_code``).
+        Join INE census-tract identifiers (``census_tract_code``, ``district_code``).
         Required for ``sociodemographic_layer``.
     elevations_layer : bool, default True
         Sample the DEM to add ground ``elevation`` (m). Note the trailing "s":
@@ -303,29 +305,33 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
         Raw OSM query results are cached under the ``os_maps`` directory so
         re-runs skip the network.
     sociodemographic_layer : bool, default False
-        Join INE 2021 census-section sociodemographic indicators (mean age,
+        Join INE 2021 census-tract sociodemographic indicators (mean age,
         share over 64 / under 16, average household size, total households) as
         ``br__population_*`` / ``br__*_household*`` columns. Requires
-        ``census_layer=True`` (needs ``section_code``); degrades gracefully to a
+        ``census_layer=True`` (needs ``census_tract_code``); degrades gracefully to a
         no-op if the source is unavailable.
     social_ES_layer : bool, default False
         Join INE socioeconomic indicators from the ``social_ES`` package onto
         every building, each dataset at its finest geographic level (census
-        section → district → municipality → province, using the codes added by
+        tract → district → municipality → province, using the codes added by
         ``census_layer``). Adds ``so__{indicator}_{year}`` columns (``so__``
         namespace prefix, snake_case indicator, year as suffix)
         for the most recent ``social_ES_years`` years of the income atlas,
-        population census, education/employment census, rental & housing price
-        indices, and district electricity consumption. Runs **before** the POI
-        join. Requires ``census_layer=True``; ``social_ES`` caches the whole-Spain
-        source files under ``{wd}/INE`` on first use (a slow one-off download).
+        population census, education/employment census, 2021 dwellings census,
+        the empty & secondary dwellings series (2001/2011/2021), rental &
+        housing price indices, and district electricity consumption. Every
+        indicator comes from a single dataset — the curated maps do not overlap.
+        Runs **before** the POI join. Requires ``census_layer=True``;
+        ``social_ES`` (≥ 1.0.3) caches the whole-Spain source files under
+        ``{wd}/INE`` on first use (a slow one-off download).
         See :mod:`hypercadaster_ES.social` for the curated indicator set.
     social_ES_years : int, default 5
         Number of most-recent years to keep per ``social_ES`` dataset.
     social_ES_datasets : sequence[str], optional
         Subset of the ``social_ES`` datasets to include; default is all of
         :data:`hypercadaster_ES.social.ALL_DATASETS` (``"atlas"``,
-        ``"population"``, ``"education"``, ``"rental"``, ``"price"``,
+        ``"population"``, ``"education"``, ``"dwellings"``,
+        ``"empty_dwellings"``, ``"rental"``, ``"price"``,
         ``"electricity"``), plus the per-building **Essential Characteristics**
         downscaling (``"essential_characteristics"`` →
         :data:`hypercadaster_ES.social.ESSENTIAL_CHARACTERISTICS`, adding
@@ -334,6 +340,24 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
         ``social_ES_datasets`` is ``None`` (and ``use_CAT_files=True``) or when it
         explicitly lists ``"essential_characteristics"``; requesting it without
         ``use_CAT_files`` skips it with a warning.
+    social_ES_ec_variables : sequence[str] or None, default
+        :data:`hypercadaster_ES.social.EC_SELECTED_VARIABLES`
+        Which **Essential Characteristics** survey variables to keep, named as
+        ``social_ES`` names them (the part of an ``ec__{variable}~{class}`` column
+        left of the ``~``). The default is the curated 27 that add something the
+        ``so__`` census layer and the cadaster do not already carry; ``None`` keeps
+        all ~70 of them (~256 columns).
+    census_tract_aggregations : bool, default True
+        Aggregate the frame by census tract and write the result onto every
+        building as ``ctagg__*`` — the tract's building/dwelling counts, its
+        summed residential floor area, and the occupancy densities
+        (``ctagg__people_per_m2``, ``ctagg__people_per_dwelling``) the energy
+        simulations need. Those densities are a property of the whole tract, so
+        computing them here — while the whole frame is in hand — is what lets a
+        single-building frame be simulated on its own later. Runs after the
+        social layer (it reads ``so__population_{year}``) and degrades to a no-op
+        without ``census_tract_code`` or the CAT ``br__building_spaces_*``
+        columns. See :func:`hypercadaster_ES.mergers.join_census_tract_aggregations`.
     weather_layer : bool, default False
         Join annually-aggregated ERA5-Land climate indicators onto every
         building. Each building is snapped to the nearest 0.1° ERA5-Land cell
@@ -568,8 +592,17 @@ def merge(wd, province_codes=None, ine_codes=None, cadaster_codes=None,
                 n_years=social_ES_years,
                 datasets=social_ES_datasets,
                 use_CAT_files=use_CAT_files,
+                ec_variables=social_ES_ec_variables,
                 verbose=(verbose == "full"),
             )
+
+    # After the social layer (needs so__population_{year}) and before the heavy
+    # POI/weather joins: aggregate the frame by census tract so every building
+    # carries its tract's occupancy context and can later be simulated alone.
+    if census_tract_aggregations:
+        with utils.stage_timer("merge(): join_census_tract_aggregations"):
+            gdf = mergers.join_census_tract_aggregations(
+                gdf=gdf, verbose=(verbose == "full"))
 
     if weather_layer:
         with utils.stage_timer("merge(): join_weather"):

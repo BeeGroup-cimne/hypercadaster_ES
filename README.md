@@ -14,7 +14,7 @@ A comprehensive Python library for downloading, processing, and analyzing Spanis
 
 - 🏘️ **Comprehensive Cadastral Data Access**: Download building and parcel data from the Spanish Cadastre, and nationwide address points from CartoCiudad (CNIG)
 - 🗺️ **Multi-source Data Integration**: Merge with census tracts, postal codes, elevation models, and OpenStreetMap data
-- 🧮 **Socioeconomic Enrichment**: INE indicators via `social_ES` (income atlas, population, education, rental & housing prices, electricity) joined per building, plus per-building Essential-Characteristics downscaling
+- 🧮 **Socioeconomic Enrichment**: INE indicators via `social_ES` (income atlas, population, education, dwelling stock & tenure, empty & secondary dwellings, rental & housing prices, electricity) joined per building, plus per-building Essential-Characteristics downscaling
 - 🌦️ **Weather Enrichment**: Annual ERA5-Land climate indicators per building (heating/cooling degree days, precipitation, solar irradiation, temperature, humidity, wind) via `merge(weather_layer=True)`, gathered from the Copernicus analysis-ready (ARCO) Zarr stores
 - 🏗️ **Advanced Building Analysis**: Geometric inference, floor footprint calculation, building space classification, shadow analysis
 - 📊 **Orientation & Environmental Analysis**: Building orientation analysis, street relationships, shadow calculations, terrain analysis
@@ -29,6 +29,7 @@ A comprehensive Python library for downloading, processing, and analyzing Spanis
 - [**Configuration & Examples**](docs/configuration-examples.md) - Advanced configuration and example workflows
 
 ### Library Reference
+- [**Energy Model & Scenarios**](docs/energy-model.md) - How the EnergyPlus model is built, the occupant-behaviour model, and the scenarios
 - [**Library Structure**](docs/library-structure.md) - Module overview and key entry points
 - [**Data Sources & Coverage**](docs/data-sources-coverage.md) - Available datasets and geographic coverage
 - [**Output Data Schema**](docs/output-schema.md) - Complete data structure and column reference
@@ -100,7 +101,7 @@ For detailed installation instructions and advanced examples, see [Installation 
 - **CAT Files Support**: Detailed building space classification from official cadastral CAT format
 - **Energy Simulation Ready**: Export formats compatible with building energy simulation tools (EnergyPlus IDF via hc.energy.build_energy_model)
 - **POI Proximity Analysis**: Points of interest from OpenStreetMap with distance-based indicators
-- **Socioeconomic Layer**: INE indicators via `social_ES` joined at the finest geographic level (`merge(social_ES_layer=True)`), with English-keyed `ec__*` Essential-Characteristics downscaling when CAT files are used
+- **Socioeconomic Layer**: INE indicators via `social_ES` joined at the finest geographic level (`merge(social_ES_layer=True)`), each figure taken from a single source dataset, with `ec__*` Essential-Characteristics downscaling when CAT files are used
 - **Weather Layer**: Annual ERA5-Land climate indicators per building (`merge(weather_layer=True)`) — degree days, precipitation, irradiation, temperature, humidity, wind — via the Copernicus analysis-ready (ARCO) Zarr stores with `cdsapi` fallback
 - **Commercial Premises Analysis**: Barcelona-specific ground floor commercial data
 

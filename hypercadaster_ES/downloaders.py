@@ -2126,6 +2126,23 @@ def normalize_cartociudad_street_type(value):
     if first in _STREET_TYPE_UNKNOWN_CODES:
         return None
     return first
+
+
+def strip_street_type(address):
+    """Drop the leading street-TYPE token(s) (CALLE, AVENIDA, CARRER, URBANIZACION,
+    …) from an address so the street NAME drives comparison — the CAT per-space
+    address and the CartoCiudad parcel label often disagree on the type prefix
+    (``CALLE URBANIZACION DEVESA PARK`` vs ``URBANIZACION DEVESA PARK``), which
+    should not block their harmonisation. Keeps everything after the type(s).
+    Returns the upper-cased remainder (empty string when nothing is left)."""
+    if not address:
+        return ""
+    tokens = " ".join(str(address).upper().split()).split()
+    while tokens and _resolve_street_type_token(tokens[0]) is not None:
+        tokens.pop(0)
+    return " ".join(tokens)
+
+
 """Cadastral two-letter street-type acronym → full Spanish literal."""
 
 # 16 - Registro de reparto de elementos comunes

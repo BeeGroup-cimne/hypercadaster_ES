@@ -27,6 +27,9 @@ geometry:
 windows:
   default_wwr: 0.2             # fallback window-to-wall ratio
   wwr_bounds: [0.05, 0.95]     # clamp for any WWR (predictor or manual)
+  # Per-use multiplier on the WWR; commercial premises are far less glazed and
+  # only on their (street) main façade (see shading.commercial_main_facade_only).
+  wwr_by_use: {residential: 1.0, office: 1.0, commercial: 0.35, other: 1.0}
   area_per_window: 3.0         # m² of glazing per window; count = WWR·wall/area
   sill_height: 0.9             # height of the window sill above the floor (m)
   head_margin: 0.3             # clearance from window head to ceiling (m)
@@ -39,11 +42,116 @@ windows:
   # of each Spanish construction period (glazing + frame type). Applied as the
   # zone design infiltration (air changes per hour) for CONDITIONED zones;
   # non-conditioned zones (parking/communal/sports) keep loads.*.infil_ach.
+  #
+  # These are MEAN infiltration rates at normal pressure -- what the building
+  # actually leaks over a season -- NOT the n50 blower-door figure. EnergyPlus
+  # applies them with a constant coefficient (no wind term), so the number here is
+  # the number delivered every hour. Derived from the typical n50 of each period
+  # by the usual n50/20 rule of thumb for a sheltered urban site.
+  #
+  # They were previously ~2x these values, which is an n50/10 reading. That
+  # mattered: at 1.1 ren/h the dwelling is flushed so hard that indoor CO2 never
+  # rises and no occupant behaviour can move it, so the air-quality KPIs were
+  # flat by construction rather than by result.
   infiltration:
-    "pre1980":   {type: "single glazing, old wood openable frame",      air_changes_per_hour: 1.4}
-    "1980_2006": {type: "double glazing, aluminium sliding frame",      air_changes_per_hour: 1.1}
-    "2007_2013": {type: "double glazing, aluminium RPT openable frame", air_changes_per_hour: 0.55}
-    "post2013":  {type: "double glazing, PVC openable frame",           air_changes_per_hour: 0.35}
+    "pre1980":   {type: "single glazing, old wood openable frame",      n50: 16, air_changes_per_hour: 0.80}
+    "1980_2006": {type: "double glazing, aluminium sliding frame",      n50: 11, air_changes_per_hour: 0.55}
+    "2007_2013": {type: "double glazing, aluminium RPT openable frame", n50: 7,  air_changes_per_hour: 0.35}
+    "post2013":  {type: "double glazing, PVC openable frame",           n50: 5,  air_changes_per_hour: 0.25}
+
+# --- Façade shading: balconies + awnings ----------------------------------- #
+shading:
+  commercial_main_facade_only: true   # commercial glazing only on the main façade
+  # NEIGHBOUR-shading (context) panels, applied by build_energy_model as the model
+  # is built -- so the .idf it writes, the 3-D plot and the simulation all show
+  # exactly the same obstructions.
+  neighbours:
+    filter: true               # drop panels that cannot shade this building:
+                               # below its horizon from every vantage, in the
+                               # N/NE/NW sector (no direct sun in the northern
+                               # hemisphere), or hidden behind a nearer panel
+    max_panels: 200            # hard cap on what survives the filter (E+ runtime
+                               # grows with panel count); null = keep them all
+    sun_exclude_halfwidth: 67.5  # deg either side of due north to exclude
+    occlusion: true            # view-based culling of panels hidden behind others
+  # --- Exterior roller blind ("persiana") -----------------------------------
+  # Modelled as a real EnergyPlus shade LAYER driven by a WindowShadingControl,
+  # not as a shading surface pasted in front of the glazing: a coincident surface
+  # only blocks the beam its own shadow catches and lets the sky diffuse straight
+  # through, so a fully closed persiana came out blocking ~half the transmitted
+  # solar. As a layer it sits in the window construction and attenuates beam and
+  # diffuse alike, which is what a closed persiana does.
+  #
+  # The control NEVER runs in the heating season: a Spanish household wants that
+  # sun, so the persiana (and the awnings) stay fully retracted/transparent. In
+  # the cooling and in-between seasons it closes when the sun on the window
+  # exceeds solar_setpoint_w_m2 -- and only for the occupant behaviours that
+  # actually operate them (see residential_behavior.behaviors).
+  persiana:
+    enabled: true
+    solar_transmittance: 0.05    # closed slats: almost opaque to solar
+    solar_reflectance: 0.55      # light-coloured PVC/aluminium, typical in Spain
+    visible_transmittance: 0.05
+    visible_reflectance: 0.55
+    thermal_transmittance: 0.0   # opaque to long-wave
+    thermal_emissivity: 0.9
+    thickness: 0.003             # m
+    conductivity: 0.15           # W/mK
+    distance_to_glass: 0.05      # m; air gap between blind and glazing
+    air_permeability: 0.05       # openness factor of the closed slats
+    solar_setpoint_w_m2: 140     # close above this incident solar on the window
+    # A closed persiana is also NIGHT INSULATION: the slats plus their air gap cut
+    # the radiant and convective loss through the glazing, which is why a Spanish
+    # household shuts them on a winter night. Modelled as a second shading control
+    # on the same windows, active only in the heating and in-between seasons (in
+    # summer the night is when you WANT the window losing heat) and only for the
+    # occupants who operate them.
+    night_insulation:
+      enabled: true
+      outdoor_below_c: 15        # close when the outdoor air is below this
+
+  balcony:
+    enabled: true
+    # RESIDENTIAL balconies on the street MAIN FAÇADE, from the first floor upward
+    # (never the ground floor). Depth (projection, m) and the fraction of the main-
+    # façade length they cover GROW with the construction period — old buildings
+    # have short, shallow balconies; modern ones run the whole façade.
+    by_period:
+      "pre1980":   {depth: 0.7, length_fraction: 0.35}
+      "1980_2006": {depth: 1.0, length_fraction: 0.60}
+      "2007_2013": {depth: 1.3, length_fraction: 0.85}
+      "post2013":  {depth: 1.6, length_fraction: 1.00}
+    window_height: 2.0                 # balcony door/window height (m)
+  awning:
+    enabled: true
+    # Retractable awnings on E/SE/S/SW/W windows (never north). Modelled as an
+    # inclined fabric of ``length`` hanging from the window head and projecting
+    # OUTWARD. On a balcony the awning sits at the balcony's outer edge; on the TOP
+    # floor (no balcony above) a horizontal awning of the balcony's projection
+    # depth is created over the window instead.
+    orientations: [E, SE, S, SW, W]
+    length: 1.5                        # fabric length along the slope (m)
+    # Angle from the VERTICAL: 90 deg is a horizontal canopy, 0 deg is a blind
+    # hanging flat against the glazing. A Spanish retractable awning sits well
+    # open, so the fabric reaches far out and drops only a little.
+    inclination_from_vertical_deg: 75
+    # Adoption probability = clamp(income / income_reference) × conservation_weight
+    # (both from social_ES when available, else the defaults below).
+    # The draw is made once per FAÇADE COLUMN (vertical bay): the windows stacked
+    # at one façade XY share the answer on every floor, which is how a real façade
+    # looks. "window" restores the old independent per-window draw (awnings appear
+    # to flicker storey by storey); "building" is all-or-nothing per building.
+    adoption_scope: column             # column | window | building
+    income_reference: 30000            # €/yr for full adoption
+    default_income: 22000
+    default_conservation: normal
+    conservation_weight:
+      excellent: 1.0
+      very_good: 0.9
+      good: 0.8
+      normal: 0.6
+      fair: 0.4
+      bad: 0.25
 
 # --- Doors ----------------------------------------------------------------- #
 doors:
@@ -101,11 +209,20 @@ archetype_envelope:
 # below) that drives People/Lights/Equipment for the category. heat/cool (+ _sb
 # setback) are fallback scalars used to build the setpoint schedules when no
 # explicit schedules.setpoints.<category> profile is given.
+# Non-residential (office/commercial) internal-gain densities and occupancy follow
+# the CTE DB-HE "perfiles de uso" for terciario (operating-hour occupancy schedules
+# below), and their fresh-air ventilation follows RITE IT 1.1.4.2 (hvac.non
+# residential_ventilation_ls_per_person). ppl_per_m2 ≈ CTE occupancy density
+# (office ~10 m²/person = IDA 2; commercial denser); equip/lights per CTE terciario
+# intensity; infil_ach per the envelope tightness (overridden per period for windows).
 loads:
   residential: {ppl_per_m2: 0.028, lights: 4.4,  equip: 4.0,  infil_ach: 0.5, heat: 20, heat_sb: 17, cool: 25, cool_sb: 27, activity: 110, conditioned: true,  occ: OCC_RESIDENTIAL}
-  office:      {ppl_per_m2: 0.11,  lights: 10.0, equip: 12.0, infil_ach: 0.4, heat: 21, heat_sb: 16, cool: 24, cool_sb: 28, activity: 120, conditioned: true,  occ: OCC_OFFICE}
-  commercial:  {ppl_per_m2: 0.15,  lights: 14.0, equip: 10.0, infil_ach: 0.5, heat: 21, heat_sb: 16, cool: 24, cool_sb: 28, activity: 130, conditioned: true,  occ: OCC_COMMERCIAL}
-  other:       {ppl_per_m2: 0.05,  lights: 8.0,  equip: 8.0,  infil_ach: 0.5, heat: 20, heat_sb: 17, cool: 25, cool_sb: 27, activity: 120, conditioned: true,  occ: OCC_OFFICE}
+  office:      {ppl_per_m2: 0.11,  lights: 10.0, equip: 12.0, infil_ach: 0.4, heat: 19, heat_sb: 16, cool: 27, cool_sb: 30, activity: 120, conditioned: true,  occ: OCC_OFFICE}
+  commercial:  {ppl_per_m2: 0.15,  lights: 14.0, equip: 10.0, infil_ach: 0.5, heat: 19, heat_sb: 16, cool: 27, cool_sb: 30, activity: 130, conditioned: true,  occ: OCC_COMMERCIAL}
+  # Only residential / office / commercial (tertiary) uses are conditioned; any
+  # other use (singular buildings, cultural, religious, unknown, …) gets NO HVAC
+  # even when it is a thermal zone inside a modelled building.
+  other:       {ppl_per_m2: 0.05,  lights: 8.0,  equip: 8.0,  infil_ach: 0.5, activity: 120, conditioned: false, occ: OCC_OFFICE}
   parking:     {ppl_per_m2: 0.0,   lights: 2.0,  equip: 0.0,  infil_ach: 1.0, conditioned: false, occ: OCC_LOW}
   # Rural sheds/barns: same assumptions as a warehouse (which maps to the
   # `parking` category), but uninsulated (see archetype_envelope.uninsulated)
@@ -113,6 +230,229 @@ loads:
   agricultural: {ppl_per_m2: 0.0,  lights: 2.0,  equip: 0.0,  infil_ach: 5.0, conditioned: false, occ: OCC_LOW}
   communal:    {ppl_per_m2: 0.0,   lights: 3.0,  equip: 0.0,  infil_ach: 0.5, conditioned: false, occ: OCC_LOW}
   sports:      {ppl_per_m2: 0.0,   lights: 0.0,  equip: 0.0,  infil_ach: 2.0, conditioned: false, occ: OCC_LOW}
+
+  # Metabolic rate while ASLEEP (W/person), against the `activity` above for the
+  # waking hours. ~0.8 met vs ~1.2 met: a sleeping body emits less heat AND less
+  # CO2, because EnergyPlus derives the CO2 generation from the activity level
+  # (People.Carbon_Dioxide_Generation_Rate is per WATT), so one number moves both.
+  # Which hours count as asleep comes from the Time Use Survey agenda when the
+  # building has one, and from the night band (23:00-08:00) otherwise.
+  residential_activity_sleeping: 72
+
+  # RESIDENTIAL occupancy from the census rather than the ppl_per_m2 default
+  # above (0.028 people/m² ~ 2.8 per 100 m²). When the building carries its
+  # census tract's occupancy -- ctagg__people_per_m2, written by hc.merge -- that
+  # measured density drives the PEOPLE internal gains (metabolic heat, and the
+  # ventilation/comfort that follow from it), the same figure that already drives
+  # the DHW demand and the household size. One census population, one occupancy,
+  # everywhere in the model.
+  #
+  # Each dwelling gets max(1, round(density x its area)) occupants -- a dwelling
+  # is never modelled as empty -- and the zone density is the resulting head
+  # count over the residential floor area, so gains and DHW agree exactly.
+  #
+  # EVERY scenario houses the same people, the normative `cte` one included: how
+  # many live in a dwelling is a property of its neighbourhood, not of the
+  # occupant archetype simulated in it. Giving cte the ppl_per_m2 default instead
+  # put 3.5 people per dwelling against the census's 1, so its results differed
+  # from the behaviour scenarios for two reasons at once. ppl_per_m2 below is now
+  # only the FALLBACK, for a building whose tract has no census population.
+  residential_occupancy_from_census: true
+
+  # How that census occupancy is spread over the dwellings. Two estimators, each
+  # wrong on its own:
+  #   per DWELLING (population / tract dwellings) gives every home the average
+  #     household whatever its size -- a studio and a 200 m2 flat house the same;
+  #   per AREA (population / tract residential area, x this dwelling's area)
+  #     scales with size but takes it too literally -- the 200 m2 flat gets five
+  #     people and the studio less than one.
+  # Household size grows with dwelling size, but far more slowly than floor area,
+  # so the two are blended. area_weight 0 is purely per-dwelling, 1 purely per-m2.
+  occupancy_area_weight: 0.5
+
+
+# --- Season classification (for the KPIs and the HVAC in-between gate) ------ #
+# Seasons are derived from the WEATHER, not the calendar: each day is classified
+# by its mean outdoor temperature, smoothed over a centred window so the season
+# follows the trend rather than the weather. A day inside the band is IN-BETWEEN
+# (the occupant scenarios run no HVAC then; the normative CTE case ignores this
+# entirely and follows its own calendar -- see residential_cte.seasons).
+seasons:
+  smoothing_days: 7            # centred window; a week is short enough to track a
+                               # real change of season and long enough that a warm
+                               # spell in March does not become "cooling"
+  in_between_low_c: 16.0       # below this daily mean -> heating
+  in_between_high_c: 24.0      # above -> cooling
+
+# --- Mechanical ventilation of the NON-RESIDENTIAL uses --------------------- #
+# Offices and commercial premises are mechanically ventilated -- RITE (RD
+# 1027/2007, IT 1.1.4.2.3) requires it and sets the rate by air-quality category.
+# Dwellings are not included: their air renewal is infiltration plus the windows
+# the occupant opens, which the behaviour model already carries.
+#
+# It runs on the zone's OCCUPANCY schedule, not on HVAC availability: a shop's
+# ventilation works whenever the shop is open, including the mild shoulder season
+# when the heating and cooling are off. Without it the ground-floor premises of
+# the reference building reached 1962 ppm of CO2 in the in-between season, with
+# every occupied hour above 1000 ppm -- an artefact of modelling a full shop with
+# nothing but 0.5 ren/h of leakage.
+nonresidential_ventilation:
+  enabled: true
+  # Litres per second and person, by RITE air-quality category:
+  #   IDA 2 (offices, museums, classrooms)       12.5 l/s.person
+  #   IDA 3 (commercial, restaurants, gyms)       8.0 l/s.person
+  #   IDA 4 (everything of lower requirement)     5.0 l/s.person
+  litres_per_second_person:
+    office: 12.5
+    commercial: 8.0
+    other: 8.0
+
+# --- HS3 continuous ventilation of the DWELLINGS --------------------------- #
+# CTE DB-HS3 ("Calidad del aire interior") requires a dwelling to be ventilated
+# CONTINUOUSLY -- admission in the dry rooms, extraction in the wet ones -- and it
+# has been mandatory since the CTE came into force (RD 314/2006, obligatory from
+# 29-09-2006). Before it, a Spanish dwelling had no ventilation system at all and
+# renewed itself by leakage alone, which is what `windows.infiltration` models.
+#
+# It applies to EVERY occupant scenario, the normative `cte` one included: a
+# ventilation system is a property of the BUILDING, not of the person living in
+# it. Without this the normative case -- the only one the law actually describes
+# -- came out the WORST ventilated of the set, because its only air renewal
+# outside the CTE summer-night airing was infiltration.
+#
+# Flow per dwelling = max(admission, extraction) of DB-HS3 Tabla 2.1:
+#   admission  = occupants x l_s_per_occupant
+#                (5 l/s.occupant in the dormitorios + 3 l/s.occupant in the salas
+#                 y comedores, whose occupancy Tabla 2.2 sets equal to the
+#                 dormitorios' -> 8 l/s per person of the dwelling);
+#   extraction = floor area x l_s_per_m2
+#                (15 l/s per bano/aseo + 2 l/s.m2 of cocina; for the typical
+#                 90 m2 Spanish dwelling -- two wet rooms and a 10 m2 kitchen --
+#                 that is ~50 l/s, i.e. ~0.55 l/s per m2 of dwelling).
+# The two are the two sides of the same airflow, so the system is sized on the
+# larger, which is what HS3 itself says. On a typical dwelling this lands near
+# the 0.6 ren/h the rule of thumb gives for an HS3 system.
+#
+# Occupants are the head count the model already houses (the census-tract density,
+# see loads.residential_occupancy_from_census) -- one occupancy everywhere.
+hs3_ventilation:
+  enabled: true
+  from_year: 2007              # first construction year that must comply
+  l_s_per_occupant: 8.0        # admission, DB-HS3 Tabla 2.1 (5 dormitorios + 3 salas)
+  l_s_per_m2: 0.55             # extraction (banos + cocina) spread over the dwelling
+  min_ach: 0.0                 # floor on the delivered rate (0 = no floor)
+  max_ach: 1.5                 # sanity cap; a dwelling system does not exceed this
+
+# --- Extended thermal comfort zone (Mollier h-x comfort field) ------------- #
+# Thermal comfort is a REGION in (temperature, humidity), not an interval on a
+# thermometer: 26 C at 8 g/kg and 26 C at 16 g/kg are different rooms to be in.
+# This is the classic comfort field ("Behaglichkeitsfeld") of the Mollier h-x
+# diagram, as EN ISO 7730 / DIN 1946-2 / ASHRAE 55 draw it -- see
+# https://www.andivi.com/comfort-zone-indoor-en-iso773-din-1960-ashrae-standard-55/
+#
+# The field is a POLYGON, not a rectangle: each bound below binds over a different
+# stretch of the temperature range, and which one binds is what gives it its
+# shape. With the defaults, the relative-humidity ceiling governs the cool end,
+# the enthalpy line takes over at about 22.3 C, and the absolute-humidity cap
+# never binds at all -- so editing one number reshapes the field rather than
+# breaking a hard-coded vertex list. Set any bound to null to drop it.
+#
+# This is reported ALONGSIDE the EN 16798-1 adaptive band, not instead of it. They
+# answer different questions -- "was the state inside the comfort field" against
+# "was the temperature acceptable for THIS climate" -- and a dwelling can pass one
+# and fail the other, which is itself the finding.
+comfort_zone:
+  enabled: true
+  t_min_c: 20.0                # operative temperature, lower bound
+  t_max_c: 26.0                # ...and upper
+  rh_min: 30                   # % relative humidity, lower bound
+  rh_max: 65                   # ...and upper
+  humidity_ratio_max_g_kg: 11.5   # absolute-humidity cap (DIN 1946-2)
+  humidity_ratio_min_g_kg: null
+  enthalpy_min_kj_kg: 30.0     # Mollier h lines bounding the field
+  enthalpy_max_kj_kg: 50.0
+
+  # Drive the HVAC to the field, not only measure against it. Without this the
+  # AWARE/PASSIVE thermostat tracks the EN 16798-1 adaptive band alone, which in a
+  # Lleida summer lets the cooling setpoint drift past 30 C -- so the dwelling was
+  # reported comfortable by the criterion that was steering it and far outside the
+  # comfort field, on the same hours.
+  #
+  # The adaptive tracking is KEPT and simply confined: the setpoint follows the
+  # running-mean outdoor temperature WITHIN the field, and stops at its edge. The
+  # occupant still adapts to the climate; it just no longer adapts out of comfort.
+  # Applies to the behaviours that use the adaptive thermostat (aware, passive).
+  # The normative 'cte' user is never touched -- its setpoints are the standard's.
+  setpoints:
+    enabled: true
+    margin_c: 0.5              # pull the band this far inside the field's edges,
+                               # since the thermostat holds AIR temperature while
+                               # the comfort criterion is on OPERATIVE temperature
+    min_deadband_c: 1.0        # smallest gap kept between the heating and cooling
+                               # setpoints. Confining BOTH ends of a band that used
+                               # to be 4 K wide can close it, and EnergyPlus treats
+                               # an inverted thermostat as a FATAL error
+    # The income-driven offset (see income_setpoints) is applied AFTER this, so an
+    # energy-poor household still underheats -- confining the comfort TARGET must
+    # not quietly erase a modelled behaviour.
+    #
+    # Humidity control. The field bounds humidity as well as temperature, but a
+    # Spanish dwelling has no humidifier: "dehumidification" drives only the upper
+    # bound (which an AC coil does anyway) and leaves the 30 % floor reported but
+    # unconditioned; "full" adds humidification, "none" leaves humidity free.
+    humidity_control: dehumidification   # none | dehumidification | full
+    # WHICH upper bound the humidistat holds. A humidistat can only hold a
+    # relative humidity, but the field's ceiling is the tightest of the RH,
+    # absolute-humidity and enthalpy bounds -- and above ~22.3 C that is the
+    # ENTHALPY line. Held at the bare rh_max of 65 % the dwelling sits outside the
+    # very zone these setpoints exist to deliver; "field" instead holds the
+    # field's EFFECTIVE ceiling at the cooling setpoint, ~47 % RH at 25.5 C.
+    humidity_setpoint: field             # field | rh_max
+
+# --- Indoor CO2 (air renewal) ---------------------------------------------- #
+# Switches on the EnergyPlus contaminant balance so every zone reports
+# `Zone Air CO2 Concentration` in ppm. This is the indicator of how RENEWED the
+# air is: occupants raise it, infiltration and open windows flush it, so it reads
+# the census occupancy and the occupant's ventilation behaviour at once -- an
+# air-quality counterpart to the thermal comfort KPIs.
+co2:
+  enabled: true
+  outdoor_ppm: 420             # ambient background the zones decay towards
+  # m3 of CO2 per second per WATT of metabolic rate (EnergyPlus default 3.82e-8).
+  # Multiplied by the activity level, so the sleeping rate above automatically
+  # produces less CO2 than a waking hour.
+  generation_rate_m3_s_w: 0.0000000382
+  # Reporting thresholds (ppm) for the "hours above" KPIs. 1000 is the usual
+  # comfort/ventilation-adequacy limit; 1400 is IDA 3 / clearly under-ventilated.
+  thresholds: [1000, 1400]
+
+# --- Ideal-loads HVAC power limits + scenario setpoints -------------------- #
+# The ideal-loads systems are NOT infinite plants: heating/cooling capacity is
+# CAPPED (LimitCapacity) at these specific powers, sized from each conditioned
+# zone's floor area. Setpoints used by the occupant-behaviour scenarios:
+# UNAWARE holds a fixed band; AWARE tracks the EN 16798-1 adaptive band while
+# occupied and sets BACK to these temperatures whenever the dwelling is empty.
+hvac:
+  max_heating_w_per_m2: 250
+  max_cooling_w_per_m2: 120
+  # RESIDENTIAL thermostats, one per occupant archetype. This is the ONLY place
+  # residential setpoints live: 'aware' and 'passive' track the EN 16798-1 adaptive
+  # band (confined to the comfort field, see comfort_zone.setpoints) and fall back
+  # to aware_setback when the dwelling is empty; 'unaware' and 'always_on' hold a
+  # fixed band around the clock; 'cte' is the normative user (residential_cte).
+  unaware:       {heating: 21, cooling: 25}
+  always_on:     {heating: 21, cooling: 24}   # archetype not in the default scenarios
+  aware_setback: {heating: 16, cooling: 30}
+  # Non-residential (office / commercial / tertiary) buildings have a SINGLE
+  # normative user following the RITE / RD 486-2022 restriction for tertiary
+  # buildings: heating ≤ 19 °C, cooling ≥ 27 °C while occupied, setting BACK to
+  # these temperatures when empty (no aware/unaware split — that is residential).
+  nonresidential:         {heating: 19, cooling: 27}
+  nonresidential_setback: {heating: 16, cooling: 30}
+  # RITE IT 1.1.4.2.3 minimum outdoor-air ventilation (IDA air-quality categories),
+  # per person (l/s): offices / tertiary = IDA 2 (12.5 l/s), commercial / public-
+  # concurrence = IDA 3 (8 l/s). Supplied mechanically by the HVAC while occupied.
+  nonresidential_ventilation_ls_per_person: {office: 12.5, commercial: 8.0}
 
 # --- Schedules: internal-gains usage + temperature setpoints, per use ------ #
 # Each profile is a list of [until "HH:MM", value] steps applied For: AllDays,
@@ -135,100 +475,394 @@ schedules:
     residential:
       heating: [["07:00", 17], ["23:00", 20], ["24:00", 17]]
       cooling: [["07:00", 27], ["23:00", 25], ["24:00", 27]]
+    # Non-residential (tertiary) setpoints follow the RITE / RD 486-2022
+    # restriction: heating 19 °C, cooling 27 °C while occupied; setback 16/30 when
+    # empty. Occupied bands match the use's occupancy hours (office 08–20 weekdays,
+    # commercial 07–22 Mon–Sat).
     office:
-      heating: [["08:00", 16], ["18:00", 21], ["24:00", 16]]
-      cooling: [["08:00", 28], ["18:00", 24], ["24:00", 28]]
+      heating: [["08:00", 16], ["20:00", 19], ["24:00", 16]]
+      cooling: [["08:00", 30], ["20:00", 27], ["24:00", 30]]
     commercial:
-      heating: [["09:00", 16], ["21:00", 21], ["24:00", 16]]
-      cooling: [["09:00", 28], ["21:00", 24], ["24:00", 28]]
+      heating: [["07:00", 16], ["22:00", 19], ["24:00", 16]]
+      cooling: [["07:00", 30], ["22:00", 27], ["24:00", 30]]
+
+# --- CTE residential user profile (Spanish standards) ---------------------- #
+# A third residential occupant profile ("cte"), alongside aware/unaware, following
+# the CTE DB-HE "perfiles de uso" + UNE-EN 16798, per the RETABIT reference
+# (Mont Lecocq et al., Energy & Buildings 328 (2025) 115215, Table 25):
+#  · setpoints: 21 °C heating / 26 °C cooling, CONSTANT (no setback);
+#  · internal gains: CTE 24-h fixed profiles — lighting/appliances peak 4.40 W/m²
+#    (hourly 0.44 / 1.32 / 2.20 / 4.40 = 4.40 × 0.1/0.3/0.5/1.0), occupancy sensible
+#    peak 2.15 W/m² (× 1.0/0.25/0.5);
+#  · natural ventilation: FIXED 4 ren/h on summer nights 01:00–08:00;
+#  · shadow control: movable shades opaque fraction 0.6 (transmittance 0.4) when the
+#    façade radiation exceeds 140 W/m² (approximated here as daytime deployment).
+residential_cte:
+  # CTE DB-HE Apendice D splits the year by CALENDAR DATE, with no gap: every hour
+  # of the year is either heating-enabled or cooling-enabled. The standard has no
+  # "in-between season" -- that is a real-behaviour idea (people stop touching the
+  # HVAC in mild weather), so it applies to the occupant scenarios and NOT here.
+  # The normative case therefore has its HVAC available all year, with the service
+  # that is out of season made unreachable by its setpoint rather than switched
+  # off by an availability schedule.
+  seasons:
+    heating_months: [1, 2, 3, 4, 5, 10, 11, 12]
+    cooling_months: [6, 7, 8, 9]
+  setpoints:
+    # >>> CHECK THESE AGAINST THE CURRENT Apendice D BEFORE PUBLISHING RESULTS <<<
+    # The structure is what the standard prescribes -- calendar seasons, a heating
+    # night setback, a tighter cooling consigna in the occupied evening -- and the
+    # numbers below are the widely-cited 2019 residential profile. They live here
+    # so a correction is a one-line edit rather than a code change.
+    heating: {night: 17, day: 20, day_from: 7}      # 17 C 00-07 h, 20 C 07-24 h
+    cooling: {day: 27, evening: 25, evening_from: 16}  # 27 C 00-16 h, 25 C 16-24 h
+    # Out of its own season a service must never run. Setpoints far enough away
+    # that the thermostat cannot call for them (E+ has no "disable" on a
+    # HVACTemplate thermostat).
+    off_heating: -50
+    off_cooling: 100
+  lighting_w_m2:           4.4
+  appliances_w_m2:         4.4
+  night_ventilation_ach:   4.0
+  night_ventilation_hours: [1, 8]
+  shade_transmittance:     0.4
+  shade_radiation_threshold_w_m2: 140
+
+# --- Income-driven residential setpoint variability ------------------------ #
+# The paper's headline sensitivity finding (Mont Lecocq et al., Energy & Buildings
+# 328 (2025) 115215, Section 5 / Fig. 14): the heating setpoint drives ±15-24 % of
+# demand (20->22 °C = +21 %) and CORRELATES WITH HOUSEHOLD DISPOSABLE INCOME. Lower
+# income -> lower heating setpoint (energy-poverty underheating) and higher cooling
+# setpoint (AC underuse). The offset is a linear ramp between income_floor (max
+# offset) and reference_income (no offset), applied ONLY to the real-behaviour
+# residential profiles in ``apply_to`` — the normative 'cte' user keeps its standard
+# setpoints. Income comes from the social_ES layer (so__*income* columns); when
+# absent, ``residential_behavior.default_income`` is used. No-op when disabled.
+income_setpoints:
+  enabled: true
+  reference_income: 30000     # €/yr at/above which no offset is applied
+  income_floor: 12000         # €/yr at/below which the max offset applies
+  heating_offset_max: -2.0    # °C added to the heating setpoint at/below income_floor
+  cooling_offset_max: 2.0     # °C added to the cooling setpoint at/below income_floor
+  apply_to: [unaware, aware]  # profiles the offset shifts ('cte' stays normative)
+
+# --- Domestic hot water (DHW) end-use -------------------------------------- #
+# CTE DB-HE HE4 grounded (Table 25 lists DHW as an activity input). Annual DHW
+# thermal demand = occupants × litres_per_person_day × ρ·Cp·(reference_temp −
+# inlet_temp_month), reported as a per-building ``dhw_demand_kwh_m2`` KPI (aseasonal,
+# season="annual"). Occupant count per household (Housing-use building space) is
+# derived from the census-tract population distributed over residential non-communal
+# floor area (see energy.py ``_census_tract_person_rate`` / ``_dwelling_occupants``),
+# floored at 1 person. The normative 'cte' scenario — and the fallback when the
+# census/population data is unavailable — use the CTE default occupancy density
+# (``loads.residential.ppl_per_m2``). No-op when disabled.
+residential_dhw:
+  enabled: true
+  litres_per_person_day: 28   # CTE DB-HE HE4 reference demand (vivienda), at service temp
+  reference_temp: 60          # °C service (accumulation) temperature
+  inlet_temp_monthly: [8, 9, 11, 13, 14, 15, 16, 15, 14, 13, 11, 8]  # CTE cold-water inlet, °C
 
 # --- Residential occupant behaviour (stochastic user archetypes) ----------- #
-# Each RESIDENTIAL dwelling gets an occupant BEHAVIOUR archetype and an
-# OCCUPANCY PERIOD. They are assigned per-dwelling — random but deterministic
-# (seeded by the dwelling reference), OR fixed for all dwellings via
-# build_energy_model(residential_behavior=, residential_period=). The random
-# draw is weighted by section demographics (average household size + population
-# age, from the sociodemographic layer social_ES/INE, columns br__average_
-# household_size / br__population_mean_age / br__population_share_over_64). When
-# those are missing, household size is estimated from the dwelling area and the
-# 'default' bucket weights are used.
+# Each RESIDENTIAL dwelling gets an occupant BEHAVIOUR archetype, assigned
+# per-dwelling — random but deterministic (seeded by the dwelling reference), OR
+# fixed for all dwellings via build_energy_model(residential_behavior=). The random
+# draw is weighted by the section's mean age (from the sociodemographic layer
+# social_ES/INE, column br__population_mean_age); when it is missing the 'default'
+# bucket weights are used.
+#
+# The archetype is the ONLY thing assigned per dwelling. Everything that follows
+# from it -- occupancy, setpoints, HVAC availability, ventilation -- is authored by
+# ONE engine (energy._wire_occupant_model), used both by build_energy_model and by
+# every scenario, so the .idf that is written, plotted and simulated all carry the
+# same wiring.
 residential_behavior:
   enabled: true
-  m2_per_person: 35              # fallback people/home = dwelling area / this
 
-  # Occupant archetypes. Setpoints may be a single °C constant (applied all day)
-  # or {occupied, away} following the occupancy period. hvac_availability:
-  #   always     → HVAC available 24 h
-  #   occupancy  → HVAC available only when the dwelling is occupied
-  # ventilation_ach = natural-ventilation air changes/h when the window is open
-  # (0 = never ventilates); ventilation_schedule names the opening profile below.
+  # The occupant archetypes, and where each one is wired. There is nothing to tune
+  # HERE: an archetype is a set of BRANCHES in the occupant engine, and the numbers
+  # those branches read live in the blocks named below.
+  #
+  # This block used to carry per-archetype `heating`/`cooling`/`hvac_availability`/
+  # `ventilation_ach`/`ventilation_schedule`. They were a second, parallel
+  # behaviour model: build_energy_model wrote thermostats and ZoneVentilation
+  # objects from them, and the scenario engine then deleted or overwrote every one
+  # before a single KPI was computed. Editing them changed nothing. They are gone.
   behaviors:
-    unaware:      # highly stochastic, never ventilate, wasteful tight band
-      heating: 22
-      cooling: 23
-      hvac_availability: always
-      ventilation_ach: 0.0
-    aware:        # condition only when home; ventilate midday in winter
-      heating: {occupied: 21, away: 17}
-      cooling: {occupied: 25, away: 30}
-      hvac_availability: occupancy
-      ventilation_ach: 2.0
-      ventilation_schedule: winter_midday
-    always_on:    # HVAC always working, no ventilation
-      heating: 21
-      cooling: 24
-      hvac_availability: always
-      ventilation_ach: 0.0
-    passive:      # HVAC only when strictly needed; maximise natural ventilation
-      heating: {occupied: 17, away: 15}
-      cooling: {occupied: 28, away: 32}
-      hvac_availability: occupancy
-      ventilation_ach: 4.0
-      ventilation_schedule: whenever_mild
+    unaware:
+      description: >-
+        Leaves the HVAC on through every waking hour, at home or not. Fixed band
+        (hvac.unaware). Airs the dwelling briefly and at random
+        (unaware_day_ventilation) and sleeps with the windows open on a share of
+        the nights (unaware_night_ventilation). Never operates awnings or
+        persianas. Scenarios: unaware, unaware_ff, half of random_mix.
+    aware:
+      description: >-
+        Conditions only while someone is home, to the EN 16798-1 ADAPTIVE band
+        (hvac.aware_setback for the empty hours), and turns the HVAC OFF whenever
+        the windows are open. Airs daily (hygiene_ventilation), takes the mild
+        midday airing (midday_ventilation) and purges the summer night
+        (night_purge). Operates awnings and persianas. Scenarios: aware, aware_ff,
+        half of random_mix.
+    passive:
+      description: >-
+        The aware occupant with the widest tolerance -- same adaptive thermostat,
+        same airings, same shading operation. NOT in the default scenario set;
+        reachable via build_energy_model(residential_behavior="passive") or a
+        custom scenarios= dict.
+    always_on:
+      description: >-
+        HVAC available 24 h at a fixed band (hvac.always_on), no deliberate
+        ventilation, no shading operation. NOT in the default scenario set;
+        reachable the same two ways as 'passive'.
+  # NOTE the normative 'cte' user is NOT listed here: it is not a behaviour
+  # archetype but the Spanish standard's fixed user, configured under
+  # `residential_cte` and selected by the 'cte' scenario.
+  #
+  # OCCUPANCY is not per-archetype and not per-dwelling. It comes from the census
+  # tract's INE Time Use Survey agenda (time_use_occupancy) when the survey reaches
+  # the tract, and from one stylised residential profile otherwise. The old
+  # per-dwelling `occupancy_periods` (nights_workdays / days / all_day /
+  # weekends_away, drawn by household size) is gone: the occupant engine never read
+  # it, so it moved no KPI.
 
-  # Occupancy fraction (0..1) profiles → internal gains + the occupied/away
-  # setpoint band + the 'occupancy' HVAC availability. weekdays/weekends split.
-  occupancy_periods:
-    nights_workdays:      # away during working hours, home nights + weekends
-      weekdays: [["07:00", 1.0], ["09:00", 0.35], ["18:00", 0.2], ["23:00", 1.0], ["24:00", 1.0]]
-      weekends: [["09:00", 1.0], ["24:00", 0.85]]
-    days:                 # home during the day (retired / homemaker)
-      weekdays: [["24:00", 0.7]]
-      weekends: [["24:00", 0.8]]
-    all_day:              # home almost all the time
-      weekdays: [["24:00", 0.9]]
-      weekends: [["24:00", 0.9]]
-    weekends_away:        # away on weekends
-      weekdays: [["07:00", 1.0], ["09:00", 0.4], ["18:00", 0.2], ["24:00", 1.0]]
-      weekends: [["10:00", 0.5], ["18:00", 0.1], ["24:00", 0.6]]
+  # Measured occupancy agenda from the INE Time Use Survey (EET 2009-2010), read
+  # through social_ES (TimeUseSurvey -> WeeklyScheduleHouseholdOccupancy) by
+  # hypercadaster_ES.social.time_use_household_occupancy. It gives the dominant
+  # household occupancy STATE at each of the 168 hours of the week, for the
+  # building's census tract -- matched by autonomous community and by the tract's
+  # household income band (so__household_income_group_*). When it is available it
+  # replaces the stylised residential occupancy profile in the SCENARIO runs, for
+  # the behaviours listed in apply_to; otherwise the stylised profile is kept.
+  time_use_occupancy:
+    enabled: true
+    apply_to: [aware, unaware]
+    # Share of the household PRESENT in each state -- EnergyPlus multiplies the
+    # people COUNT by this, so it answers "how many are home", not "how hard are
+    # they working". A sleeping household is fully home: Sleeping is 1.0, and the
+    # lower metabolism of a sleeping body is carried by the activity level
+    # (loads.residential_activity_sleeping), which also drops the CO2 generation.
+    # Setting it below 1 here as well would discount the same hours twice, and the
+    # night is exactly when CO2 and occupant gains matter most.
+    state_fractions: {Sleeping: 1.0, WithActivity: 1.0, NonOccupied: 0.0}
+    # Lights and appliances need their OWN fractions: they follow what the
+    # household is DOING, not how many of them are home. A sleeping dwelling is
+    # fully occupied and almost fully dark -- driving the lights off the presence
+    # fraction above put them at full power all night. An empty one still runs its
+    # fridge and standby loads, which is why NonOccupied is not zero here.
+    state_gain_fractions: {Sleeping: 0.10, WithActivity: 1.0, NonOccupied: 0.15}
+    # AWARE conditions the dwelling only while someone is in it.
+    present_states: [Sleeping, WithActivity]
+    # UNAWARE leaves the HVAC on through every waking hour, at home or not --
+    # that difference in *availability* is what the archetype is, so it stays
+    # even when both read their occupancy from the same survey agenda.
+    awake_states: [WithActivity, NonOccupied]
 
-  # Natural-ventilation opening profiles (fraction of ventilation_ach applied).
-  ventilation_schedules:
-    winter_midday: [["10:00", 0.0], ["14:00", 1.0], ["24:00", 0.0]]
-    whenever_mild: [["08:00", 0.0], ["22:00", 1.0], ["24:00", 0.0]]
+  # Daily hygiene airing ("ventilar") for the AWARE and PASSIVE occupants. This is
+  # an AIR-QUALITY habit, not a thermal strategy: a Spanish household opens the
+  # windows every day whatever the weather, so it is NOT gated on outdoor
+  # temperature or on the season the way the free-cooling airings are.
+  #
+  # It has to be sized to actually do something. At 15 minutes of 3 ren/h it came
+  # to 0.75 ren·h/day, LESS outdoor air than the unaware occupant's three random
+  # bursts (3 ren·h/day) -- so the careful user ended up with the worse air, and
+  # the CO2 KPIs said so.
+  # EVERY window opening below -- the aware hygiene/midday/night-purge airings and
+  # the unaware daytime and night ones alike -- is GATED ON OCCUPANCY: it happens
+  # only in the hours somebody is home to open a window. Ungated they ran on the
+  # clock alone, so an 08:30 airing (or a random burst at 11:00) happened just the
+  # same on a weekday when the flat was empty from nine to two, ventilating -- and
+  # in winter cooling -- nobody. The mask is the census tract's Time Use Survey
+  # week when it drives the dwelling, the stylised presence profile otherwise.
+  #
+  # Air change while the windows of a dwelling are OPEN. One rate for every
+  # airing — hygiene, the free-cooling midday airing, the summer night purge and
+  # the unaware occupant's random bursts all mean "the windows are open", and an
+  # open dwelling renews at about this rate whatever the reason it was opened.
+  # What distinguishes the behaviours is WHEN and FOR HOW LONG, not how wide.
+  opening_ach: 4.0
 
-  # Assignment: weighted random draw of behaviour + period, per demographic
-  # bucket. Behaviour weights by an AGE bucket (section mean age); period weights
-  # by a HOUSEHOLD-SIZE bucket (avg people/home). Weights are normalised.
+  # Per SEASON, because when you air is the whole question:
+  #   periods          the in-between season -- morning and evening, 30 min each
+  #   heating_periods  ONE 15-minute airing in the middle of the day. Opening at
+  #                    08:30 and again at 20:30 in January hits the two coldest
+  #                    hours the household is awake for; 13:00-14:00 is the warmest
+  #                    hour of a winter day and the one a household actually picks.
+  #   cooling_periods  the evening airing is dropped -- the night purge already
+  #                    opens the dwelling from midnight, and a 20:00 opening on a
+  #                    hot evening brings in air warmer than the room.
+  # The heating airing is a BAND plus a duration, not a fixed clock time. Since
+  # every opening is gated on occupancy (see above), an airing pinned to 13:00
+  # sharp would simply never fire on a weekday whose profile has the household out
+  # until two; given a band, it is placed at the first quarter-hour of the band
+  # that dwelling is actually in.
+  #
+  # NOTE the default band and the STYLISED presence profile do not overlap on
+  # weekdays (that profile has the household out 09:00-14:00), so with it the
+  # winter hygiene airing happens at weekends only. Where the INE Time Use Survey
+  # reaches the census tract its measured week decides instead. Widen the band to
+  # ["13:00", "16:00"] if you want it to land in the Spanish comida hours on
+  # weekdays too. ``heating_periods`` overrides band+duration with explicit
+  # windows, airing at a fixed time whatever the occupancy mask says.
+  hygiene_ventilation:
+    periods:         [["08:00", "08:30"], ["20:00", "20:30"]]
+    heating_window:  ["13:00", "14:00"]
+    heating_duration_minutes: 15
+    cooling_periods: [["08:00", "08:30"]]
+
+  # Midday airing for the AWARE/PASSIVE occupant, on top of the hygiene one. In
+  # the cooling season it is free cooling; in the heating and in-between seasons
+  # it is the mid-day "abrir un rato" -- shorter, and only when the outdoor air is
+  # not punishing. The heating gate used to be 20 C, which in a Lleida January
+  # never fires, so the aware occupant had no midday airing at all in winter.
+  #
+  # 14:00-14:15 rather than the old 14:00-14:20: with simulation.timestep_per_hour
+  # 4 the schedule lives on a 15-minute grid, so EnergyPlus rounded the 20 minutes
+  # anyway and the config was claiming a duration that was never simulated.
+  midday_ventilation:
+    periods: [["14:00", "14:15"]]
+    min_outdoor_c: 12.0
+
+  # Summer NIGHT PURGE of the AWARE/PASSIVE occupant. Deliberately UNGATED on the
+  # indoor temperature: the window is opened at bedtime and stays open until the
+  # morning, because the household is ASLEEP and cannot reopen or reclose it when
+  # the room crosses a threshold at 04:00.
+  #
+  # It used to carry min_indoor 22 C + delta 1 K, which made the opening a
+  # THERMOSTAT rather than a habit -- and, since a free-floating dwelling drifts
+  # warmer than a conditioned one, it made 'aware' and 'aware_ff' open their
+  # windows for different numbers of hours. Those two scenarios must differ ONLY
+  # by the HVAC being off, so the gates are gone: what the occupant decides is
+  # WHETHER to open before going to bed, not hour by hour through the night.
+  night_purge:
+    periods: [["00:00", "08:00"]]
+
+  # NIGHT SETBACK of the AWARE/PASSIVE occupant, on the HEATING setpoint.
+  #
+  # The adaptive thermostat sets back when the dwelling is EMPTY, which never
+  # happens at night: the household is at its fullest at 03:00, so the dwelling
+  # read as occupied and held the full comfort setpoint until morning. Nobody
+  # does that -- a Spanish household turns the heating down and puts a blanket
+  # on -- and holding 21 C through eight sleeping hours is a large share of the
+  # winter demand, spent on hours nobody is awake to feel.
+  #
+  # Applied to the HEATING schedule only. In the cooling season this occupant is
+  # already purging the night with the windows open and the HVAC off (see
+  # night_purge), so a cooling setback there would gate hours that are not
+  # conditioned anyway. The value it falls back to is hvac.aware_setback.heating.
+  aware_night_setback:
+    enabled: true
+    hours: ["23:00", "07:00"]          # wraps midnight
+
+  # PRECONDITIONING of the AWARE/PASSIVE dwelling. The system starts this long
+  # BEFORE the household is home (and before it wakes), so it is already working
+  # when they walk in rather than starting from a setback dwelling at the moment
+  # somebody arrives -- which is what a thermostat with a schedule on it actually
+  # does, and without it the occupant's first hour home was always spent
+  # recovering. Applies to heating and cooling alike, and to every comfort period
+  # of the day: with the defaults the weekday heating starts at 06:00 (home 07:00),
+  # 13:00 (home 14:00) and 18:00 (home 19:00).
+  aware_preconditioning:
+    enabled: true
+    lead_minutes: 60
+
+  # The UNAWARE occupant's FORGOTTEN nights. This occupant leaves the HVAC on
+  # through every waking hour and it goes off overnight -- but not always: on this
+  # share of the nights it simply keeps running at the setpoint, because nobody
+  # remembered to turn it off before going to bed. Forgetting is the archetype's
+  # defining failure, and modelling it as never-happens made the careless dwelling
+  # look better overnight than the careful one.
+  #
+  # Drawn per DWELLING as whole nights of the week, like the window opening below,
+  # but on an independent random stream: the same occupant may well leave both the
+  # heating on AND a window open on the same night. They do not coordinate; that
+  # is the archetype.
+  unaware_night_hvac:
+    nights_fraction: 0.25
+
+  # DAYTIME airing of the UNAWARE occupant -- 'unaware', 'unaware_ff' and the
+  # unaware share of 'random_mix'. This occupant runs no ventilation STRATEGY, but
+  # still opens the windows: short, discrete airings, not a window left ajar
+  # through the day. Both numbers are drawn per DWELLING, seeded by the zone name.
+  #
+  # It used to be hard-coded at exactly three openings of exactly 15 minutes, so
+  # every unaware dwelling in Spain aired for the same 45 minutes a day and only
+  # the hours differed.
+  unaware_day_ventilation:
+    openings_per_day: [1, 3]           # inclusive; how many times a day
+    duration_minutes: [15, 30]         # inclusive; how long each one lasts
+    # The band the openings may fall in. They start on the hour and are drawn
+    # without repetition, so at most one airing per hour. Narrow this to
+    # concentrate them (e.g. ["08:00", "12:00"] for a morning-only household).
+    # Within the band the start hours are drawn from the hours somebody is HOME
+    # (see the occupancy note below), so the count survives the gate.
+    hours: ["08:00", "22:00"]
+    # Share of those airings kept through the HEATING season. A cold day is a day
+    # you open the window less: this occupant is careless, not immune to the
+    # weather. 0.5 halves them; 1.0 airs the same in January as in May.
+    heating_factor: 0.5
+  # NOTE: durations are snapped to the simulation timestep (simulation.
+  # timestep_per_hour: 4 -> a 15-minute grid). EnergyPlus rounds a Schedule:Compact
+  # "Until:" that falls between two timesteps, so a 20-minute airing would silently
+  # become 15 or 30 anyway; snapping makes the config say what will be simulated.
+
+  # NIGHT window opening of the UNAWARE occupant -- the 'unaware' and 'unaware_ff'
+  # scenarios, and the unaware share of 'random_mix'. This occupant runs no
+  # strategy, but does sleep with the windows open some of the time, and until now
+  # was modelled as fully sealed from dusk to dawn: three 15-minute daytime bursts
+  # and nothing else, which put its night-time CO2 above every other archetype's
+  # for reasons that were an artefact of the model rather than of the behaviour.
+  #
+  # ``nights_fraction`` is the share of nights of the season on which the windows
+  # are left open (0 = never, 1 = every night). It is drawn per DWELLING, seeded
+  # by the zone name, and lands on whole nights of the week: a dwelling gets
+  # round(fraction x 7) nights, randomised so the fraction is exact across the
+  # building rather than in each dwelling. The opening is unattended, like the
+  # aware night purge above -- no temperature gate, the household is asleep.
+  unaware_night_ventilation:
+    nights_fraction: 0.30              # share of nights with the windows open
+    periods: [["00:00", "08:00"]]
+    # Seasons it happens in: the COOLING season only. Sleeping with the windows
+    # open is a hot-night habit -- carelessness is not the same as freezing, and
+    # the in-between season is mild precisely because the night is already cool,
+    # so an unattended 8-hour opening there just dumps heat the dwelling wanted.
+    seasons: [cooling]
+
+  # EnergyPlus computes a ZoneVentilation rate as
+  #     design_ach x schedule x (constant + velocity x wind_speed)
+  # so the bracket decides whether the nominal rate is what actually arrives. It
+  # used to be (0.15 + 0.20 V): an open window nominally at 4 ren/h delivered 0.6
+  # in calm air and only reached its nominal at 4.25 m/s of wind, so the reported
+  # air change never resembled the number configured for it.
+  #
+  # The default below DELIVERS the nominal rate: these `ach` values are open-window
+  # figures already, and a rate you cannot read off the config is worse than one
+  # that ignores the breeze. Set velocity > 0 (with constant reduced to match at
+  # your site's mean wind) to bring the modulation back.
+  ventilation_wind:
+    constant: 1.0
+    velocity: 0.0
+
+  # Assignment: weighted random draw of the ARCHETYPE, per demographic bucket --
+  # weights by an AGE bucket (the section's mean age), normalised.
+  #
+  # This drives build_energy_model() when no `residential_behavior=` is given. The
+  # default SCENARIOS all fix the archetype (and 'random_mix' forces its own
+  # aware/unaware 50-50 split), so it does not reach a scenario KPI; it is what a
+  # single built model, or a custom scenario with "behavior": null, uses.
+  #
+  # The parallel period draw (household_buckets + period_weights, choosing an
+  # occupancy period per dwelling) is gone with `occupancy_periods` -- see the
+  # `behaviors` note above.
   assignment:
     age_buckets:                       # by br__population_mean_age (years)
       young: {max_mean_age: 40}
       mixed: {max_mean_age: 50}
       older: {max_mean_age: 200}
-    household_buckets:                 # by br__average_household_size (people)
-      single: {max_size: 1.5}
-      small:  {max_size: 3.0}
-      family: {max_size: 20.0}
     behavior_weights:
       young:   {aware: 3, passive: 3, unaware: 2, always_on: 2}
       mixed:   {aware: 3, passive: 2, unaware: 2, always_on: 3}
       older:   {aware: 2, passive: 1, unaware: 3, always_on: 4}
       default: {aware: 3, passive: 2, unaware: 2, always_on: 3}
-    period_weights:
-      single:  {nights_workdays: 4, all_day: 2, days: 2, weekends_away: 2}
-      small:   {nights_workdays: 4, all_day: 2, days: 2, weekends_away: 2}
-      family:  {nights_workdays: 3, all_day: 3, days: 3, weekends_away: 2}
-      default: {nights_workdays: 4, all_day: 2, days: 2, weekends_away: 2}
 
 # --- Simulation control + site + outputs ---------------------------------- #
 simulation:
