@@ -19,8 +19,6 @@ import glob
 import numpy as np
 import pandas as pd
 import time
-import gc
-import psutil
 from ._pretty import PrettyDict
 import polars as pl
 import geopandas as gpd
