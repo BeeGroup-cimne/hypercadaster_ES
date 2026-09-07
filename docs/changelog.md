@@ -4,6 +4,37 @@ All notable changes to hypercadaster_ES will be documented in this file. The for
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-09-07
+
+### 🐛 Flattening to building-space resolution no longer scales memory with total spaces
+
+`flat_gdf_to_building_spaces_resolution` materialised one Python dict per
+building space — building-level context included — into a single list before
+building the DataFrame, so peak RAM grew with the *total* number of building
+spaces in the municipality (the Barcelona-scale OOM path). It now counts the
+output rows first and then assembles them in chunks, releasing each chunk's
+intermediates and forcing a garbage collection between chunks. Progress
+(per-space columns, chunk boundaries, total record count) is logged to stderr
+so long merges are no longer silent.
+
+### 🧹 Empty and malformed values in the CAT parser
+
+`parse_CAT_file` now skips blank/whitespace-only lines and lines whose first
+two characters are not a valid numeric record type instead of feeding them to
+the schema splitter, and maps empty strings to nulls when building each
+dataset's DataFrame — a single short or truncated line no longer aborts the
+whole municipality parse.
+
+### 🔧 Robustness
+
+- `join_cadaster_building` slices `year_of_construction` as an explicit string
+  (`astype('string').str[:4]`) and only when the column is present, instead of
+  assuming `.str` access on whatever dtype the file produced.
+- Removed unused top-level `import psutil` / `import gc` from `mergers.py`.
+  `psutil` was never declared in `install_requires`, so a fresh
+  `pip install` aborted at `import hypercadaster_ES` with
+  `ModuleNotFoundError: No module named 'psutil'`.
+
 ## [1.3.0] - 2026-08-07
 
 ### 🧹 One occupant engine (breaking: `residential_behavior` config keys removed)
