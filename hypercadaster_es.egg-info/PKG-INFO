@@ -1,6 +1,6 @@
-Metadata-Version: 2.4
+Metadata-Version: 2.1
 Name: hypercadaster_es
-Version: 1.3.0
+Version: 1.3.1
 Summary: Python library to obtain the Spanish cadaster data joined with external attributes.
 Home-page: https://github.com/BeeGroup-cimne
 Author: Jose Manuel Broto Vispe
@@ -83,19 +83,6 @@ Requires-Dist: ruff>=0.4; extra == "dev"
 Requires-Dist: pytest>=7.0; extra == "dev"
 Requires-Dist: pytest-cov>=4.0; extra == "dev"
 Requires-Dist: pdoc>=14.0; extra == "dev"
-Dynamic: author
-Dynamic: author-email
-Dynamic: classifier
-Dynamic: description
-Dynamic: description-content-type
-Dynamic: home-page
-Dynamic: keywords
-Dynamic: license
-Dynamic: license-file
-Dynamic: provides-extra
-Dynamic: requires-dist
-Dynamic: requires-python
-Dynamic: summary
 
 # hypercadaster_ES
 
