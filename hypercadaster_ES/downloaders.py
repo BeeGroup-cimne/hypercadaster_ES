@@ -2299,6 +2299,13 @@ def parse_CAT_file(cadaster_code, CAT_files_dir, allowed_dataset_types = [14, 15
     """
     # Function to parse a single line into a dictionary for each record type
     def process_line(line, allowed_dataset_types):
+        # Skip empty lines or lines with only whitespace
+        if not line or not line.strip():
+            return None
+
+        if len(line) < 2 or not line[:2].strip().isdigit():
+            return None
+
         parsed_row = {}
 
         line = line.encode('utf-8').decode('utf-8')
@@ -2326,6 +2333,9 @@ def parse_CAT_file(cadaster_code, CAT_files_dir, allowed_dataset_types = [14, 15
 
         # Aggregate rows for each type from parsed rows
         for row_dict in parsed_rows:
+            if row_dict is None:
+                continue
+
             for dataset_type, row in row_dict.items():
                 row_data[dataset_type].append(row)
 
@@ -2333,7 +2343,11 @@ def parse_CAT_file(cadaster_code, CAT_files_dir, allowed_dataset_types = [14, 15
         combined_dfs = {}
         for dataset_type, rows in row_data.items():
             schema = {i[3]: i[4] for i in catstruct[dataset_type]}
-            combined_dfs[dataset_type] = pl.DataFrame(rows, schema=schema, orient="row")
+            cleaned_rows = []
+            for row in rows:
+                cleaned_row = [None if v == "" else v for v in row]
+                cleaned_rows.append(cleaned_row)
+            combined_dfs[dataset_type] = pl.DataFrame(cleaned_rows, schema=schema, orient="row")
 
         return combined_dfs
 

@@ -18,6 +18,9 @@ import os
 import glob
 import numpy as np
 import pandas as pd
+import time
+import gc
+import psutil
 from ._pretty import PrettyDict
 import polars as pl
 import geopandas as gpd
@@ -1095,9 +1098,16 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
             'reference': 'building_reference',
             'beginning': 'year_of_construction'
         })
-        building_gdf_['year_of_construction'] = building_gdf_['year_of_construction'].str[0:4]
-        building_gdf_['year_of_construction'] = pd.to_numeric(
-            building_gdf_['year_of_construction'], errors='coerce').astype('Int64')
+        if 'year_of_construction' in building_gdf_.columns:
+            building_gdf_['year_of_construction'] = (
+                building_gdf_['year_of_construction']
+                .astype('string')
+                .str[:4]
+            )
+
+            building_gdf_['year_of_construction'] = pd.to_numeric(
+                building_gdf_['year_of_construction'], errors='coerce').astype('Int64')
+
         building_gdf_.drop(
             ["localId", "namespace", "officialAreaReference", "value_uom", "horizontalGeometryEstimatedAccuracy",
              "horizontalGeometryEstimatedAccuracy_uom", "horizontalGeometryReference", "referenceGeometry",

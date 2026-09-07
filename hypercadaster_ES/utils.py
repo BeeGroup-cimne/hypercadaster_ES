@@ -3854,7 +3854,7 @@ def _create_full_street_names(gdf):
 
     return gdf_result
 
-def flat_gdf_to_building_spaces_resolution(gdf, building_reference_col="building_reference"):
+def flat_gdf_to_building_spaces_resolution(gdf, building_reference_col="building_reference", chunk_size=50_000):
     """Explode a building-level (Geo)DataFrame to one row per building space.
 
     Each ``br__building_spaces_<name>`` column holds a ``{use_type: [values]}``
@@ -3891,6 +3891,9 @@ def flat_gdf_to_building_spaces_resolution(gdf, building_reference_col="building
     pandas.DataFrame
         One row per building space.
     """
+
+    import gc
+
     prefix = "br__building_spaces_"
     out_prefix = "building_space_"
     excluded_per_space = {"br__building_spaces_by_floor"}
@@ -3901,36 +3904,158 @@ def flat_gdf_to_building_spaces_resolution(gdf, building_reference_col="building
         return (isinstance(v, dict) and len(v) > 0
                 and all(isinstance(x, list) for x in v.values()))
 
+    # Find per-space columns
     candidate_cols = [
         c for c in gdf.columns
         if c.startswith(prefix) and c not in excluded_per_space
     ]
 
-    records = []
-    for _, row in gdf.iterrows():
-        consumed = [c for c in candidate_cols if _is_per_space(row[c])]
-        if not consumed:
-            continue
-        exploded = {out_prefix + c[len(prefix):]: row[c] for c in consumed}
-        # building-level context = everything not exploded as a per-space column
-        context = {c: row[c] for c in gdf.columns if c not in consumed}
-        # All per-space columns share the same {use_type: [...]} shape; use the
-        # first as the reference for the use-type keys and per-use list lengths.
-        ref = exploded[next(iter(exploded))]
-        for use_type, values in ref.items():
-            for i in range(len(values)):
-                rec = dict(context)
-                rec["use_type"] = use_type
-                for name, by_use in exploded.items():
-                    seq = by_use.get(use_type)
-                    rec[name] = seq[i] if isinstance(seq, list) and i < len(seq) else None
-                records.append(rec)
+    per_space_cols = []
 
-    result = pd.DataFrame(records)
-    if not result.empty:
-        lead = [c for c in (building_reference_col, "use_type") if c in result.columns]
-        rest = [c for c in result.columns if c not in lead]
-        result = result[lead + rest]
+    for col in candidate_cols:
+        for value in gdf[col]:
+            if _is_per_space(value):
+                per_space_cols.append(col)
+                break
+
+    if not per_space_cols:
+        sys.stderr.write("[FLAT] No per-space columns found")
+        return pd.DataFrame()
+
+    renamed_space_cols = {
+        c: out_prefix + c[len(prefix):]
+        for c in per_space_cols
+    }
+
+    context_cols = [
+        c for c in gdf.columns
+        if c not in per_space_cols
+    ]
+
+    sys.stderr.write(f"[FLAT] per-space columns: {len(per_space_cols)}")
+
+    sys.stderr.write(f"[FLAT] context columns: {len(context_cols)}")
+
+    sys.stderr.write("[FLAT] Counting building spaces...")
+
+    # Determine how many output rows we need.
+    total_records = 0
+
+    n_buildings = len(gdf)
+
+    for start in range(0, n_buildings, chunk_size):
+        stop = min(start + chunk_size, n_buildings)
+        sys.stderr.write(f"[FLAT] counting buildings {start:,} -> {stop:,}")
+        part = gdf.iloc[start:stop]
+
+        for _, row in part.iterrows():
+            ref = None
+            for col in per_space_cols:
+                value = row[col]
+                if _is_per_space(value):
+                    ref = value
+                    break
+
+            if ref is None:
+                continue
+
+            for values in ref.values():
+                if isinstance(values, list):
+                    total_records += len(values)
+
+        del part
+
+    gc.collect()
+
+    sys.stderr.write(f"[FLAT] Total records: {total_records:,}")
+
+    if total_records == 0:
+        return pd.DataFrame()
+
+    sys.stderr.write("[FLAT] Allocating output columns...")
+
+    output = {}
+
+    for col in context_cols:
+        output[col] = [None] * total_records
+
+    output["use_type"] = [None] * total_records
+
+    for col in per_space_cols:
+        output[renamed_space_cols[col]] = [None] * total_records
+
+    pos = 0
+    # Fill the preallocated columns.
+    for start in range(0, n_buildings, chunk_size):
+        stop = min(start + chunk_size, n_buildings)
+
+        sys.stderr.write(f"\n[FLAT] filling buildings {start:,} -> {stop:,}")
+
+        part = gdf.iloc[start:stop]
+
+        for _, row in part.iterrows():
+            values_by_col = {}
+            for col in per_space_cols:
+                value = row[col]
+                if _is_per_space(value):
+                    values_by_col[col] = value
+
+            if not values_by_col:
+                continue
+
+            # First valid per-space column is reference.
+            ref = next(iter(values_by_col.values()))
+
+            for use_type, values in ref.items():
+                if not isinstance(values, list):
+                    continue
+
+                n_spaces = len(values)
+
+                for i in range(n_spaces):
+                    for col in context_cols:
+                        output[col][pos] = row[col]
+
+                    output["use_type"][pos] = use_type
+
+                    for col in per_space_cols:
+                        by_use = values_by_col.get(col)
+                        if by_use is None:
+                            continue
+
+                        seq = by_use.get(use_type)
+
+                        if isinstance(seq, list) and i < len(seq):
+                            output[renamed_space_cols[col]][pos] = seq[i]
+
+                    pos += 1
+
+        del part
+
+        gc.collect()
+
+        sys.stderr.write(f"[FLAT] filled {pos:,} / {total_records:,}")
+
+    if pos != total_records:
+        raise RuntimeError(
+            f"Expected {total_records:,} records but generated {pos:,}"
+        )
+
+    sys.stderr.write("\n[FLAT] Creating final DataFrame...")
+
+    result = pd.DataFrame(output)
+
+    del output
+    gc.collect()
+
+    lead = [c for c in (building_reference_col,"use_type") if c in result.columns]
+    rest = [c for c in result.columns if c not in lead]
+    result = result[lead + rest]
+
+    gc.collect()
+
+    sys.stderr.write(f"[FLAT] Final DataFrame: {len(result):,} rows")
+
     return result
 
 
