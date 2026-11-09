@@ -1,6 +1,6 @@
 Metadata-Version: 2.1
 Name: hypercadaster_es
-Version: 1.3.1
+Version: 1.3.2
 Summary: Python library to obtain the Spanish cadaster data joined with external attributes.
 Home-page: https://github.com/BeeGroup-cimne
 Author: Jose Manuel Broto Vispe
@@ -33,7 +33,7 @@ Requires-Dist: shapely<3.0,>=2.0
 Requires-Dist: pyproj<4.0,>=3.5
 Requires-Dist: rasterio<2.0,>=1.3
 Requires-Dist: fiona<2.0,>=1.9
-Requires-Dist: geopandas<1.1,>=0.13
+Requires-Dist: geopandas<1.2,>=1.1.2
 Requires-Dist: pyogrio<1.0,>=0.8
 Requires-Dist: affine>=2.4
 Requires-Dist: snuggs>=1.4
@@ -43,28 +43,34 @@ Requires-Dist: pyrosm>=0.6
 Requires-Dist: networkx>=3.2
 Requires-Dist: eppy>=0.5.63
 Requires-Dist: geomeppy>=0.12
-Requires-Dist: pyarrow>=14.0
+Requires-Dist: pyarrow>=23.0.1
 Requires-Dist: openpyxl>=3.1
 Requires-Dist: et-xmlfile>=1.1
 Requires-Dist: arrow>=1.4.0
 Requires-Dist: fastkml>=1.4.0
-Requires-Dist: lxml>=6.0.2
-Requires-Dist: duckdb>=1.5.3
-Requires-Dist: requests<3.0,>=2.31
-Requires-Dist: urllib3<3,>=2.1
+Requires-Dist: lxml>=6.1.0
+Requires-Dist: duckdb<2,>=1.5.3
+Requires-Dist: cdsapi>=0.7
+Requires-Dist: xarray>=2024.1
+Requires-Dist: cfgrib>=0.9.10
+Requires-Dist: pvlib>=0.11
+Requires-Dist: requests<3.0,>=2.33
+Requires-Dist: urllib3<3,>=2.8
 Requires-Dist: charset-normalizer>=3.3
-Requires-Dist: idna>=3.6
-Requires-Dist: certifi>=2024.2
+Requires-Dist: idna>=3.15
+Requires-Dist: certifi>=2026.10.18
 Requires-Dist: beautifulsoup4>=4.12
-Requires-Dist: soupsieve>=2.5
+Requires-Dist: soupsieve>=2.9
 Requires-Dist: xmltodict>=0.13
 Requires-Dist: matplotlib<4,>=3.8
 Requires-Dist: contourpy>=1.2
 Requires-Dist: cycler>=0.12
 Requires-Dist: kiwisolver>=1.4
 Requires-Dist: fonttools>=4.53
-Requires-Dist: pillow>=10.2
+Requires-Dist: pillow>=13.0
 Requires-Dist: folium>=0.20.0
+Requires-Dist: contextily>=1.5
+Requires-Dist: plotly>=5.20
 Requires-Dist: click>=8.1
 Requires-Dist: click-plugins>=1.1
 Requires-Dist: cligj>=0.7
@@ -88,9 +94,9 @@ Requires-Dist: pdoc>=14.0; extra == "dev"
 
 A comprehensive Python library for downloading, processing, and analyzing Spanish cadastral data with integration of external geographic datasets and EnergyPlus model generation.
 
-[![Python Version](https://img.shields.io/badge/python-3.10+-blue.svg)](https://python.org)
+[![Python Version](https://img.shields.io/badge/python-3.12+-blue.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-EUPL%20v1.2-blue.svg)](https://joinup.ec.europa.eu/collection/eupl/eupl-text-eupl-12)
-[![Version](https://img.shields.io/badge/version-1.1.0-green.svg)](https://github.com/BeeGroup-cimne/hypercadaster_ES)
+[![Version](https://img.shields.io/badge/version-1.3.2-green.svg)](https://github.com/BeeGroup-cimne/hypercadaster_ES)
 
 ## 🎯 Overview
 
@@ -193,9 +199,15 @@ For detailed installation instructions and advanced examples, see [Installation 
 
 ## 👥 Authors & Contributors
 
-**Primary Authors:**
+**Main Authors:**
 - **Jose Manuel Broto Vispe** - jmbrotovispe@gmail.com
 - **Gerard Mor** - gmor@cimne.upc.edu
+- **Maite Sellart** - tsellart@cimne.upc.edu
+
+**Co-authors:**
+- **David Blanco** - dblanco@cimne.upc.edu
+- **Gerard Laguna** - glaguna@cimne.upc.edu
+- **Nadiya Mehraj** - nmehraj@cimne.upc.edu
 
 **Institutional Affiliations:**
 - **CIMNE** - Centre Internacional de Mètodes Numèrics en Enginyeria, Building Energy and Environment (BEE) group
@@ -209,4 +221,4 @@ This project is licensed under the **EUPL v1.2**. See the [license](https://join
 
 *hypercadaster_ES - Built with ❤️ for the Spanish urban analysis and building research community*
 
-*Last updated: July 2026 | Version 1.1.0*
+*Last updated: November 2026 | Version 1.3.2*
