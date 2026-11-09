@@ -4,6 +4,61 @@ All notable changes to hypercadaster_ES will be documented in this file. The for
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-11-09
+
+### 🔒 Security: vulnerable dependency pins bumped
+
+GitHub Dependabot reported 88 advisories (6 critical, 51 high) against the
+pinned `requirements.txt`. Every affected package is now pinned to a patched
+release, and the matching `install_requires` floors in `setup.py` were raised so
+a fresh `pip install` can no longer resolve to a vulnerable version:
+
+| package | before | after |
+|---|---|---|
+| pillow | 12.0.0 | 13.0.0 |
+| certifi | 2025.11.12 | 2026.10.23 |
+| aiohttp | 3.14.1 | 3.14.5 |
+| urllib3 | 2.6.2 | 2.8.0 |
+| requests | 2.32.5 | 2.34.2 |
+| idna | 3.11 | 3.20 |
+| soupsieve | 2.8 | 2.9.0 |
+| lxml | 6.0.2 | 6.1.3 |
+| pyarrow | 22.0.0 | 23.0.1 |
+| fsspec | 2025.12.0 | 2026.6.0 |
+| geopandas | 1.0.1 | 1.1.2 |
+
+The `geopandas` cap moves from `<1.1` to `>=1.1.2,<1.2`; the old cap excluded
+the only patched release line.
+
+### 🐛 Undeclared dependencies broke clean installs
+
+- `contextily` is imported at module level in `utils.py` but was never declared,
+  so `import hypercadaster_ES` failed with `ModuleNotFoundError` on a fresh
+  environment (affects the published 1.3.1 wheel). Now in `install_requires`.
+- `plotly` is used by the energy-scenario HTML reports and interactive plots but
+  was never declared. Now in `install_requires`.
+- The weather module imports `pvlib`, `cdsapi` and `xarray` at module level, and
+  opens ERA5 GRIB files through xarray's `cfgrib` engine; none of the four was
+  declared, so `import hypercadaster_ES` also failed on them. All are now in
+  `install_requires`.
+- `requirements.txt` pinned `social_ES==1.0.0` while `setup.py` requires
+  `>=1.0.3`; the pin is aligned to `1.0.3`.
+
+### 📌 duckdb capped below 2.0
+
+`duckdb>=1.5.3` had no upper bound, so a fresh install resolved to duckdb 2.0,
+which breaks the persistence layer: the connection object no longer has `.pl()`,
+and a connection with an unfinished result (e.g. after `fetchone()`) rejects
+further queries. In the CAT cache these errors were swallowed by the fallback
+path, so every read silently missed and each municipality was re-parsed.
+`install_requires` now pins `duckdb>=1.5.3,<2` until the DuckDB layer is ported;
+`cat_cache_read` already uses the version-portable relation API
+(`con.sql(..., params=...).pl()`).
+
+### 📝 Docs
+
+README badges and footer updated (Python 3.12+, version 1.3.2).
+
 ## [1.3.1] - 2026-09-07
 
 ### 🐛 Flattening to building-space resolution no longer scales memory with total spaces

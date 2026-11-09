@@ -131,9 +131,10 @@ def cat_cache_read(results_dir: str, cadaster_code: str):
         con = duckdb.connect(path, read_only=True)
         if not _table_exists(con, CAT_SPACES_TABLE):
             return None
-        df = con.execute(
+        # Relation .pl(): duckdb 2.0 dropped .pl() on the DB-API connection.
+        df = con.sql(
             f'SELECT * FROM "{CAT_SPACES_TABLE}" WHERE cadaster_code = ?',
-            [str(cadaster_code)],
+            params=[str(cadaster_code)],
         ).pl()
         if df.height == 0:
             return None

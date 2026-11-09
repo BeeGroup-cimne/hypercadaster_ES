@@ -3,7 +3,7 @@ from setuptools import find_packages, setup
 
 HERE = pathlib.Path(__file__).parent
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 PACKAGE_NAME = "hypercadaster_es"
 AUTHOR = "Jose Manuel Broto Vispe"
 AUTHOR_EMAIL = "jmbrotovispe@gmail.com"
@@ -35,7 +35,7 @@ INSTALL_REQUIRES = [
     "pyproj>=3.5,<4.0",
     "rasterio>=1.3,<2.0",
     "fiona>=1.9,<2.0",
-    "geopandas>=0.13,<1.1",
+    "geopandas>=1.1.2,<1.2",
     "pyogrio>=0.8,<1.0",
     "affine>=2.4",
     "snuggs>=1.4",
@@ -51,22 +51,28 @@ INSTALL_REQUIRES = [
     "geomeppy>=0.12",
 
     # --- File formats & tabular IO ---
-    "pyarrow>=14.0",
+    "pyarrow>=23.0.1",
     "openpyxl>=3.1",
     "et-xmlfile>=1.1",
     "arrow>=1.4.0",
     "fastkml>=1.4.0",
-    "lxml>=6.0.2",
-    "duckdb>=1.5.3",
+    "lxml>=6.1.0",
+    "duckdb>=1.5.3,<2",  # 2.0 rejects new work while a prior result is unfinished; port pending
+
+    # --- Weather (ERA5-Land -> EPW) ---
+    "cdsapi>=0.7",  # Copernicus CDS client (Apache-2.0)
+    "xarray>=2024.1",  # (Apache-2.0)
+    "cfgrib>=0.9.10",  # GRIB engine for xarray; pulls eccodes (Apache-2.0)
+    "pvlib>=0.11",  # solar position / irradiance (BSD-3)
 
     # --- Web / HTTP ---
-    "requests>=2.31,<3.0",
-    "urllib3>=2.1,<3",
+    "requests>=2.33,<3.0",
+    "urllib3>=2.8,<3",
     "charset-normalizer>=3.3",
-    "idna>=3.6",
-    "certifi>=2024.2",
+    "idna>=3.15",
+    "certifi>=2026.10.18",
     "beautifulsoup4>=4.12",
-    "soupsieve>=2.5",
+    "soupsieve>=2.9",
     "xmltodict>=0.13",
 
     # --- Plotting & visuals ---
@@ -75,8 +81,10 @@ INSTALL_REQUIRES = [
     "cycler>=0.12",
     "kiwisolver>=1.4",
     "fonttools>=4.53",
-    "pillow>=10.2",
+    "pillow>=13.0",
     "folium>=0.20.0",
+    "contextily>=1.5",  # basemap tiles (BSD-3); imported at module level in utils
+    "plotly>=5.20",  # interactive energy-scenario reports (MIT)
 
     # --- CLI & packaging helpers ---
     "click>=8.1",
