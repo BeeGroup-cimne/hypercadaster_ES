@@ -107,9 +107,15 @@ For detailed installation instructions and advanced examples, see [Installation 
 
 ## 👥 Authors & Contributors
 
-**Primary Authors:**
+**Main Authors:**
 - **Jose Manuel Broto Vispe** - jmbrotovispe@gmail.com
 - **Gerard Mor** - gmor@cimne.upc.edu
+- **Maite Sellart** - tsellart@cimne.upc.edu
+
+**Co-authors:**
+- **David Blanco** - dblanco@cimne.upc.edu
+- **Gerard Laguna** - glaguna@cimne.upc.edu
+- **Nadiya Mehraj** - nmehraj@cimne.upc.edu
 
 **Institutional Affiliations:**
 - **CIMNE** - Centre Internacional de Mètodes Numèrics en Enginyeria, Building Energy and Environment (BEE) group

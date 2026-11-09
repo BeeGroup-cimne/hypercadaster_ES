@@ -26,7 +26,7 @@ wd = "/mnt/data2/hypercadaster_ES"
 # wiping and recomputing the (multi-hour) KPI inference. Set back to True for
 # a clean production run.
 force_update = False
-cadaster_codes = ["25011"] #08900: Barcelona, 25023: Alpicat, 25285: Torrefarrera
+cadaster_codes = ["25900"] #08900: Barcelona, 25023: Alpicat, 25285: Torrefarrera
 
 # Download all required data for all municipalities at once
 print("Downloading cadastral and auxiliary data for all municipalities...")
