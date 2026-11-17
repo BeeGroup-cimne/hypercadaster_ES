@@ -3,7 +3,7 @@ from setuptools import find_packages, setup
 
 HERE = pathlib.Path(__file__).parent
 
-VERSION = "1.3.2"
+VERSION = "1.4.0"
 PACKAGE_NAME = "hypercadaster_es"
 AUTHOR = "Jose Manuel Broto Vispe"
 AUTHOR_EMAIL = "jmbrotovispe@gmail.com"
@@ -34,7 +34,6 @@ INSTALL_REQUIRES = [
     "shapely>=2.0,<3.0",
     "pyproj>=3.5,<4.0",
     "rasterio>=1.3,<2.0",
-    "fiona>=1.9,<2.0",
     "geopandas>=1.1.2,<1.2",
     "pyogrio>=0.8,<1.0",
     "affine>=2.4",
@@ -55,9 +54,8 @@ INSTALL_REQUIRES = [
     "openpyxl>=3.1",
     "et-xmlfile>=1.1",
     "arrow>=1.4.0",
-    "fastkml>=1.4.0",
     "lxml>=6.1.0",
-    "duckdb>=1.5.3,<2",  # 2.0 rejects new work while a prior result is unfinished; port pending
+    "duckdb>=1.5.3,<3",
 
     # --- Weather (ERA5-Land -> EPW) ---
     "cdsapi>=0.7",  # Copernicus CDS client (Apache-2.0)

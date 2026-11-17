@@ -106,11 +106,34 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
 CAT_SPACES_TABLE = "cat_building_spaces"
 
 
+def fetch_first(con: duckdb.DuckDBPyConnection, sql: str,
+                params: Optional[list] = None):
+    """Run ``sql`` and return its first row (or None), fully consuming the result.
+
+    Use instead of ``con.execute(...).fetchone()``: duckdb 2.0 treats a result
+    read with ``fetchone()`` as unfinished, and a later ``register()`` /
+    ``sql()`` on the same connection then raises ResourceInUseException. Only
+    for queries that return at most a handful of rows (COUNT, key lookups,
+    ``LIMIT 1``).
+    """
+    rows = con.execute(sql, params or []).fetchall()
+    return rows[0] if rows else None
+
+
 def _table_exists(con: duckdb.DuckDBPyConnection, table: str) -> bool:
-    return con.execute(
-        "SELECT 1 FROM information_schema.tables WHERE table_name = ?",
+    """True when ``table`` exists in the connection's own ``main`` schema.
+
+    Catalog lookup, never a probing query that can fail: under duckdb 2.0 a
+    failed statement aborts an enclosing transaction even when caught. Scoped to
+    the current database so a same-named table in an ATTACHed shard is ignored.
+    """
+    return fetch_first(
+        con,
+        "SELECT 1 FROM information_schema.tables "
+        "WHERE table_catalog = current_database() AND table_schema = 'main' "
+        "AND table_name = ? LIMIT 1",
         [table],
-    ).fetchone() is not None
+    ) is not None
 
 
 def cat_cache_read(results_dir: str, cadaster_code: str):
@@ -168,12 +191,12 @@ def cat_cache_clear(results_dir: str, cadaster_code: Optional[str] = None) -> in
             if not _table_exists(con, tbl):
                 continue
             if cadaster_code is None:
-                removed += con.execute(f'SELECT COUNT(*) FROM "{tbl}"').fetchone()[0]
+                removed += fetch_first(con, f'SELECT COUNT(*) FROM "{tbl}"')[0]
                 con.execute(f'DROP TABLE "{tbl}"')
             else:
-                removed += con.execute(
-                    f'SELECT COUNT(*) FROM "{tbl}" WHERE cadaster_code = ?',
-                    [str(cadaster_code)]).fetchone()[0]
+                removed += fetch_first(
+                    con, f'SELECT COUNT(*) FROM "{tbl}" WHERE cadaster_code = ?',
+                    [str(cadaster_code)])[0]
                 con.execute(
                     f'DELETE FROM "{tbl}" WHERE cadaster_code = ?',
                     [str(cadaster_code)])
@@ -348,9 +371,8 @@ def set_table_crs(con: duckdb.DuckDBPyConnection, table: str, crs) -> None:
 
 def get_table_crs(con: duckdb.DuckDBPyConnection, table: str):
     """Return the stored ``pyproj.CRS`` for a table, or None if unset."""
-    row = con.execute(
-        "SELECT value FROM _meta WHERE key = ?", [f"crs:{table}"]
-    ).fetchone()
+    row = fetch_first(
+        con, "SELECT value FROM _meta WHERE key = ?", [f"crs:{table}"])
     if row is None:
         return None
     from pyproj import CRS as _CRS
@@ -413,11 +435,13 @@ def _df_with_wkb(gdf: gpd.GeoDataFrame, geom_cols: Iterable[str]) -> pd.DataFram
     # object (dict, list, numpy scalar, etc.). Strings and bytes pass
     # through as-is; they're already DuckDB-compatible. This handles
     # round-trips through read_gdf which unpickles BLOB columns on read.
+    # The decision covers EVERY value, not a sample: a column that is str in
+    # some rows and float / dict in others (shard type drift) must be pickled
+    # whole, or DuckDB either rejects the frame or silently coerces it.
     for col in df.columns:
         if col in geom_set or df[col].dtype != object:
             continue
-        sample = _first_non_null(df[col])
-        if sample is None or isinstance(sample, (str, bytes, bytearray, memoryview)):
+        if _object_kind(df[col]) in ("null", "str", "bytes"):
             continue
         df[col] = [None if _is_null(v) else _to_pickle_bytes(v) for v in df[col]]
     return df
@@ -467,19 +491,14 @@ def write_gdf(con: duckdb.DuckDBPyConnection, table: str, gdf: gpd.GeoDataFrame,
     for col in gdf.columns:
         if col in geom_set:
             continue
-        sample = _first_non_null(gdf[col])
-        if isinstance(sample, _BaseGeometry):
+        if not isinstance(_first_non_null(gdf[col]), _BaseGeometry):
+            continue  # cheap reject; a geometry column's first value is one
+        # Only when EVERY value is a geometry; a mixed column is pickled.
+        if _object_kind(gdf[col]) == "geometry":
             geom_set.add(col)
     geom_cols = tuple(geom_set)
     df = _df_with_wkb(gdf, geom_cols)
     con.register("_tmp_write_gdf", df)
-
-    def _table_exists() -> bool:
-        try:
-            con.execute(f'DESCRIBE "{table}"')
-            return True
-        except Exception:
-            return False
 
     def _reconcile_schema():
         """ADD COLUMN for every frame column the table doesn't have yet."""
@@ -515,7 +534,7 @@ def write_gdf(con: duckdb.DuckDBPyConnection, table: str, gdf: gpd.GeoDataFrame,
                     f"key_cols={key_cols!r}, frame columns missing "
                     f"{[k for k in keys if k not in df.columns]}"
                 )
-            if not _table_exists():
+            if not _table_exists(con, table):
                 con.execute(
                     f'CREATE TABLE "{table}" AS SELECT {select_sql} FROM _tmp_write_gdf'
                 )
@@ -643,11 +662,12 @@ def get_blob_for_building(results_dir: str, cadaster_code: str,
     select_sql = ", ".join(f'"{c}"' for c in cols)
     con = open_shard_read(db_path(results_dir))
     try:
-        row = con.execute(
+        row = fetch_first(
+            con,
             f'SELECT {select_sql} FROM "main"."{table}" '
             f'WHERE cadaster_code = ? AND building_reference = ? LIMIT 1',
             [cadaster_code, building_reference],
-        ).fetchone()
+        )
     finally:
         con.close()
     if row is None:
@@ -694,6 +714,29 @@ def read_df_safe_chunks(con: duckdb.DuckDBPyConnection, table: str, *,
         sql += f" WHERE {where}"
 
     result = con.execute(sql, params or [])
+    exhausted = False
+    try:
+        yield from _decoded_chunks(result, cols, types, geom_cols,
+                                   vectors_per_chunk)
+        exhausted = True
+    finally:
+        # Do NOT call result.close(): DuckDB's Python API returns the same
+        # connection object from con.execute(), so closing the "result"
+        # would close the connection itself. If the consumer stopped early
+        # the result is only partially read, which under duckdb 2.0 blocks
+        # register()/sql() on this connection — replacing it with a trivial
+        # execute() releases it (and is harmless on 1.x).
+        if not exhausted:
+            try:
+                con.execute("SELECT 1").fetchall()
+            except Exception:
+                pass
+        del result
+
+
+def _decoded_chunks(result, cols, types, geom_cols, vectors_per_chunk):
+    """Yield decoded pandas chunks from an open ``execute()`` result until it
+    is exhausted (helper for :func:`read_df_safe_chunks`)."""
     while True:
         try:
             chunk = result.fetch_df_chunk(vectors_per_chunk)
@@ -709,20 +752,9 @@ def read_df_safe_chunks(con: duckdb.DuckDBPyConnection, table: str, *,
         for col in cols:
             if types[col] != "BLOB" or col in geom_cols:
                 continue
-            sample = _first_non_null(chunk[col])
-            if sample is None:
-                continue
-            sb = bytes(sample) if not isinstance(sample, bytes) else sample
-            if not (len(sb) >= 2 and sb[0] == 0x80):
-                continue
-            chunk[col] = [_maybe_unpickle(b) for b in chunk[col]]
+            if _any_pickled(chunk[col]):
+                chunk[col] = [_maybe_unpickle(b) for b in chunk[col]]
         yield chunk
-    # Do NOT call result.close(): DuckDB's Python API returns the same
-    # connection object from con.execute(), so closing the "result"
-    # would close the connection itself. Dropping the local reference
-    # and letting the next con.execute() displace the cursor state is
-    # the correct cleanup.
-    del result
 
 
 def ingest_shard_table(central_con: duckdb.DuckDBPyConnection, *,
@@ -766,17 +798,18 @@ def ingest_shard_table(central_con: duckdb.DuckDBPyConnection, *,
 
     # Fully qualify with "main" so DESCRIBE / ALTER don't get confused by
     # an identically-named table in the ATTACH'd shard.
-    try:
+    # Catalog lookup rather than a DESCRIBE probe: Phase A runs this inside
+    # BEGIN TRANSACTION, and under duckdb 2.0 a failed probe (table missing on
+    # the first shard) aborts the transaction even when caught.
+    central_exists = _table_exists(central_con, central_table)
+    if central_exists:
         existing_rows = central_con.execute(
             f'DESCRIBE "main"."{central_table}"'
         ).fetchall()
         existing_types = {r[0]: str(r[1]).upper() for r in existing_rows}
-        existing = set(existing_types.keys())
-        central_exists = True
-    except Exception:
+    else:
         existing_types = {}
-        existing = set()
-        central_exists = False
+    existing = set(existing_types.keys())
 
     bookkeeping_cols = list(bookkeeping.keys())
     pickle_wrap_cols: set = set()
@@ -844,6 +877,7 @@ def ingest_shard_table(central_con: duckdb.DuckDBPyConnection, *,
                         existing_types[n] = "BLOB"
                         kept.append((n, "BLOB"))
                     except Exception as _wide_err:
+                        _raise_if_txn_aborted(central_con, _wide_err)
                         sys.stderr.write(
                             f"[ingest_shard_table] could not widen '{n}' "
                             f"from {ct} to BLOB ({_wide_err}); dropping for "
@@ -863,6 +897,7 @@ def ingest_shard_table(central_con: duckdb.DuckDBPyConnection, *,
                         existing_types[n] = "DOUBLE"
                         kept.append((n, "DOUBLE"))
                     except Exception as _ne:
+                        _raise_if_txn_aborted(central_con, _ne)
                         sys.stderr.write(
                             f"[ingest_shard_table] type drift on '{n}' "
                             f"(central={ct}, shard={st}); could not widen "
@@ -1015,6 +1050,22 @@ def ingest_shard_table(central_con: duckdb.DuckDBPyConnection, *,
             central_con.unregister("_tmp_ingest_wrap")
 
 
+def _raise_if_txn_aborted(con: duckdb.DuckDBPyConnection,
+                          err: Exception) -> None:
+    """Re-raise ``err`` when it left ``con``'s transaction aborted.
+
+    duckdb 2.0 aborts an explicit transaction on any failed statement, so a
+    caught error can't be recovered from inside it: every later statement
+    fails and COMMIT rolls back. Probing with a no-op tells the two cases
+    apart; under autocommit (and duckdb 1.x) the probe succeeds and the
+    caller's fallback proceeds.
+    """
+    try:
+        con.execute("SELECT 1").fetchall()
+    except Exception:
+        raise err
+
+
 def _is_null(v) -> bool:
     """True for None / pd.NA / NaN floats. Robust against scalars where
     pd.isna would broadcast (e.g. ndarrays in object columns)."""
@@ -1057,17 +1108,14 @@ def _classify_columns(df: pd.DataFrame) -> Tuple[List[str], List[str], List[str]
         if s.dtype != object and dtype_name != "geometry":
             primitive.append(col)
             continue
-        sample = _first_non_null(s)
-        if sample is None:
-            primitive.append(col)
-            continue
-        # Shapely objects all expose __geo_interface__ and wkb_hex / wkb attrs.
-        if hasattr(sample, "__geo_interface__") and hasattr(sample, "wkb"):
+        # Classified over every value, not a sample, so a column mixing str
+        # with other types (shard type drift) is pickled rather than handed to
+        # DuckDB as a column it can't type.
+        kind = _object_kind(s)
+        if kind == "geometry":
             geometry.append(col)
-        elif isinstance(sample, str):
-            primitive.append(col)
-        elif isinstance(sample, (bytes, bytearray, memoryview)):
-            primitive.append(col)  # already binary; let DuckDB store as BLOB
+        elif kind in ("null", "str", "bytes"):
+            primitive.append(col)  # bytes: already binary, stored as BLOB
         else:
             opaque.append(col)
     return primitive, geometry, opaque
@@ -1196,19 +1244,59 @@ def read_df_safe(con: duckdb.DuckDBPyConnection, table: str, *,
     # look like pickle (start with 0x80) and successfully unpickle, use
     # the rehydrated value; otherwise leave as raw bytes. Per-row
     # robustness matters because a column may end up mixed across
-    # shards, and a single coincidentally-0x80 raw value used to crash
-    # the whole read.
+    # shards (text widened by type drift + pickles), and row order is
+    # arbitrary (preserve_insertion_order=false) — so the decision must
+    # not depend on whichever value happens to come first.
     for col in cols:
         if types[col] != "BLOB" or col in geom_cols:
             continue
-        sample = _first_non_null(df[col])
-        if sample is None:
-            continue
-        sb = bytes(sample) if not isinstance(sample, bytes) else sample
-        if not (len(sb) >= 2 and sb[0] == 0x80):
-            continue  # no row in the probe likely pickled; cheap-out
-        df[col] = [_maybe_unpickle(b) for b in df[col]]
+        if _any_pickled(df[col]):
+            df[col] = [_maybe_unpickle(b) for b in df[col]]
     return df
+
+
+def _is_pickle_bytes(v) -> bool:
+    """True for a bytes-like value carrying our pickle prefix (0x80)."""
+    if not isinstance(v, (bytes, bytearray, memoryview)):
+        return False
+    return len(v) >= 2 and bytes(v[:1]) == b"\x80"
+
+
+def _any_pickled(series) -> bool:
+    """True when any value of ``series`` looks like our pickled BLOB."""
+    return any(_is_pickle_bytes(v) for v in series)
+
+
+def _object_kind(series: pd.Series) -> str:
+    """Classify an object column over ALL its non-null values.
+
+    Returns ``'null'`` (no values), ``'str'`` / ``'bytes'`` (every value of
+    that type), ``'geometry'`` (every value a shapely geometry) or ``'mixed'``
+    (anything else, including a mix of the above). pandas' C-level
+    ``infer_dtype`` short-circuits the common homogeneous cases.
+    """
+    inferred = pd.api.types.infer_dtype(series, skipna=True)
+    if inferred == "empty":
+        return "null"
+    if inferred == "string":
+        return "str"
+    if inferred == "bytes":
+        return "bytes"
+    kinds = set()
+    for v in series:
+        if _is_null(v):
+            continue
+        if isinstance(v, str):
+            kinds.add("str")
+        elif isinstance(v, (bytes, bytearray, memoryview)):
+            kinds.add("bytes")
+        elif hasattr(v, "__geo_interface__") and hasattr(v, "wkb"):
+            kinds.add("geometry")
+        else:
+            return "mixed"
+        if len(kinds) > 1:
+            return "mixed"
+    return kinds.pop() if kinds else "null"
 
 
 def _maybe_unpickle(b):
@@ -1367,20 +1455,26 @@ def read_gdf(con: duckdb.DuckDBPyConnection, table: str, *,
         if col in geom_typed:
             df[col] = [_wkb_or_none(v) for v in df[col]]
             continue
-        sample = _first_non_null(df[col])
-        if sample is None or not isinstance(sample, (bytes, bytearray, memoryview)):
+        blobs = [v for v in df[col] if isinstance(v, (bytes, bytearray, memoryview))]
+        if not blobs:
             continue
-        sb = bytes(sample) if not isinstance(sample, bytes) else sample
-        if len(sb) >= 2 and sb[0] == 0x80:
-            df[col] = [_maybe_unpickle(v) for v in df[col]]   # pickled object
-        else:
-            # Non-pickle BLOB: decode to str if it is valid UTF-8 text (e.g. a
-            # date string that shard type-drift widened to BLOB), else keep raw.
-            try:
-                sb.decode('utf-8')
-            except Exception:
-                continue
-            df[col] = [_text_or_bytes(v) for v in df[col]]
+        # Decide per value, never from the first row (row order is arbitrary):
+        # a column widened to BLOB by shard type drift holds text-encoded
+        # values from early shards AND pickles from later ones. Pickles are
+        # always rehydrated; the remaining bytes are decoded to str only when
+        # all of them are valid UTF-8 text (e.g. a widened date string), else
+        # they stay raw so genuinely binary data is never half-decoded.
+        raw = [bytes(v) for v in blobs if not _is_pickle_bytes(v)]
+        try:
+            for b in raw:
+                b.decode('utf-8')
+            decode_text = bool(raw)
+        except UnicodeDecodeError:
+            decode_text = False
+        df[col] = [_maybe_unpickle(v) if _is_pickle_bytes(v)
+                   else _text_or_bytes(v) if decode_text
+                   else v
+                   for v in df[col]]
     return gpd.GeoDataFrame(df, geometry=geom_col, crs=get_table_crs(con, table))
 
 
@@ -1422,17 +1516,17 @@ class ResultsHandle:
     def sbr_relation(self) -> duckdb.DuckDBPyRelation:
         """Return a lazy DuckDB relation for sbr_results filtered by code."""
         con = self._con()
-        return con.execute(
+        return con.sql(
             'SELECT * FROM "main"."sbr_results" WHERE cadaster_code = ?',
-            [self.cadaster_code],
+            params=[self.cadaster_code],
         )
 
     def br_relation(self) -> duckdb.DuckDBPyRelation:
         """Return a lazy DuckDB relation for br_results filtered by code."""
         con = self._con()
-        return con.execute(
+        return con.sql(
             'SELECT * FROM "main"."br_results" WHERE cadaster_code = ?',
-            [self.cadaster_code],
+            params=[self.cadaster_code],
         )
 
     # -- batched iteration --------------------------------------------------
@@ -1504,10 +1598,11 @@ class ResultsHandle:
         con = self._con()
         own_con = con is not self._parent_con
         try:
-            row = con.execute(
+            row = fetch_first(
+                con,
                 'SELECT count(*) FROM "main"."sbr_results" WHERE cadaster_code = ?',
                 [self.cadaster_code],
-            ).fetchone()
+            )
             return row[0] if row else 0
         finally:
             if own_con:
@@ -1518,10 +1613,11 @@ class ResultsHandle:
         con = self._con()
         own_con = con is not self._parent_con
         try:
-            row = con.execute(
+            row = fetch_first(
+                con,
                 'SELECT count(*) FROM "main"."br_results" WHERE cadaster_code = ?',
                 [self.cadaster_code],
-            ).fetchone()
+            )
             return row[0] if row else 0
         finally:
             if own_con:

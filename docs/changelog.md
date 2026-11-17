@@ -4,6 +4,118 @@ All notable changes to hypercadaster_ES will be documented in this file. The for
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-17
+
+### 🦆 DuckDB 2.0 support
+
+The persistence layer (`_db.py`) now runs on duckdb 2.x as well as 1.5;
+`install_requires` is `duckdb>=1.5.3,<3` and `requirements.txt` pins 2.0.0.
+duckdb 2.0 changed two connection semantics the layer relied on, and both broke
+the inference merge:
+
+- **Partially-read results block the connection.** A result read with
+  `fetchone()` now counts as unfinished, and a later `register()` / `sql()` on
+  the same connection raises `ResourceInUseException`. The merge hit this right
+  after `ResultsHandle.br_count()`, when it registers `_building_slim` on the
+  same connection. Single-row reads now go through `_db.fetch_first`, which
+  consumes the whole result. An abandoned `read_df_safe_chunks` stream releases
+  its result as well.
+- **A failed statement aborts the transaction.** Phase A ingests each shard
+  under `BEGIN TRANSACTION`, and `ingest_shard_table` probed the central table
+  with a `DESCRIBE` inside `try`/`except`. On the first shard that table doesn't
+  exist yet, so the probe aborted the transaction, every zone rolled back, and
+  Phase A aggregated nothing. Table existence (there and in `write_gdf`'s
+  upsert) is now a catalog lookup scoped to the current database. The
+  column-widening fallbacks re-raise their real error when it has left the
+  transaction aborted, instead of continuing into a dead transaction.
+
+Also: `ResultsHandle.sbr_relation()` / `br_relation()` now return real lazy
+relations, as their annotations always said, instead of the connection with a
+pending result. New offline tests (`tests/test_db_layer.py`) cover these call
+sequences on either duckdb major.
+
+### 🐛 Mixed-type columns decoded by whichever row came first
+
+When zones disagree on a column's type, `ingest_shard_table` widens the central
+column to BLOB. The column then holds text-encoded values from early shards and
+pickles from later ones (e.g. `br__parcel_main_orientation`, a mix of float and
+numeric-string orientations). `read_gdf`, `read_df_safe` and
+`read_df_safe_chunks` chose a decoding for the *whole* column from its first
+non-null value. With `preserve_insertion_order = false` that row is arbitrary,
+so on a real Lleida municipality (25011) the merge either returned ~2,000 raw
+pickle blobs in the column, or crashed in the `buildings` upsert
+(`Failed to cast value: DOUBLE -> BLOB`). Which one happened depended on row
+order, on either duckdb major. Decoding is now per value: pickles are always
+rehydrated, and `read_gdf` decodes the remaining bytes to `str` when all of them
+are UTF-8 text. On the write side (`write_gdf`, `write_df_safe`), a column is
+passed through as plain text or binary only when every value is a `str` (or
+every value is bytes); any mixed column is pickled whole.
+
+Note: duckdb 1.5 cannot open database files written by duckdb 2.0, so a
+`building_results.duckdb` (or shard cache) touched by 2.0 can't be read again
+after downgrading to 1.5.
+
+### 🐛 Buildings without a CartoCiudad address were dropped
+
+`join_cadaster_building` left-joined buildings onto CartoCiudad addresses, so any
+cadastral building with no CartoCiudad address point disappeared from the merge
+(e.g. `0354404CG3305N`, a residential building in Cubells, 25095). Those
+buildings are now appended to the merge:
+
+- **With the cadastral address when there is one.** The INSPIRE Address layer
+  is downloaded again (`cadaster/address/`), only as this fallback, and read by
+  a new, slim `mergers.get_cadaster_address`. It returns the same columns as the
+  CartoCiudad reader, with `address_source = "Catastro INSPIRE"`. These
+  addresses are often "S-N" (no number) on the cadastral street, e.g.
+  `0354404CG3305N` -> CALLE CALVARI S-N, 25737. On Cubells, 41 previously
+  dropped buildings get one.
+- **Then with the CAT parcel record** (when `use_CAT_files=True`). The new
+  `mergers.get_CAT_address` reads record type 11 from the urban **and rural**
+  CAT files (`{province}_R_*_CAT`, next to the `_U_` folder). Rural buildings,
+  which the INSPIRE Address layer mostly skips, get the cadastre's rural
+  address: `25095A00100086` -> PARAJE TRILLA, POLIGONO 1 PARCELA 86, 25737,
+  located at the CAT parcel point. `address_source = "Catastro CAT"`. On
+  Cubells this covers the 108 buildings the INSPIRE step left address-less,
+  so every building there now has an address.
+- **Address-less otherwise.** Address columns are null, `cadaster_code` comes
+  from the building, and `address_location` falls back to the parcel centroid.
+
+Also:
+- `downloaders.parse_CAT_file` takes `cat_kind="U"|"R"` (rural tables are
+  cached as `{code}_R_{type}.parquet`; urban cache names are unchanged) and
+  `wait_timeout` (0 = don't wait for a missing file to be uploaded).
+- CAT type-11 coordinates are parsed as Float64 instead of Float32, which
+  rounded the y coordinate to about 0.3 m.
+- `street_type_names` gains the Catastro code `DS` -> `DISEMINADO`.
+
+### ⚡ Essential characteristics no longer re-reads the whole-Spain census
+
+`social_ES`'s `EssentialCharacteristicsOfPopulationAndHouseholds` calls
+`PopulationCensus(wd=wd)` and `HouseholdIncomeDistributionAtlas(wd=wd)` for all
+of Spain internally, then inner-joins them onto the buildings. With the
+`essential_characteristics` dataset on, the merge re-scraped the INE
+population-census metadata and re-read all 52 provincial files a second time
+(the duplicate "Reading the metadata to gather the INE population census"
+line), and estimated the income/nationality distributions row by row for every
+census tract in Spain. `join_social_ES` now hands its already-fetched
+population table to `join_essential_characteristics` (new `population=`
+argument), and both internal reads are scoped to the enriched municipalities
+for the duration of the call (`social._scoped_ec_sources`). The result is
+unchanged, because the inner join kept only those municipalities anyway.
+
+### 🗑️ Removed: `utils.kml_to_geojson`, fiona and fastkml
+
+`utils.kml_to_geojson` was unused and is removed. It was the only user of
+`fastkml`. `fiona` was used only to list a GeoPackage's layers, which
+`get_streets_open_street_maps` now does with `pyogrio.list_layers`. Both
+packages are dropped from `install_requires` and `requirements.txt`.
+
+### 📝 Docs
+
+Address fallback, `address_source` values and the urban + rural CAT folder
+layout documented (data sources, output schema, configuration); DuckDB 1.5/2.x
+compatibility note in the quick start. README version updated to 1.4.0.
+
 ## [1.3.2] - 2026-11-09
 
 ### 🔒 Security: vulnerable dependency pins bumped

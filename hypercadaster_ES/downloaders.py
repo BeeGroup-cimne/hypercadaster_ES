@@ -4,12 +4,14 @@ import re
 import html
 import unicodedata
 import zipfile
+import io
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import geopandas as gpd
 import os
 from ._pretty import PrettyDict, PrettyList
 import requests
 import pandas as pd
-import fiona
+import json
 from hypercadaster_ES import utils
 import polars as pl
 from charset_normalizer import from_path
@@ -196,11 +198,13 @@ def download_osm_pbf(open_street_dir, subregion_slug, skip_if_exists=True):
 def download_postal_codes(postal_codes_dir, province_codes=None):
     """Download and assemble Spanish postal-code boundary polygons.
 
-    Fetches per-province KML from codigospostales.com, converts each to GeoJSON
-    under ``{postal_codes_dir}/raw/``, then validates and concatenates them into
-    ``{postal_codes_dir}/postal_codes.geojson``. Already-downloaded provinces are
-    skipped. Individual province failures are logged and skipped rather than
-    raised.
+    Fetches the per-province GeoJSON that backs the codigospostales.com map
+    (``/data/poly/{province}.json``; the old ``/kml/k{province}.kml`` files are
+    gone), maps its ``cp`` property onto the legacy ``PROV``/``CODPOS`` schema,
+    stores it under ``{postal_codes_dir}/raw/``, then validates and concatenates
+    them into ``{postal_codes_dir}/postal_codes.geojson``. Already-downloaded
+    provinces are skipped. Individual province failures are logged and skipped
+    rather than raised.
 
     Parameters
     ----------
@@ -216,15 +220,21 @@ def download_postal_codes(postal_codes_dir, province_codes=None):
     sys.stderr.write('\nDownloading postal codes from Spain\n')
     if province_codes is None:
         province_codes = ["{:02d}".format(i) for i in range(1, 53)]
-    fiona.drvsupport.supported_drivers['KML'] = 'rw'
+    os.makedirs(f"{postal_codes_dir}/raw", exist_ok=True)
     for province_code in province_codes:
         if not os.path.exists(f"{postal_codes_dir}/raw/k{province_code}.geojson"):
             try:
-                geojson_data = utils.kml_to_geojson(f"https://www.codigospostales.com/kml/k{province_code}.kml")
+                r = requests.get(f"https://www.codigospostales.com/data/poly/{province_code}.json",
+                                 timeout=120)
+                r.raise_for_status()
+                geojson_data = r.json()
+                for feature in geojson_data["features"]:
+                    cp = str(feature["properties"]["cp"]).zfill(5)
+                    feature["properties"] = {"PROV": cp[:2], "CODPOS": cp}
                 with open(f"{postal_codes_dir}/raw/k{province_code}.geojson", 'w') as f:
-                   f.write(geojson_data)
-            except:
-                sys.stderr.write(f"Error downloading postal code {province_code} file\n")
+                    json.dump(geojson_data, f)
+            except Exception as e:
+                sys.stderr.write(f"Error downloading postal code {province_code} file: {e}\n")
 
     # Filter and concatenate downloaded geojson files
     patterns = [f'k{pr}.geojson' for pr in province_codes]
@@ -363,16 +373,18 @@ def _download_inspire_zip(dest_dir, file_name, url):
 def cadaster_downloader(cadaster_dir, cadaster_codes=None):
     """Download INSPIRE-harmonised cadastral data from the Spanish Catastro.
 
-    Fetches the INSPIRE parcels and buildings layers for each requested
+    Fetches the INSPIRE parcels, buildings and addresses layers for each requested
     municipality, saving per-municipality zips under ``{cadaster_dir}/{layer}/zip/``
     and unzipping them to ``.../unzip/``. Municipalities already present are
     skipped, so re-runs only fetch what is missing.
 
     .. note::
-        The INSPIRE **Addresses** layer (``ES.SDGC.AD``) is no longer downloaded
-        here: addresses now come from CartoCiudad (see
-        :func:`cartociudad_downloader`). The parcels and buildings layers are
-        still required for building geometry, parcel geometry and inference.
+        Addresses come from CartoCiudad (see :func:`cartociudad_downloader`).
+        The INSPIRE **Addresses** layer (``ES.SDGC.AD``) is still downloaded,
+        but only as the fallback for buildings CartoCiudad has no address for
+        (:func:`hypercadaster_ES.mergers.get_cadaster_address`). The parcels and
+        buildings layers are required for building geometry, parcel geometry
+        and inference.
 
     Parameters
     ----------
@@ -388,9 +400,10 @@ def cadaster_downloader(cadaster_dir, cadaster_codes=None):
     """
     inspire_dict = {
         "parcels": "https://www.catastro.hacienda.gob.es/INSPIRE/CadastralParcels/ES.SDGC.CP.atom.xml",
-        # Deprecated: addresses are now sourced from CartoCiudad, not the INSPIRE
-        # Address feed. See cartociudad_downloader / mergers.get_cartociudad_address.
-        # "address": "https://www.catastro.hacienda.gob.es/INSPIRE/Addresses/ES.SDGC.AD.atom.xml",
+        # Addresses come from CartoCiudad (cartociudad_downloader); the INSPIRE
+        # Address feed is only the fallback for buildings CartoCiudad does not
+        # cover (mergers.get_cadaster_address).
+        "address": "https://www.catastro.hacienda.gob.es/INSPIRE/Addresses/ES.SDGC.AD.atom.xml",
         "buildings": "https://www.catastro.hacienda.gob.es/INSPIRE/buildings/ES.SDGC.BU.atom.xml"
     }
     for k, v in inspire_dict.items():
@@ -435,6 +448,8 @@ def cadaster_downloader(cadaster_dir, cadaster_codes=None):
 #      (wrapping a .gpkg with a `portalpk_publi` address-point layer).
 CARTOCIUDAD_BASE_URL = "https://centrodedescargas.cnig.es/CentroDescargas"
 CARTOCIUDAD_COD_SERIE = "02122"
+# Address-point layer inside each province GeoPackage.
+CARTOCIUDAD_ADDRESS_LAYER = "portalpk_publi"
 # The download center drops connections from clients without a browser-like
 # User-Agent, so a session with one is reused across the three requests.
 CARTOCIUDAD_USER_AGENT = "Mozilla/5.0 (compatible; hypercadaster_ES)"
@@ -493,10 +508,14 @@ def cartociudad_downloader(cartociudad_dir, province_codes, timeout=120, max_ret
 
     For each 2-digit province code, resolves the current file on the CNIG
     download center, downloads and unzips it, and stores the address GeoPackage
-    as ``{cartociudad_dir}/{province_code}.gpkg``. Provinces whose gpkg already
-    exists are skipped, so re-runs only fetch what is missing. Failures for a
-    single province are logged to stderr rather than raised, so a multi-province
-    run continues past a dead resource.
+    as ``{cartociudad_dir}/{province_code}.gpkg``. When the download center
+    refuses the request (it blocks scripted downloads with a 403) or keeps
+    failing, the province is fetched from the IDEE OGC API-Features instead
+    (:func:`cartociudad_api_downloader`), which writes a GeoPackage with the
+    same layer and columns. Provinces whose gpkg already exists are skipped, so
+    re-runs only fetch what is missing. Failures for a single province are
+    logged to stderr rather than raised, so a multi-province run continues past
+    a dead resource.
 
     Parameters
     ----------
@@ -525,20 +544,15 @@ def cartociudad_downloader(cartociudad_dir, province_codes, timeout=120, max_ret
     try:
         name2sec = _cartociudad_name_to_sec(session, timeout=timeout)
     except Exception as e:
-        sys.stderr.write(f"Error listing CartoCiudad files: {e}\n")
-        return
+        sys.stderr.write(f"Error listing CartoCiudad files on the CNIG download center: {e}\n")
+        name2sec = {}
 
     for province_code in needed:
         gpkg_path = os.path.join(cartociudad_dir, f"{province_code}.gpkg")
         sys.stderr.write(f"\nDownloading CartoCiudad addresses for province {province_code}\n")
         prov_name = CARTOCIUDAD_PROVINCE_NAMES.get(province_code)
         sec = name2sec.get(_normalize_province_name(prov_name)) if prov_name else None
-        if sec is None:
-            sys.stderr.write(
-                f"Warning: no CartoCiudad file found for province {province_code} "
-                f"({prov_name}); its addresses will be unavailable\n")
-            continue
-        for attempt in range(1, max_retries + 1):
+        for attempt in range(1, max_retries + 1 if sec is not None else 1):
             zip_path = gpkg_path + ".zip.part"
             try:
 
@@ -559,6 +573,9 @@ def cartociudad_downloader(cartociudad_dir, province_codes, timeout=120, max_ret
                     stream=True,
                     timeout=timeout,
                 ) as resp:
+                    if resp.status_code == 403:
+                        sys.stderr.write("CNIG download center refused the download (403)\n")
+                        break
                     if resp.status_code in (429, 500, 502, 503, 504):
                         raise requests.exceptions.RequestException(f"transient status {resp.status_code}")
                     resp.raise_for_status()
@@ -593,6 +610,271 @@ def cartociudad_downloader(cartociudad_dir, province_codes, timeout=120, max_ret
                         os.remove(zip_path)
                     except OSError:
                         pass
+
+        if not os.path.exists(gpkg_path) and province_code in CARTOCIUDAD_API_PROVINCE_NAMES:
+            sys.stderr.write(f"Falling back to the CartoCiudad OGC API-Features for province {province_code}\n")
+            try:
+                cartociudad_api_downloader(gpkg_path, province_code)
+            except Exception as e:
+                sys.stderr.write(
+                    f"Error downloading CartoCiudad province {province_code} from API-Features: {e}; "
+                    f"its addresses will be unavailable\n")
+
+
+# ---------------------------------------------------------------------------
+# CartoCiudad addresses via OGC API-Features (fallback)
+# ---------------------------------------------------------------------------
+# The CNIG download center started answering scripted `descargaDir` requests with
+# 403 `X-Action: Block-Bot`. The same CartoCiudad portal/PK points are published
+# through IDEE's OGC API-Features (CC BY 4.0), which is meant for programmatic
+# access. Its INSPIRE schema differs from the GeoPackage, so the fallback rebuilds
+# a `portalpk_publi` layer with the GeoPackage columns and writes it to the same
+# `{province}.gpkg` path, keeping `mergers.get_cartociudad_address` unchanged:
+#   - `component_ThoroughfareName` is "<tipo_vial> <nombre_via>"; split against the
+#     raw `tipo_vial` vocabulary below (exact for 99.99% of the GeoPackage streets).
+#     Basque provinces publish Basque type words/bilingual names there, so their
+#     split is best-effort.
+#   - `ine_mun` is absent; it is recovered from the municipality name via INE's
+#     official municipality dictionary (articles un-inverted: "Roda, La" ->
+#     "La Roda"), which matches every CartoCiudad municipality name exactly.
+#   - `tipo` (Portal/PK) is not exposed; kilometre points are the road points
+#     sourced from IGR-Redes de Transporte (exact for Lleida, 99.997% nationally
+#     against the CNIG GeoPackages). `id_pob` is not exposed and is left empty.
+CARTOCIUDAD_API_URL = "https://api-features.idee.es/collections/address/items"
+CARTOCIUDAD_API_PAGE_SIZE = 10000          # server-side maximum per page
+CARTOCIUDAD_API_WORKERS = 4
+# The API filters on the exact province name; it matches the CNIG listing names
+# except for these.
+CARTOCIUDAD_API_PROVINCE_NAMES = {
+    **CARTOCIUDAD_PROVINCE_NAMES,
+    "03": "Alacant/Alicante", "07": "Illes Balears", "12": "Castelló/Castellón",
+    "46": "València/Valencia",
+}
+_CARTOCIUDAD_PK_SOURCE_PREFIX = "IGR"
+_CARTOCIUDAD_PK_STREET_TYPES = {"CARRETERA", "AUTOVIA", "AUTOPISTA", "ITINERARIO EUROPEO"}
+# Every raw `tipo_vial` observed across the 52 CartoCiudad province GeoPackages.
+_CARTOCIUDAD_RAW_STREET_TYPES = frozenset({
+    'ACCESO', 'ACERA', 'AF', 'AGREGADO', 'AGRUPACION', 'AI', 'AJ', 'ALAMEDA', 'ALDAPA',
+    'ALDEA', 'ALDEA, ALAMEDA', 'ALQUERIA', 'ALTO', 'ANDADOR', 'AO', 'AP', 'APARTAMENTOS',
+    'ARBOLEDA', 'AREA', 'ARRABAL', 'ARROYO', 'AT', 'AUTOPISTA', 'AUTOVIA', 'AUZO',
+    'AVENGUDA', 'AVENIDA', 'AVENIDA / ETORBIDEA', 'AVINGUDA', 'BAISHADA', 'BAIXADA',
+    'BAJADA', 'BARRANC', 'BARRANCO', 'BARRANQUIL', 'BARREDUELA', 'BARRIADA', 'BARRIO',
+    'BELENA', 'BI', 'BIDE', 'BLOC', 'BLOQUE', 'BT', 'BU', 'BULEVAR', 'CALEXON', 'CALEYA',
+    'CALLE', 'CALLE / AUZOA', 'CALLE / BIDEA', 'CALLE / IBILBIDEA', 'CALLE / KALE',
+    'CALLE / KALEA', 'CALLE / KARRIKA', 'CALLE / POLIGONO', 'CALLEJA', 'CALLEJA / KALEXKA',
+    'CALLEJA / KARRIKA', 'CALLEJA, CALLEJON', 'CALLEJON', 'CALLEJUELA', 'CALLIZO',
+    'CALZADA', 'CAMINO', 'CAMPA', 'CAMPA, CAMPO', 'CAMPO', 'CANADA', 'CANAL', 'CANTON',
+    'CARRER', 'CARRERA', 'CARRERO', 'CARRETERA', 'CARRIL', 'CARRIL BICI', 'CASA', 'CASER',
+    'CASERIO', 'CAÑADA', 'CB', 'CC', 'CD', 'CE', 'CERRO', 'CHALET', 'CINTURON',
+    'CIRCUMVAL·LACIO', 'CIRCUNVALACION', 'CK', 'CLLJN', 'CLYON', 'COLEGIO, CIGARRAL',
+    'COLONIA', 'COMPLEJO', 'COMPLEX', 'CONCEJO, COLEGIO', 'CONJUNTO', 'CORDEL',
+    'CORREDERA', 'CORREDOIRA', 'CORREDOR', 'CORRIOL', 'CORTIJO', 'COSTA', 'COSTANILLA',
+    'CUESTA', 'CUESTA / ALDAPA', 'CUESTA / KALEA', 'CV', 'DA', 'DE LA', 'DE LES',
+    'DEMARCACION', 'DESCONOCIDO', 'DETRAS', 'DH', 'DI', 'DIPUTACION', 'DISEMINADO',
+    'DISEMINADOS', 'DISSEMINAT', 'DRECERA', 'EC', 'EDIFICIO', 'ENLACE', 'ENPARANTZA',
+    'ENTRADA', 'ENTRADA, ENSANCHE', 'ERA', 'ERREKA', 'ERREPIDE', 'ESCALERA', 'ESCALINATA',
+    'ESPALDA', 'ESTRADA', 'ET', 'ETORBIDEA', 'ETORBIDEA / AVENIDA', 'EXPLANADA',
+    'EXTRAMUROS', 'EXTRARRADIO', 'FABRICA', 'FERROCARRIL', 'FINCA', 'GALERIA', 'GENERICA',
+    'GJ', 'GLORIETA', 'GRAN RECORREGUT', 'GRAN VIA', 'GRUPO', 'HF', 'HG', 'HI', 'HUERTA',
+    'HUERTA, HUERTO', 'HUERTO', 'IBILBIDE', 'ID', 'ILLA', 'INGURUA', 'IT',
+    'ITINERARIO EUROPEO', 'JA', 'JARDIN', 'JARDINES', 'KA', 'KALEA', 'KARRIKA', 'KL', 'KS',
+    'KT', 'LA', 'LADERA', 'LADO, LADERA', 'LC', 'LF', 'LOMA', 'LT', 'LU', 'LUGAR',
+    'MALECON', 'MANZANA', 'MASIAS', 'MD', 'MENDI', 'MERCADO', 'MIRADOR', 'MO', 'MOLL',
+    'MONTE', 'MU', 'MUELLE', 'MUNICIPIO', 'MURALLA', 'NU', 'P', 'PAGO', 'PARAJE',
+    'PARAJE / BIDEA', 'PARAJE / INGURUA', 'PARAMO', 'PARATGE', 'PARQUE', 'PARQUE / PARKEA',
+    'PARTICULAR', 'PARTIDA', 'PAS', 'PASADIZO', 'PASAJE', 'PASAJE, PASADIZO', 'PASEO',
+    'PE', 'PINAR', 'PISTA', 'PLACETA', 'PLATJA', 'PLAYA', 'PLAZA', 'PLAZA / AUZOA',
+    'PLAZA / EMPARANTZA', 'PLAZA / ENPARANTZA', 'PLAZA / KALEA', 'PLAZA / KARRIKA',
+    'PLAZOLETA', 'PLAZUELA', 'PLAÇA', 'POBLADO', 'POLG', 'POLIGONO', 'PRACIÑA',
+    'PROLONGACION', 'PUENTE', 'PUENTE / BIDEA', 'PUERTO', 'PUERTO / KALEA',
+    'PUERTO, PORTILLO', 'PUJADA', 'PV', 'QA', 'QI', 'QJ', 'QL', 'QN', 'RACO', 'RAMAL',
+    'RAMBLA', 'RAMPA', 'RAVAL', 'RE', 'RENTO', 'RESIDENCIAL', 'RI', 'RIBERA',
+    'RIBERA / ETORBIDEA', 'RIERA', 'RINCON', 'RINCON, RINCONADA', 'RINCONADA', 'RN', 'RO',
+    'RONDA', 'ROTONDA', 'RUA', 'RUEIRO', 'RUELA', 'SALIDA', 'SECTOR', 'SENDA', 'SENDERO',
+    'SERVENTIA', 'SG', 'SOLAR', 'SUBIDA', 'TERRENOS', 'TORRENT', 'TORRENTE', 'TRANS',
+    'TRANSITO', 'TRANSVERSAL', 'TRASERA', 'TRAVESIA', 'TRAVESIA / ERREPIDEA',
+    'TRAVESIA / PLAZA', 'TRAVESIA / ZEHARKALEA', 'TRAVESSERA', 'TRAVESSIA', 'UN',
+    'URBANIZACION', 'VC', 'VECINDARIO', 'VEGA', 'VEINAT', 'VEREDA', 'VIA', 'VIADUCTO',
+    'VIAL', 'VO', 'ZEARKALETA', 'ZK', 'ZONA', 'ZU',
+})
+
+_CARTOCIUDAD_RAW_STREET_TYPES_BY_LENGTH = sorted(_CARTOCIUDAD_RAW_STREET_TYPES, key=len, reverse=True)
+
+
+def split_cartociudad_thoroughfare(thoroughfare):
+    """Split a CartoCiudad ``"<tipo_vial> <nombre_via>"`` string into its two parts.
+
+    Matches the longest known raw street type as a whole-word prefix; failing that,
+    takes the first word when it resolves to a street type (regional variants,
+    Catastro acronyms). Otherwise the whole string is the name.
+
+    Returns
+    -------
+    tuple[str | None, str | None]
+        ``(tipo_vial, nombre_via)``.
+    """
+    if thoroughfare is None or pd.isna(thoroughfare):
+        return None, None
+    s = " ".join(str(thoroughfare).split())
+    u = s.upper()
+    for street_type in _CARTOCIUDAD_RAW_STREET_TYPES_BY_LENGTH:
+        if u == street_type:
+            return street_type, None
+        if u.startswith(street_type + " "):
+            return street_type, s[len(street_type) + 1:]
+    first, _, rest = s.partition(" ")
+    if rest and _resolve_street_type_token(first.upper()) is not None:
+        return first.upper(), rest
+    return None, s or None
+
+
+def _uninvert_ine_name(name):
+    """INE lists articles last ("Roda, La", "Atzúbia, l'"); put them first, per part."""
+    parts = []
+    for part in str(name).split("/"):
+        m = re.match(r"^(.*), (\S+)$", part.strip())
+        if m:
+            part = m.group(2) + m.group(1) if m.group(2).endswith("'") else f"{m.group(2)} {m.group(1)}"
+        parts.append(part.strip())
+    return "/".join(parts)
+
+
+_INE_MUNICIPALITY_LOOKUP = None
+
+
+def _ine_municipality_lookup(timeout=60):
+    """Return ``{(province_code, normalised name): ine_code}`` from INE's dictionary.
+
+    Uses the most recent ``diccionarioYY.xlsx`` published by INE (cached per process).
+    """
+    global _INE_MUNICIPALITY_LOOKUP
+    if _INE_MUNICIPALITY_LOOKUP is None:
+        year = time.localtime().tm_year % 100
+        last_error = None
+        for yy in (year, year - 1, year - 2):
+            try:
+                r = requests.get(f"https://www.ine.es/daco/daco42/codmun/diccionario{yy:02d}.xlsx",
+                                 timeout=timeout)
+                r.raise_for_status()
+                df = pd.read_excel(io.BytesIO(r.content), header=1, dtype=str)
+                break
+            except Exception as e:
+                last_error = e
+        else:
+            raise RuntimeError(f"could not download the INE municipality dictionary: {last_error}")
+        cpro = df["CPRO"].str.zfill(2)
+        ine = cpro + df["CMUN"].str.zfill(3)
+        names = df["NOMBRE"].map(_uninvert_ine_name).map(_normalize_province_name)
+        _INE_MUNICIPALITY_LOOKUP = dict(zip(zip(cpro, names), ine))
+    return _INE_MUNICIPALITY_LOOKUP
+
+
+def _cartociudad_api_page(session, province_name, offset, timeout, max_retries):
+    params = {"f": "json", "limit": CARTOCIUDAD_API_PAGE_SIZE, "offset": offset,
+              "component_AdminUnitName_3": province_name}
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = session.get(CARTOCIUDAD_API_URL, params=params, timeout=timeout)
+            r.raise_for_status()
+            features = r.json()["features"]
+            break
+        except Exception:
+            if attempt == max_retries:
+                raise
+            time.sleep(min(2 ** attempt, 30))
+    rows = []
+    for f in features:
+        p = f["properties"]
+        lon, lat = f["geometry"]["coordinates"][:2]
+        rows.append((f["id"], p.get("component_ThoroughfareName"),
+                     p.get("locator_designator_addressNumber"),
+                     p.get("locator_designator_addressNumberExtension"),
+                     p.get("component_AddressAreaName"), p.get("component_PostalDescriptor"),
+                     p.get("component_AdminUnitName_4"), p.get("component_AdminUnitName_3"),
+                     p.get("component_AdminUnitName_2"), p.get("dataProvider"),
+                     p.get("beginLifespanVersion"), lon, lat))
+    return rows
+
+
+def cartociudad_api_downloader(gpkg_path, province_code, timeout=300, max_retries=4):
+    """Download one province of CartoCiudad addresses from the IDEE OGC API-Features.
+
+    Fallback for :func:`cartociudad_downloader` when the CNIG download center is
+    unreachable. Writes ``gpkg_path`` with a ``portalpk_publi`` layer in the
+    CNIG GeoPackage schema (see the module notes above for the field mapping).
+
+    Parameters
+    ----------
+    gpkg_path : str
+        Output GeoPackage path (``{cartociudad_dir}/{province_code}.gpkg``).
+    province_code : str
+        2-digit INE province code.
+    timeout : int, default 300
+        Per-page request timeout in seconds.
+    max_retries : int, default 4
+        Attempts per page before giving up.
+
+    Returns
+    -------
+    None
+    """
+    province_name = CARTOCIUDAD_API_PROVINCE_NAMES[province_code]
+    session = requests.Session()
+    session.headers.update({"User-Agent": CARTOCIUDAD_USER_AGENT})
+    r = session.get(CARTOCIUDAD_API_URL, timeout=timeout,
+                    params={"f": "json", "limit": 1, "component_AdminUnitName_3": province_name})
+    r.raise_for_status()
+    n = r.json().get("numberMatched") or 0
+    if n == 0:
+        raise RuntimeError(f"API-Features returned no addresses for province '{province_name}'")
+
+    offsets = range(0, n, CARTOCIUDAD_API_PAGE_SIZE)
+    rows = []
+    with ThreadPoolExecutor(max_workers=CARTOCIUDAD_API_WORKERS) as pool:
+        futures = [pool.submit(_cartociudad_api_page, session, province_name, o, timeout, max_retries)
+                   for o in offsets]
+        for fut in tqdm(as_completed(futures), total=len(futures),
+                        desc=f"CartoCiudad API-Features ({province_name})", leave=False):
+            rows.extend(fut.result())
+    if len(rows) != n:
+        raise RuntimeError(f"API-Features returned {len(rows)} of {n} addresses")
+
+    df = pd.DataFrame(rows, columns=[
+        "id_porpk", "thoroughfare", "numero", "extension", "poblacion", "cod_postal",
+        "municipio", "provincia", "comunidad_autonoma", "fuente_datos",
+        "fecha_modificacion", "lon", "lat"])
+    df = df.drop_duplicates("id_porpk")
+    df["id_porpk"] = df["id_porpk"].str.removeprefix("AD_ADDRESS_PPK_")
+    split = {t: split_cartociudad_thoroughfare(t) for t in df["thoroughfare"].dropna().unique()}
+    df["tipo_vial"] = df["thoroughfare"].map(lambda t: split.get(t, (None, None))[0])
+    df["nombre_via"] = df["thoroughfare"].map(lambda t: split.get(t, (None, None))[1])
+
+    lookup = _ine_municipality_lookup()
+    mun_to_ine = {m: lookup.get((province_code, _normalize_province_name(m)))
+                  for m in df["municipio"].dropna().unique()}
+    unmatched = sorted(m for m, code in mun_to_ine.items() if code is None)
+    if unmatched:
+        sys.stderr.write(
+            f"Warning: {len(unmatched)} CartoCiudad municipality name(s) in province {province_code} "
+            f"not found in the INE dictionary; their addresses get no INE code: {unmatched[:10]}\n")
+    df["ine_mun"] = df["municipio"].map(mun_to_ine)
+    is_pk = (df["fuente_datos"].fillna("").str.startswith(_CARTOCIUDAD_PK_SOURCE_PREFIX)
+             & df["tipo_vial"].isin(_CARTOCIUDAD_PK_STREET_TYPES))
+    df["tipo"] = is_pk.map({True: "PK", False: "Portal"})
+    df["id_pob"] = None
+
+    gdf = gpd.GeoDataFrame(
+        df[["id_porpk", "tipo", "tipo_vial", "nombre_via", "numero", "extension", "id_pob",
+            "poblacion", "cod_postal", "ine_mun", "municipio", "provincia",
+            "comunidad_autonoma", "fuente_datos", "fecha_modificacion"]],
+        geometry=gpd.points_from_xy(df["lon"], df["lat"]), crs="EPSG:4326")
+    part_path = os.path.splitext(gpkg_path)[0] + ".part.gpkg"
+    try:
+        gdf.to_file(part_path, layer=CARTOCIUDAD_ADDRESS_LAYER, driver="GPKG")
+        os.replace(part_path, gpkg_path)
+    finally:
+        if os.path.exists(part_path):
+            os.remove(part_path)
 
 
 def read_dataspace_credentials(client_name="hypercadaster_ES", filepath=os.path.expanduser("~/.dataspaces")):
@@ -985,8 +1267,8 @@ catstruct[11] = [
     [313, 7, 'N', 'superficie_construida_sobre_rasante',pl.Float32],
     [320, 7, 'N', 'superficie_construida_bajo_rasante',pl.Float32],
     [327, 7, 'N', 'superficie_cubierta',pl.Float32],
-    [334, 9, 'N', 'coordenada_x_por_cien',pl.Float32],
-    [343, 10, 'N', 'coordenada_y_por_cien',pl.Float32],
+    [334, 9, 'N', 'coordenada_x_por_cien',pl.Float64],  # Float32 would round y (~4.6e8 cm) to ~0.3 m
+    [343, 10, 'N', 'coordenada_y_por_cien',pl.Float64],
     [582, 20, 'X', 'referencia_catastral_bice',pl.Utf8],
     [602, 65, 'X', 'denominacion_bice',pl.Utf8],
     [667, 10, 'X', 'codigo_epsg',pl.Utf8]
@@ -1965,6 +2247,7 @@ street_type_names = {
     "CO": "COLONIA",
     "CN": "CONJUNTO",
     "CT": "CUESTA",
+    "DS": "DISEMINADO",
     "ED": "EDIFICIO",
     "EN": "ENTRADA",
     "ES": "ESCALINATA",
@@ -2274,7 +2557,8 @@ catstruct[90] = [
 ]
 
 
-def parse_CAT_file(cadaster_code, CAT_files_dir, allowed_dataset_types = [14, 15]):
+def parse_CAT_file(cadaster_code, CAT_files_dir, allowed_dataset_types = [14, 15], cat_kind="U",
+                   wait_timeout=30):
     """Parse a Spanish cadastral CAT (alphanumeric) file into per-type tables.
 
     CAT files are fixed-width records keyed by a 2-digit record type. This reads
@@ -2291,12 +2575,24 @@ def parse_CAT_file(cadaster_code, CAT_files_dir, allowed_dataset_types = [14, 15
         Directory containing the raw CAT file and receiving the Parquet outputs.
     allowed_dataset_types : list[int], default [14, 15]
         Record types to extract.
+    cat_kind : {"U", "R"}, default "U"
+        Urban (``{province}_U_*_CAT``) or rural (``{province}_R_*_CAT``) CAT
+        file. Rural tables are cached as ``{code}_R_{type}.parquet``; urban
+        ones keep the historical ``{code}_{type}.parquet`` names.
+    wait_timeout : float, default 30
+        Seconds to wait (re-listing the directory) for a missing CAT file to be
+        uploaded. 0 returns None straight away.
 
     Returns
     -------
-    None
-        Parsed tables are written to Parquet under ``CAT_files_dir``.
+    dict[int, polars.DataFrame] or None
+        One table per record type (also cached as Parquet under
+        ``CAT_files_dir/parquet``), or None when no CAT file is found.
     """
+    # Parquet cache name: rural tables get their own prefix so they never
+    # collide with the urban cache of the same municipality.
+    cache_prefix = cadaster_code if cat_kind == "U" else f"{cadaster_code}_{cat_kind}"
+
     # Function to parse a single line into a dictionary for each record type
     def process_line(line, allowed_dataset_types):
         # Skip empty lines or lines with only whitespace
@@ -2359,12 +2655,12 @@ def parse_CAT_file(cadaster_code, CAT_files_dir, allowed_dataset_types = [14, 15
         elif isinstance(allowed_dataset_types, list):
             allowed_dataset_types = [int(dt) for dt in allowed_dataset_types]
 
-        if all(os.path.exists(f"{CAT_files_dir}/parquet/{cadaster_code}_{dataset_type}.parquet")
+        if all(os.path.exists(f"{CAT_files_dir}/parquet/{cache_prefix}_{dataset_type}.parquet")
                for dataset_type in allowed_dataset_types):
             combined_dfs = {k: None for k in catstruct.keys()}
             for dataset_type in allowed_dataset_types:
                 combined_dfs[dataset_type] = pl.read_parquet(
-                    f"{CAT_files_dir}/parquet/{cadaster_code}_{dataset_type}.parquet"
+                    f"{CAT_files_dir}/parquet/{cache_prefix}_{dataset_type}.parquet"
                 )
             return combined_dfs
 
@@ -2399,13 +2695,19 @@ def parse_CAT_file(cadaster_code, CAT_files_dir, allowed_dataset_types = [14, 15
         # Save each DataFrame to Parquet
         for dataset_type, df in combined_dfs.items():
             if len(df) > 1:
-                output_path = f"{CAT_files_dir}/parquet/{cadaster_code}_{dataset_type}.parquet"
+                output_path = f"{CAT_files_dir}/parquet/{cache_prefix}_{dataset_type}.parquet"
                 df.write_parquet(output_path)
 
         return combined_dfs
 
 
     def get_CAT_file_path(CAT_files_dir, cadaster_code, timeout=30):
+        def is_kind(fname):
+            # 08001U_23012026.CAT(.gz): the letter after the code is U or R.
+            # Unlabelled plain .CAT files count as urban, as before.
+            k = fname[len(cadaster_code):len(cadaster_code) + 1]
+            return k == cat_kind or (cat_kind == "U" and k not in ("U", "R"))
+
         def sort_key(path):
             # Strip .CAT.gz or .CAT extension to get base like "08001U_23012026"
             base = os.path.basename(path)
@@ -2422,7 +2724,8 @@ def parse_CAT_file(cadaster_code, CAT_files_dir, allowed_dataset_types = [14, 15
         start_time = time.time()
         province_code = cadaster_code[:2]
 
-        while CAT_file is None and task_time < timeout:
+        # Always look once; only then wait (timeout > 0) for an upload.
+        while CAT_file is None and (timeout <= 0 or task_time < timeout):
             try:
                 all_entries = os.listdir(CAT_files_dir)
 
@@ -2431,22 +2734,25 @@ def parse_CAT_file(cadaster_code, CAT_files_dir, allowed_dataset_types = [14, 15
                 for entry in all_entries:
                     entry_path = os.path.join(CAT_files_dir, entry)
                     if (os.path.isdir(entry_path)
-                            and entry.startswith(f"{province_code}_U_")
+                            and entry.startswith(f"{province_code}_{cat_kind}_")
                             and entry.endswith("_CAT")):
                         for fname in os.listdir(entry_path):
-                            if fname.startswith(cadaster_code) and fname.endswith('.CAT.gz'):
+                            if (fname.startswith(cadaster_code) and fname.endswith('.CAT.gz')
+                                    and is_kind(fname)):
                                 CAT_files.append(os.path.join(entry_path, fname))
 
                 # Fall back to plain .CAT files directly in CAT_files_dir
                 if not CAT_files:
                     for fname in all_entries:
-                        if fname.startswith(cadaster_code) and fname.endswith('.CAT'):
+                        if fname.startswith(cadaster_code) and fname.endswith('.CAT') and is_kind(fname):
                             CAT_files.append(os.path.join(CAT_files_dir, fname))
 
                 if CAT_files:
                     CAT_files.sort(key=sort_key, reverse=True)
                     return CAT_files[0]
                 else:
+                    if timeout <= 0:
+                        break
                     if not message_displayed:
                         sys.stderr.write(
                             f"\nPlease, upload the CAT file in {CAT_files_dir} for municipality {cadaster_code} (cadaster code). "
@@ -2467,7 +2773,7 @@ def parse_CAT_file(cadaster_code, CAT_files_dir, allowed_dataset_types = [14, 15
     os.makedirs(f"{CAT_files_dir}", exist_ok=True)
     os.makedirs(f"{CAT_files_dir}/parquet", exist_ok=True)
 
-    inputfile = get_CAT_file_path(CAT_files_dir, cadaster_code)
+    inputfile = get_CAT_file_path(CAT_files_dir, cadaster_code, timeout=wait_timeout)
 
     if inputfile is not None:
         combined_dfs = process_file_in_chunks(inputfile, CAT_files_dir, cadaster_code, allowed_dataset_types)

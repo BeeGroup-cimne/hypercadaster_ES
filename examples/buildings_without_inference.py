@@ -29,9 +29,9 @@ wd = "/mnt/data2/hypercadaster_ES"
 
 # Configuration parameters for merge operation
 # These are explicitly defined for clarity and potential modification
-output_filename = f"{wd}/lleida_province.pkl"
-province_codes = "25"
-cadaster_codes = None              # Not any specific municipality through their cadaster codes
+output_filename = f"{wd}/cubells.pkl"
+province_codes = None
+cadaster_codes = ["25095"]              # Not any specific municipality through their cadaster codes
 ine_codes = None                   # Not any specific municipality through their INE codes
 neighborhood_layer = False         # Barcelona-only; must be False elsewhere
 postal_code_layer = True           # Include postal code boundaries

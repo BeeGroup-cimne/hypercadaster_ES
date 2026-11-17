@@ -680,11 +680,16 @@ def join_social_ES(gdf, wd, n_years=5, datasets=None, use_CAT_files=False,
             sys.stderr.write(f"social_ES: atlas failed ({e}); skipping\n")
 
     # --- Population census (census tract) ---
+    ec_population = None
     if "population" in run_simple:
         try:
             log("PopulationCensus ...")
             source = INE.PopulationCensus(wd, municipality_code=muni_list)
             pop = source["Census tracts"]
+            if include_ec:
+                # Kept for the essential-characteristics downscaling, which would
+                # otherwise read the whole census again (it filters to 2021 itself).
+                ec_population = pop.copy()
             shares = _population_shares(pop)
             release(source, pop)
             share_map = {c: c for c in shares.columns if c not in ("Year", "_key")}
@@ -815,13 +820,55 @@ def join_social_ES(gdf, wd, n_years=5, datasets=None, use_CAT_files=False,
     # --- Essential Characteristics per-building downscaling (needs CAT br__*) ---
     if include_ec:
         gdf = join_essential_characteristics(gdf, wd, ec_variables=ec_variables,
-                                             verbose=verbose)
+                                             verbose=verbose, population=ec_population)
+        release(ec_population)
 
     return gdf
 
 
+@contextlib.contextmanager
+def _scoped_ec_sources(INE, municipality_codes, population=None):
+    """Scope the census reads ``EssentialCharacteristicsOfPopulationAndHouseholds``
+    makes internally to the municipalities being enriched.
+
+    ``social_ES`` calls ``PopulationCensus(wd=wd)`` and
+    ``HouseholdIncomeDistributionAtlas(wd=wd)`` for the whole of Spain and only
+    then inner-joins them onto the building frame, so everything outside its
+    municipalities is discarded. Unscoped, that re-scrapes the INE population
+    metadata pages and re-reads all 52 provincial files a second time after
+    :func:`join_social_ES` already did, and estimates the income/nationality
+    distribution row by row for every census tract in Spain.
+
+    ``population`` is the ``"Census tracts"`` table :func:`join_social_ES`
+    already fetched for these municipalities; when given it is served as is.
+    Both functions are module globals of ``social_ES.INE``, resolved at call time,
+    so swapping them for the duration of the call is enough.
+    """
+    original_population = INE.PopulationCensus
+    original_atlas = INE.HouseholdIncomeDistributionAtlas
+
+    def population_census(wd, municipality_code=None, years=None):
+        if population is not None and municipality_code is None and years is None:
+            return {"Census tracts": population.copy()}
+        return original_population(
+            wd, municipality_code=municipality_code or municipality_codes, years=years)
+
+    def atlas(wd, municipality_code=None, years=None):
+        return original_atlas(
+            wd, municipality_code=municipality_code or municipality_codes, years=years)
+
+    INE.PopulationCensus = population_census
+    INE.HouseholdIncomeDistributionAtlas = atlas
+    try:
+        yield
+    finally:
+        INE.PopulationCensus = original_population
+        INE.HouseholdIncomeDistributionAtlas = original_atlas
+
+
 def join_essential_characteristics(gdf, wd, prefix=EC_PREFIX,
-                                   ec_variables=EC_SELECTED_VARIABLES, verbose=True):
+                                   ec_variables=EC_SELECTED_VARIABLES, verbose=True,
+                                   population=None):
     """Downscale the INE *Essential Characteristics of Population and Households*
     survey to the building level and join it onto ``gdf``.
 
@@ -867,6 +914,10 @@ def join_essential_characteristics(gdf, wd, prefix=EC_PREFIX,
         a column left of the ``~``). ``None`` keeps every variable.
     verbose : bool, default True
         Emit progress to stderr.
+    population : pandas.DataFrame, optional
+        The ``PopulationCensus`` ``"Census tracts"`` table already fetched for
+        ``gdf``'s municipalities, reused instead of reading the census again;
+        see :func:`_scoped_ec_sources`.
 
     Returns
     -------
@@ -910,8 +961,11 @@ def join_essential_characteristics(gdf, wd, prefix=EC_PREFIX,
         # kind in a census tract) yield 0/0 -> NaN and numpy floods stderr with
         # "invalid value encountered in divide" RuntimeWarnings. The NaN is the
         # intended result, so silence just that noise around the call.
+        muni_list = sorted(m for m in work["census_tract_code"].astype(str)
+                           .str.strip().str[:5].unique() if m)
         with np.errstate(divide="ignore", invalid="ignore"), \
-                warnings.catch_warnings():
+                warnings.catch_warnings(), \
+                _scoped_ec_sources(INE, muni_list, population):
             warnings.filterwarnings(
                 "ignore", category=RuntimeWarning,
                 message="invalid value encountered in divide")

@@ -25,11 +25,14 @@ hypercadaster_es.egg-info/requires.txt
 hypercadaster_es.egg-info/top_level.txt
 tests/test_aggregation.py
 tests/test_agricultural_archetype.py
+tests/test_cartociudad_api.py
+tests/test_cat_address.py
 tests/test_cat_cache.py
 tests/test_cat_empty_schema.py
 tests/test_census_tract_aggregations.py
 tests/test_code_normalisation.py
 tests/test_codes.py
+tests/test_db_layer.py
 tests/test_dem_tiles.py
 tests/test_energy_config.py
 tests/test_energy_scenarios.py

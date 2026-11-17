@@ -167,8 +167,10 @@ Visit the [Spanish Cadastral Service](https://www.sedecatastro.gob.es/Accesos/SE
 
 1. Click "Descarga de información alfanumérica por provincia (formato CAT)"
 2. Select your province of interest
-3. Download the provincial CAT files
-4. Extract to `CAT_files/` directory in your working directory
+3. Download the provincial CAT files: urban (`U`) and, for the rural address
+   fallback, rural (`R`)
+4. Extract them under `{wd}/{CAT_files_rel_dir}` (default `CAT_files/`), one
+   folder per province and kind, as the portal names them
 
 #### CAT File Directory Structure
 
@@ -176,11 +178,19 @@ Visit the [Spanish Cadastral Service](https://www.sedecatastro.gob.es/Accesos/SE
 data_directory/
 ├── cadaster/
 ├── CAT_files/
-│   ├── 08279U_17012025.zip
-│   ├── 08900U_17012025.zip
-│   └── ...
+│   ├── 25_U_14082026_CAT/
+│   │   ├── 25001U_14082026.CAT.gz
+│   │   └── ...
+│   ├── 25_R_14082026_CAT/         # rural: only used for addresses
+│   │   ├── 25001R_14082026.CAT.gz
+│   │   └── ...
+│   └── parquet/                   # parsed-record cache, created automatically
 └── ...
 ```
+
+Loose `{code}U_{date}.CAT` files directly under `CAT_files/` are found as well.
+Without the rural folder the merge still runs; rural buildings without a
+CartoCiudad or INSPIRE address are then left address-less.
 
 #### Using CAT Files
 

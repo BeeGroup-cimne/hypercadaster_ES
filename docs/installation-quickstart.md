@@ -57,6 +57,10 @@ gdf.to_parquet("./data/barcelona_data.parquet")  # or to_pickle with compression
 3. **Persists** the result to a DuckDB database (`./data/results/building_results.duckdb`)
 4. **Returns** a GeoDataFrame for immediate use (or save it for later)
 
+> **DuckDB versions.** Both duckdb 1.5 and 2.x are supported. duckdb 1.5 cannot
+> open a database file written by duckdb 2.x, so after upgrading, don't downgrade
+> against the same `building_results.duckdb` (or shard cache).
+
 ### Accessing Results via DuckDB
 
 Instead of (or in addition to) saving the GeoDataFrame, you can query the persistent DuckDB directly:

@@ -60,6 +60,11 @@ aligned to the same order (the *i*-th entry of each list describes the parcel's
 *i*-th address). The raw `street_type` / `street_name` / `street_number_*` columns
 are collapsed into the combined `postal_addresses_*` label lists below.
 
+Buildings with no CartoCiudad address are kept, with a cadastral address when
+there is one (see `address_source` below and the fallback in
+[Data Sources & Coverage](data-sources-coverage.md)), or with null address
+columns and the parcel centroid as location.
+
 **Street-type normalisation.** CartoCiudad's `tipo_vial` is inconsistent (regional
 languages, bilingual `SPANISH / REGIONAL` forms, `X, Y` descriptors, abbreviations,
 typos). It is normalised to the canonical Catastro full name via
@@ -77,8 +82,8 @@ short codes become `None`. The full mapping (with per-province provenance) is in
 | `postal_code` | List[String] | Postal code of each address (from CartoCiudad `cod_postal`; boundary-polygon fallback) |
 | `population_entity` | List[String] | Population entity / hamlet / estate name (`poblacion`) per address |
 | `postal_addresses_location` | List[Point] | Address point coordinates (see Geometric Information) |
-| `postal_address_specification` | String | Address type (always "Portal" for CartoCiudad) |
-| `address_source` | String | Origin of the address data (`fuente_datos`) |
+| `postal_address_specification` | String | Address type ("Portal" for CartoCiudad; the INSPIRE specification for "Catastro INSPIRE"; "Parcel" for "Catastro CAT") |
+| `address_source` | String | Origin of the address: CartoCiudad's `fuente_datos`, or `"Catastro INSPIRE"` / `"Catastro CAT"` for the cadastral fallback |
 | `address_last_modification` | Datetime | Source last-modification timestamp (`fecha_modificacion`) |
 
 ## 🗺️ Administrative Geography & Context

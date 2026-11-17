@@ -752,10 +752,11 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
         try:
             def _aux_present(tbl):
                 try:
-                    return _aux_con.execute(
+                    return _db_mod_aux.fetch_first(
+                        _aux_con,
                         f'SELECT 1 FROM "main"."{tbl}" '
                         f'WHERE cadaster_code = ? LIMIT 1', [code],
-                    ).fetchone() is not None
+                    ) is not None
                 except Exception:
                     return False
 
@@ -1204,10 +1205,11 @@ def process_building_parts(code, building_part_gdf_, buildings_CAT, parcels_gdf,
         if cleanup_shards:
           with utils.stage_timer("post-KPI: cleanup aggregated shards"):
             try:
-                has_central_data = central_con.execute(
+                has_central_data = _db_mod.fetch_first(
+                    central_con,
                     'SELECT 1 FROM "main"."sbr_results" '
                     'WHERE cadaster_code = ? LIMIT 1', [code],
-                ).fetchone() is not None
+                ) is not None
             except Exception:
                 has_central_data = False
 

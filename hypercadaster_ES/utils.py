@@ -31,9 +31,8 @@ from shapely.geometry import (box, Polygon, Point, LineString, MultiPolygon, Mul
 from shapely.errors import GEOSException
 from shapely.geometry import mapping
 from shapely.geometry.base import BaseGeometry
-from fastkml import kml
 import osmnx as ox
-import fiona
+import pyogrio
 
 # Network and graph libraries
 import networkx as nx
@@ -514,80 +513,6 @@ def get_administrative_divisions_naming(cadaster_codes):
     municipalities = municipalities[municipalities['cadaster_code'].apply(lambda x: x in cadaster_codes)]
 
     return municipalities
-
-def kml_to_geojson(kml_url):
-    """Download a KML file and convert its placemarks to a GeoJSON string.
-
-    Handles Polygon and MultiPolygon geometries and copies each placemark's
-    extended-data attributes into the feature ``properties``.
-
-    Parameters
-    ----------
-    kml_url : str
-        URL of the KML resource.
-
-    Returns
-    -------
-    str
-        A serialised GeoJSON ``FeatureCollection``.
-    """
-    r = requests.get(kml_url)
-    r.raise_for_status()
-
-    kml_bytes = r.content
-
-    k = kml.KML()
-    k = k.from_string(kml_bytes)
-
-    features = []
-
-    for doc in k.features:
-        for feature in doc.features:
-            for placemark in feature.features:
-
-                properties = {}
-
-                if placemark.extended_data:
-                    for element in placemark.extended_data.elements:
-                        if hasattr(element, "data"):
-                            for sd in element.data:
-                                name = getattr(sd, "name", None) or sd.get("name")
-                                value = getattr(sd, "value", None) or sd.get("value")
-                                if name is not None:
-                                    properties[name] = value
-
-                coordinates = []
-
-                if hasattr(placemark, 'geometry') and placemark.geometry:
-
-                    geom = placemark.geometry
-
-                    if geom.geom_type == "MultiPolygon":
-                        for polygon in geom.geoms:
-                            outer = polygon.exterior.coords
-                            coordinates.append([[list(pt)[:2] for pt in outer]])
-
-                    elif geom.geom_type == "Polygon":
-                        outer = geom.exterior.coords
-                        coordinates.append([list(pt)[:2] for pt in outer])
-
-                feature_json = {
-                    "type": "Feature",
-                    "properties": properties,
-                    "geometry": {
-                        "type": placemark.geometry.geom_type if coordinates else None,
-                        "coordinates": coordinates if coordinates else None
-                    }
-                }
-
-                features.append(feature_json)
-
-    feature_collection = {
-        "type": "FeatureCollection",
-        "features": features
-    }
-
-    return json.dumps(feature_collection)
 
 # ==========================================
 # FILE OPERATIONS
@@ -2551,7 +2476,7 @@ def get_streets_open_street_maps(open_street_dir, ine_code=None, cadaster_code=N
         
         try:
             # Check what layers exist in the file
-            available_layers = fiona.listlayers(fn)
+            available_layers = list(pyogrio.list_layers(fn)[:, 0])
             
             # Try to use the clean layer name first
             if clean_layer_name in available_layers:

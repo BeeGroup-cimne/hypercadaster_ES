@@ -49,7 +49,10 @@ The public API is what `import hypercadaster_ES as hc` exposes (see
 
   Addresses (from CartoCiudad) are always compacted to one row per parcel, with
   the per-address columns collapsed into aligned lists; street types are
-  normalised to canonical Catastro names.
+  normalised to canonical Catastro names. Buildings with no CartoCiudad address
+  fall back to the cadastral INSPIRE address (`mergers.get_cadaster_address`),
+  then to the CAT parcel record (`mergers.get_CAT_address`, urban and rural CAT
+  files), and are kept address-less otherwise.
 
 ## 🔗 mergers.py — integration & aggregation
 
@@ -176,7 +179,9 @@ are cached once under `{wd}/INE/…`.
   verbatim** and only the `ec__` prefix is added. By default only
   `EC_SELECTED_VARIABLES` (27 of the ~70) is kept — what the `so__` layer and the
   cadaster do not already carry; `ec_variables=None` keeps all of them. The survey
-  is published only for larger municipalities.
+  is published only for larger municipalities. The census and income-atlas reads
+  `social_ES` makes internally are scoped to the enriched municipalities, and
+  `population=` reuses the table `join_social_ES` already fetched.
 - **`time_use_household_occupancy(wd, census_tract_code)`** — a census tract's
   weekly household occupancy agenda from the INE Time Use Survey
   (`social_ES.INE.TimeUseSurvey` → `WeeklyScheduleHouseholdOccupancy`): the 168

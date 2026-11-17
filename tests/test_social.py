@@ -336,3 +336,38 @@ def test_ctagg_prefix_and_coverage_threshold():
     assert mergers.CTAGG_PREFIX == "ctagg__"
     # A frame must hold most of a tract before its density is published.
     assert 0.0 < mergers.CTAGG_MIN_COVERAGE <= 1.0
+
+
+def test_scoped_ec_sources_reuses_population_and_scopes_atlas():
+    # EssentialCharacteristics calls PopulationCensus(wd=wd) and
+    # HouseholdIncomeDistributionAtlas(wd=wd) for the whole of Spain; inside the
+    # scope the first serves the table join_social_ES already fetched and the
+    # second is restricted to the enriched municipalities.
+    import types
+    calls = []
+
+    def population_census(wd, municipality_code=None, years=None):
+        calls.append(("population", municipality_code))
+        return {"Census tracts": pd.DataFrame({"Year": [2021]})}
+
+    def atlas(wd, municipality_code=None, years=None):
+        calls.append(("atlas", municipality_code))
+        return {"Census tracts": pd.DataFrame()}
+
+    INE = types.SimpleNamespace(PopulationCensus=population_census,
+                                HouseholdIncomeDistributionAtlas=atlas)
+    fetched = pd.DataFrame({"Year": [2021, 2020], "Population": [10, 9]})
+
+    with social._scoped_ec_sources(INE, ["08019"], fetched):
+        served = INE.PopulationCensus(wd="wd")["Census tracts"]
+        INE.HouseholdIncomeDistributionAtlas(wd="wd")
+    assert served.equals(fetched) and served is not fetched
+    assert calls == [("atlas", ["08019"])]
+    # Restored on exit.
+    assert INE.PopulationCensus is population_census
+    assert INE.HouseholdIncomeDistributionAtlas is atlas
+
+    # Without a pre-fetched table the census is read, scoped to the municipalities.
+    with social._scoped_ec_sources(INE, ["08019"]):
+        INE.PopulationCensus(wd="wd")
+    assert calls[-1] == ("population", ["08019"])

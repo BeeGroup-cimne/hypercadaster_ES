@@ -4,7 +4,7 @@ A comprehensive Python library for downloading, processing, and analyzing Spanis
 
 [![Python Version](https://img.shields.io/badge/python-3.12+-blue.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-EUPL%20v1.2-blue.svg)](https://joinup.ec.europa.eu/collection/eupl/eupl-text-eupl-12)
-[![Version](https://img.shields.io/badge/version-1.3.2-green.svg)](https://github.com/BeeGroup-cimne/hypercadaster_ES)
+[![Version](https://img.shields.io/badge/version-1.4.0-green.svg)](https://github.com/BeeGroup-cimne/hypercadaster_ES)
 
 ## 🎯 Overview
 
@@ -114,6 +114,8 @@ For detailed installation instructions and advanced examples, see [Installation 
 
 **Co-authors:**
 - **David Blanco** - dblanco@cimne.upc.edu
+- **Kerin Cardona** - kcardona@cimne.upc.edu
+- **Jordi Cipriano** - cipriano@cimne.upc.edu
 - **Gerard Laguna** - glaguna@cimne.upc.edu
 - **Nadiya Mehraj** - nmehraj@cimne.upc.edu
 
@@ -129,4 +131,4 @@ This project is licensed under the **EUPL v1.2**. See the [license](https://join
 
 *hypercadaster_ES - Built with ❤️ for the Spanish urban analysis and building research community*
 
-*Last updated: November 2026 | Version 1.3.2*
+*Last updated: November 2026 | Version 1.4.0*

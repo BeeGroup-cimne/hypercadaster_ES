@@ -67,11 +67,12 @@ def _extract_street_type_and_name(street_full_name):
         return None, None
 
 # ============================ DEPRECATED ============================
-# The address sources below (INSPIRE Address feed via get_cadaster_address,
-# Barcelona open-data carrerer via _process_barcelona_open_data /
-# process_open_data_addresses) are superseded by CartoCiudad. See
-# get_cartociudad_address / _assign_points_to_parcels below. Kept commented
-# for reference; the originals also remain in git history.
+# The address sources below (Barcelona open-data carrerer via
+# _process_barcelona_open_data / process_open_data_addresses) are superseded
+# by CartoCiudad. See get_cartociudad_address / _assign_points_to_parcels
+# below. Kept commented for reference; the originals also remain in git
+# history. The INSPIRE Address feed lives on, slimmed down, as
+# get_cadaster_address: a fallback for buildings CartoCiudad does not cover.
 # ===================================================================
 # def _process_barcelona_open_data(
 #     open_data_layers_dir,
@@ -305,163 +306,206 @@ def _extract_street_type_and_name(street_full_name):
 #         return gpd.GeoDataFrame(result, geometry='location', crs=target_crs)
 #     else:
 #         return gpd.GeoDataFrame()
-#
-# def get_cadaster_address(cadaster_dir, cadaster_codes, directions_from_CAT_files=True, CAT_files_dir="CAT_files",
-#                          directions_from_open_data=True, open_data_layers_dir="open_data"):
-#     """Read and assemble cadastral address points for the given municipalities.
-#
-#     Loads the INSPIRE Address GML per municipality, parses street type/name/number
-#     and the geolocated address point, and optionally enriches street naming from
-#     CAT files and/or Barcelona open data.
-#
-#     Parameters
-#     ----------
-#     cadaster_dir : str
-#         Root of the downloaded cadastral layers.
-#     cadaster_codes : list[str]
-#         Cadastral municipality codes to read.
-#     directions_from_CAT_files : bool, default True
-#         Also derive street names from CAT files in ``CAT_files_dir``.
-#     CAT_files_dir : str, default "CAT_files"
-#         CAT files directory (used when ``directions_from_CAT_files``).
-#     directions_from_open_data : bool, default True
-#         Also derive street names from Barcelona open data.
-#     open_data_layers_dir : str, default "open_data"
-#         Barcelona open-data directory (used when ``directions_from_open_data``).
-#
-#     Returns
-#     -------
-#     geopandas.GeoDataFrame
-#         One row per address with geometry ``address_location``.
-#     """
-#     sys.stderr.write(f"\nReading the cadaster addresses for {len(cadaster_codes)} municipalities\n")
-#
-#     address_gdf = gpd.GeoDataFrame()
-#     address_street_names_df = gpd.GeoDataFrame()
-#
-#     for code in tqdm(cadaster_codes, desc="Iterating by cadaster codes...") if len(cadaster_codes)>1 else cadaster_codes:
-#         # sys.stderr.write("\r" + " " * 60)
-#         # sys.stderr.flush()
-#         # sys.stderr.write(f"\r\tCadaster code: {code}")
-#         # sys.stderr.flush()
-#
-#         address_gdf_ = gpd.read_file(f"{cadaster_dir}/address/unzip/A.ES.SDGC.AD.{code}.gml", layer="Address")
-#         address_gdf_['cadaster_code'] = code
-#
-#         if not address_gdf.empty:
-#             if address_gdf_.crs != address_gdf.crs:
-#                 address_gdf_ = address_gdf_.to_crs(address_gdf.crs)
-#             address_gdf = gpd.GeoDataFrame(pd.concat([address_gdf, address_gdf_], ignore_index=True))
-#         else:
-#             address_gdf = address_gdf_
-#
-#         address_street_names_df_ = gpd.read_file(f"{cadaster_dir}/address/unzip/A.ES.SDGC.AD.{code}.gml",
-#                                                  layer="ThoroughfareName")
-#
-#         if not address_street_names_df.empty:
-#             address_street_names_df = pd.concat([address_street_names_df, address_street_names_df_],
-#                                                 ignore_index=True)
-#         else:
-#             address_street_names_df = address_street_names_df_
-#
-#     sys.stderr.write("\r" + " " * 60)
-#
-#     address_street_names_df = address_street_names_df[['gml_id', 'text']].copy()
-#     address_street_names_df["gml_id"] = address_street_names_df['gml_id'].apply(lambda x: x.split('ES.SDGC.TN.')[1])
-#     address_gdf["gml_id"] = address_gdf['gml_id'].apply(lambda x: '.'.join(x.split('ES.SDGC.AD.')[1].split('.')[:3]))
-#
-#     gdf = pd.merge(address_gdf, address_street_names_df, left_on="gml_id", right_on="gml_id")
-#
-#     gdf.rename(columns={'geometry': 'location', 'text': 'street_name', 'designator': 'street_number'}, inplace=True)
-#     gdf["street_type"] = gdf["street_name"].apply(lambda x: x.split(" ")[0])
-#     gdf["street_name"] = gdf["street_name"].apply(lambda x: ' '.join(x.split(" ")[1:]))
-#     gdf["street_number_label"], gdf["street_number_clean"] = utils.normalize_street_number(
-#         gdf["street_number"]
-#     )
-#     # gdf = gdf[gdf['specification'] == "Entrance"]
-#     gdf["building_reference"] = gdf['localId'].apply(lambda x: x.split('.')[-1])
-#
-#     gdf.drop(
-#         ["gml_id", "namespace", "localId", "beginLifespanVersion", "validFrom", "level", "type", "method", "default"],
-#         inplace=True, axis=1)
-#     gdf = gdf.set_geometry("location")
-#     gdf = gdf.drop(columns=["street_number"], errors="ignore")
-#     _, parcels_gdf = join_cadaster_parcel(gdf, cadaster_dir, cadaster_codes, how="left")
-#
-#     if directions_from_CAT_files:
-#         addresses_CAT = pd.DataFrame()
-#
-#         for code in cadaster_codes:
-#             # Parse CAT file, if available
-#             buildings_CAT = building_inference.parse_horizontal_division_buildings_CAT_files(code, CAT_files_dir)
-#             if buildings_CAT is None:
-#                 continue
-#             addresses_CAT_ = (pl.concat([
-#                 buildings_CAT[["building_reference", "street_type", "street_name", "street_number1"]].rename(
-#                     {"street_number1": "street_number"}),
-#                 buildings_CAT[["building_reference", "street_type", "street_name", "street_number2"]].rename(
-#                     {"street_number2": "street_number"}).filter(pl.col("street_number") != "")], how="vertical")
-#             ).to_pandas()
-#             addresses_CAT_["street_number_label"], addresses_CAT_["street_number_clean"] = utils.normalize_street_number(
-#                 addresses_CAT_["street_number"]
-#             )
-#             # Tag THIS municipality's chunk before concatenating. Assigning to
-#             # the accumulated frame instead would overwrite cadaster_code for
-#             # every previously-added municipality with the current code, so all
-#             # CAT addresses province-wide would end up labelled with the last
-#             # processed code (mislabelling entire municipalities downstream).
-#             addresses_CAT_['cadaster_code'] = code
-#             addresses_CAT = pd.concat([addresses_CAT, addresses_CAT_], ignore_index=True)
-#
-#         def calculate_centroid(group):
-#             valid_points = [pt for pt in group["location"] if isinstance(pt, Point)]
-#
-#             if not valid_points:
-#                 return pd.Series({"location": None})
-#
-#             x_coords = [pt.x for pt in valid_points]
-#             y_coords = [pt.y for pt in valid_points]
-#
-#             centroid = Point(np.mean(x_coords), np.mean(y_coords))
-#
-#             return pd.Series({"location": centroid})
-#
-#         if not addresses_CAT.empty:
-#             addresses_CAT = addresses_CAT.merge(
-#                     gdf[["building_reference", "location"]].
-#                     groupby(["building_reference"]).
-#                     apply(calculate_centroid,include_groups=False).reset_index(),
-#                 on="building_reference", how="left")
-#             if sum(addresses_CAT['location'].isna())>0:
-#                 for code in addresses_CAT.cadaster_code[addresses_CAT['location'].isna()].unique():
-#                     buildings = gpd.read_file(f"{cadaster_dir}/buildings/unzip/A.ES.SDGC.BU.{code}.building.gml", layer="Building")
-#                     for idx in addresses_CAT.index[(addresses_CAT['location'].isna()) & (addresses_CAT['cadaster_code'] == code)]:
-#                         try:
-#                             addresses_CAT.loc[idx, 'location'] = list(buildings[buildings['reference'] == addresses_CAT.loc[idx, 'building_reference']].geometry)[0].centroid
-#                         except:
-#                             pass
-#             addresses_CAT = gpd.GeoDataFrame(addresses_CAT)
-#             addresses_CAT = addresses_CAT.set_geometry("location")
-#             addresses_CAT = addresses_CAT.set_crs(gdf.crs)
-#             addresses_CAT["specification"] = "CATFile"
-#             gdf = pd.concat([gdf, addresses_CAT], ignore_index=True)
-#             gdf = gdf.drop_duplicates(subset=["street_name", "street_number", "street_type", "cadaster_code"], keep="first", ignore_index=True)
-#
-#     if directions_from_open_data:
-#         open_data_addresses = process_open_data_addresses(
-#             open_data_layers_dir, cadaster_codes, parcels_gdf, gdf.crs
-#         )
-#         if not open_data_addresses.empty:
-#             # Deprecate the addresses from Cadaster when they are already available from a Municipal dataset
-#             # (normally more accurate).
-#             gdf = gdf[~gdf["cadaster_code"].isin(open_data_addresses["cadaster_code"].unique())]
-#             gdf = pd.concat([gdf, open_data_addresses], ignore_index=True)
-#
-#     return gdf
+
+
+# ===================================================================
+# Cadastral (INSPIRE Address) fallback
+# ===================================================================
+# CartoCiudad has no address point for some cadastral buildings (often
+# isolated or recently built ones, e.g. 0354404CG3305N in Cubells 25095). The
+# cadastre's own INSPIRE Address layer does list them, usually as a parcel
+# point "S-N" (sin número) on the street the cadastre assigns. These rows are
+# used ONLY for buildings CartoCiudad does not cover (see
+# join_cadaster_building), with address_source = CADASTER_ADDRESS_SOURCE.
+CADASTER_ADDRESS_SOURCE = "Catastro INSPIRE"
+
+
+def get_cadaster_address(cadaster_dir, cadaster_codes, building_references=None):
+    """Read the cadastral INSPIRE Address points for the given municipalities.
+
+    Returns the same columns as :func:`get_cartociudad_address`, so its rows
+    can fill in address-less buildings. The street comes from the
+    ``ThoroughfareName`` the address id points to (``CL CALVARI`` ->
+    street_type ``CALLE``, street_name ``CALVARI``), with the type normalised
+    like CartoCiudad's. ``S-N`` (no number) keeps
+    its label and has no clean number. The GML loses the xlink to the
+    ``PostalDescriptor``, so postal_code is only filled when the municipality
+    has a single one.
+
+    Parameters
+    ----------
+    cadaster_dir : str
+        Root of the downloaded cadastral layers (``address/unzip/`` inside).
+    cadaster_codes : list[str]
+        Cadastral municipality codes to read. Municipalities whose Address GML
+        is missing are skipped with a warning.
+    building_references : iterable[str], optional
+        Keep only addresses of these buildings.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        One row per (building, street, number), geometry ``location``. Empty
+        when no Address GML is available.
+    """
+    if building_references is not None:
+        building_references = set(building_references)
+    frames = []
+    missing = []
+    for code in cadaster_codes:
+        path = f"{cadaster_dir}/address/unzip/A.ES.SDGC.AD.{code}.gml"
+        if not os.path.exists(path):
+            missing.append(code)
+            continue
+        addr = gpd.read_file(path, layer="Address")
+        addr["building_reference"] = addr["localId"].str.split(".").str[-1]
+        if building_references is not None:
+            addr = addr[addr["building_reference"].isin(building_references)]
+        if addr.empty:
+            continue
+        streets = gpd.read_file(path, layer="ThoroughfareName")
+        # Address id ES.SDGC.AD.{prov}.{mun}.{street}.{number}.{ref} -> street
+        # id ES.SDGC.TN.{prov}.{mun}.{street}.
+        addr["_tn"] = addr["gml_id"].str.split("ES.SDGC.AD.").str[1].str.split(".").str[:3].str.join(".")
+        streets["_tn"] = streets["gml_id"].str.split("ES.SDGC.TN.").str[1]
+        addr = addr.merge(streets[["_tn", "text"]], on="_tn", how="left")
+        postal = gpd.read_file(path, layer="PostalDescriptor")
+        addr["postal_code"] = (
+            str(postal["postCode"].iloc[0]).zfill(5) if len(postal) == 1 else None)
+        addr["cadaster_code"] = code
+        frames.append(addr)
+    if missing:
+        sys.stderr.write(
+            f"Warning: cadastral Address GML missing for {len(missing)} municipalities "
+            f"(re-run download() to fetch them); buildings without a CartoCiudad "
+            f"address there stay address-less: {missing}\n")
+    if not frames:
+        return gpd.GeoDataFrame()
+
+    gdf = gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), crs=frames[0].crs)
+    # "CL CALVARI": the cadastral street-type abbreviation, then the name.
+    text = gdf["text"].astype("string").str.strip()
+    abbr = text.str.split(" ", n=1).str[0]
+    gdf["street_name"] = text.str.split(" ", n=1).str[1]
+    _st_cache = {a: downloaders.normalize_cartociudad_street_type(a) for a in abbr.dropna().unique()}
+    gdf["street_type"] = abbr.map(lambda a: _st_cache.get(a) if isinstance(a, str) else None)
+    gdf["street_number_label"], gdf["street_number_clean"] = utils.normalize_street_number(
+        gdf["designator"])
+    gdf["postal_address_specification"] = gdf["specification"]
+    gdf["address_source"] = CADASTER_ADDRESS_SOURCE
+    gdf["postal_code"] = gdf["postal_code"].astype("string")
+    gdf = gdf.rename(columns={"geometry": "location"}).set_geometry("location")
+    gdf = gdf.drop_duplicates(
+        subset=["building_reference", "street_type", "street_name", "street_number_label"])
+
+    keep = ["location", "postal_address_specification", "cadaster_code", "street_type", "street_name",
+            "street_number_label", "street_number_clean", "postal_code", "address_source",
+            "building_reference"]
+    return gpd.GeoDataFrame(gdf[keep].reset_index(drop=True), geometry="location", crs=gdf.crs)
+
+
+# Last address fallback: the parcel record (type 11) of the urban AND rural CAT
+# files. The INSPIRE Address layer skips most rural buildings, and the rural
+# CAT file (``{province}_R_*_CAT``) is the only source naming them: no street,
+# but the paraje and polígono/parcela, the cadastre's own rural address.
+CAT_ADDRESS_SOURCE = "Catastro CAT"
+
+
+def get_CAT_address(CAT_files_dir, cadaster_codes, building_references=None):
+    """Read parcel addresses from the urban and rural CAT files (record type 11).
+
+    Returns the same columns as :func:`get_cartociudad_address`, one row per
+    parcel (= building_reference), with ``address_source =
+    CAT_ADDRESS_SOURCE``:
+
+    - A parcel with a street keeps it: ``CL CALVARI`` -> CALLE CALVARI, its
+      first number (0 -> ``S-N``) and letter.
+    - A parcel without one (rural) becomes ``PARAJE <paraje>`` with number
+      label ``POLIGONO <p> PARCELA <n>`` and no clean number, e.g.
+      ``25095A00100086`` -> PARAJE TRILLA, POLIGONO 1 PARCELA 86.
+
+    ``location`` is the parcel point the CAT record carries (null when absent,
+    so the parcel centroid is used downstream).
+
+    Parameters
+    ----------
+    CAT_files_dir : str
+        Directory with the ``{province}_U_*_CAT`` / ``{province}_R_*_CAT``
+        folders. Missing files are skipped without waiting.
+    cadaster_codes : list[str]
+        Cadastral municipality codes to read.
+    building_references : iterable[str], optional
+        Keep only these parcels.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        Geometry ``location``; empty when no CAT file is available.
+    """
+    if building_references is not None:
+        building_references = set(building_references)
+    frames = []
+    for code in cadaster_codes:
+        # Urban first: a parcel in both files keeps its urban record.
+        for kind in ("U", "R"):
+            dfs = downloaders.parse_CAT_file(
+                code, CAT_files_dir, allowed_dataset_types=[11], cat_kind=kind, wait_timeout=0)
+            if dfs is None or dfs.get(11) is None or len(dfs[11]) == 0:
+                continue
+            df = dfs[11].to_pandas().rename(columns={"parcela_catastral": "building_reference"})
+            if building_references is not None:
+                df = df[df["building_reference"].isin(building_references)]
+            if not df.empty:
+                frames.append(df.assign(cadaster_code=code))
+    if not frames:
+        return gpd.GeoDataFrame()
+
+    df = pd.concat(frames, ignore_index=True).drop_duplicates("building_reference")
+    df = df.fillna({c: "" for c in ("tipo_via", "nombre_via", "primer_numero_policia", "primera_letra",
+                                     "nombre_paraje", "codigo_poligono", "codigo_parcela")})
+    has_street = df["nombre_via"] != ""
+
+    number = pd.to_numeric(df["primer_numero_policia"], errors="coerce").fillna(0).astype(int)
+    street_number = (number.astype(str) + df["primera_letra"]).where(number > 0, "S-N")
+    rural_number = ("POLIGONO " + pd.to_numeric(df["codigo_poligono"], errors="coerce").astype("Int64").astype(str)
+                    + " PARCELA " + pd.to_numeric(df["codigo_parcela"], errors="coerce").astype("Int64").astype(str))
+    _st_cache = {a: downloaders.normalize_cartociudad_street_type(a)
+                 for a in df.loc[has_street, "tipo_via"].unique()}
+
+    out = pd.DataFrame({
+        "postal_address_specification": "Parcel",
+        "cadaster_code": df["cadaster_code"],
+        "street_type": df["tipo_via"].map(_st_cache).where(has_street, "PARAJE"),
+        "street_name": df["nombre_via"].where(has_street, df["nombre_paraje"]),
+        "street_number_label": street_number.where(has_street, rural_number),
+        # Urban parcel records leave it as 00000.
+        "postal_code": df["codigo_postal"].astype("string").str.zfill(5).replace("00000", pd.NA),
+        "address_source": CAT_ADDRESS_SOURCE,
+        "building_reference": df["building_reference"],
+    })
+    _, out["street_number_clean"] = utils.normalize_street_number(out["street_number_label"])
+    out.loc[~has_street, "street_number_clean"] = None
+    # Neither a street nor a paraje: nothing to call an address.
+    out = out[out["street_name"] != ""]
+
+    # The parcel point is stored in hundredths of a metre, in the record's CRS.
+    x = pd.to_numeric(df["coordenada_x_por_cien"], errors="coerce") / 100
+    y = pd.to_numeric(df["coordenada_y_por_cien"], errors="coerce") / 100
+    epsg = df["codigo_epsg"].dropna()
+    crs = epsg.mode().iloc[0] if not epsg.empty else None
+    valid = (x > 0) & (y > 0) & (crs is not None)
+    location = gpd.GeoSeries(
+        [Point(xx, yy) if ok else None for xx, yy, ok in zip(x, y, valid)], index=df.index, crs=crs)
+    out = gpd.GeoDataFrame(out, geometry=location.loc[out.index], crs=crs).rename_geometry("location")
+
+    keep = ["location", "postal_address_specification", "cadaster_code", "street_type", "street_name",
+            "street_number_label", "street_number_clean", "postal_code", "address_source",
+            "building_reference"]
+    return out[keep].reset_index(drop=True)
 
 
 # Address-point layer inside each CartoCiudad province GeoPackage.
-CARTOCIUDAD_ADDRESS_LAYER = "portalpk_publi"
+CARTOCIUDAD_ADDRESS_LAYER = downloaders.CARTOCIUDAD_ADDRESS_LAYER
 
 
 def _assign_points_to_parcels(points_gdf, parcels_gdf, target_crs, id_col="_pt_id"):
@@ -1719,6 +1763,39 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
             building_gdf = building_gdf_
 
     if gdf is not None:
+        # Buildings CartoCiudad has no address for (e.g. 0354404CG3305N in
+        # Cubells 25095) still exist in the cadastre, so they are appended
+        # after the address-driven left merge. They take their address from the
+        # cadastral INSPIRE Address layer when it lists them (usually "S-N" on
+        # the cadastral street), else, with CAT files, from the urban/rural CAT
+        # parcel record (rural: paraje + polígono/parcela). Otherwise the
+        # address columns stay null and `location` falls back to the parcel
+        # centroid in join_cadaster_data. Their cadaster_code comes from the
+        # building side.
+        no_address = ~building_gdf["building_reference"].isin(gdf["building_reference"])
+        building_only = building_gdf[no_address]
+        if not building_only.empty:
+            cadaster_addr = get_cadaster_address(
+                cadaster_dir, cadaster_codes,
+                building_references=building_only["building_reference"])
+            if building_parts_inference_using_CAT_files and CAT_files_dir is not None:
+                still_missing = set(building_only["building_reference"])
+                if not cadaster_addr.empty:
+                    still_missing -= set(cadaster_addr["building_reference"])
+                CAT_addr = (get_CAT_address(CAT_files_dir, cadaster_codes, building_references=still_missing)
+                            if still_missing else gpd.GeoDataFrame())
+                if not CAT_addr.empty:
+                    if not cadaster_addr.empty and CAT_addr.crs != cadaster_addr.crs:
+                        CAT_addr = CAT_addr.to_crs(cadaster_addr.crs)
+                    cadaster_addr = (CAT_addr if cadaster_addr.empty else gpd.GeoDataFrame(
+                        pd.concat([cadaster_addr, CAT_addr], ignore_index=True),
+                        geometry="location", crs=cadaster_addr.crs))
+            if not cadaster_addr.empty:
+                if cadaster_addr.crs != building_only.crs:
+                    cadaster_addr = cadaster_addr.to_crs(building_only.crs)
+                building_only = pd.merge(
+                    cadaster_addr.drop(columns="cadaster_code"), building_only,
+                    on="building_reference", how="right")
         # Avoid cadaster_code column collision: both gdf (from addresses) and
         # building_gdf carry it. Since they represent the same municipality,
         # drop it from the right side so pd.merge doesn't suffix the names.
@@ -1726,9 +1803,15 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
             building_gdf = building_gdf.drop(columns="cadaster_code")
         with utils.stage_timer(
             f"merge: address↔building pd.merge "
-            f"({len(gdf)} addresses × {len(building_gdf)} buildings)"
+            f"({len(gdf)} addresses × {len(building_gdf)} buildings, "
+            f"{len(building_only)} rows for buildings without a CartoCiudad address)"
         ):
             merged_gdf = pd.merge(gdf, building_gdf, left_on="building_reference", right_on="building_reference", how="left")
+            if not building_only.empty:
+                merged_gdf = gpd.GeoDataFrame(
+                    pd.concat([merged_gdf, building_only], ignore_index=True),
+                    geometry=merged_gdf.geometry.name, crs=merged_gdf.crs,
+                )
     else:
         merged_gdf = building_gdf
 

@@ -33,10 +33,11 @@ The primary data source providing comprehensive property and building informatio
   - Area calculations
   - Ownership context information
 
-> **Note — addresses now come from CartoCiudad.** The INSPIRE Address feed
-> (`ES.SDGC.AD`) and the Barcelona Open Data *carrerer* are deprecated; addresses
-> are sourced from CartoCiudad (see below). The Cadastre is still used for parcels,
-> buildings and CAT files.
+> **Note — addresses come from CartoCiudad.** The Barcelona Open Data *carrerer*
+> is deprecated and the INSPIRE Address feed (`ES.SDGC.AD`) is no longer the
+> primary source: addresses come from CartoCiudad (see below). The Cadastre is
+> still used for parcels, buildings and CAT files, and for the address fallback
+> described below.
 
 #### **Addresses Data (CartoCiudad — CNIG)**
 - **Content**: Nationwide postal address points (the CartoCiudad *portales* layer)
@@ -56,10 +57,28 @@ The primary data source providing comprehensive property and building informatio
 - **Output**: always compacted to one row per parcel, with per-address columns
   as aligned lists.
 
+#### **Cadastral address fallback (buildings without a CartoCiudad address)**
+A cadastral building with no CartoCiudad address point is still kept in the
+merge. It is given, in this order:
+
+1. **The cadastral INSPIRE address** (`ES.SDGC.AD`, downloaded to
+   `cadaster/address/` for this fallback only), with
+   `address_source = "Catastro INSPIRE"`. These are often "S-N" (no number) on
+   the cadastral street, e.g. `CALLE CALVARI S-N`.
+2. **The CAT parcel record** (record type 11, when `use_CAT_files=True`), read
+   from the urban **and rural** CAT files, with `address_source = "Catastro CAT"`.
+   Rural buildings, which the INSPIRE layer mostly skips, get the cadastre's
+   rural address, e.g. `PARAJE TRILLA, POLIGONO 1 PARCELA 86`, located at the
+   CAT parcel point.
+3. **No address** otherwise: the address columns are null and the location
+   falls back to the parcel centroid.
+
 #### **CAT Files Data**
 - **Content**: Detailed property division data, horizontal ownership structures
 - **Format**: CAT (custom cadastral format)
-- **Coverage**: Provincial level downloads
+- **Coverage**: Provincial level downloads, one urban (`U`) and one rural (`R`)
+  file set per province. The urban files drive the building-space detail; the
+  rural ones are only read for the address fallback above.
 - **Update Frequency**: Quarterly
 - **Special Features**:
   - Individual space-level information
