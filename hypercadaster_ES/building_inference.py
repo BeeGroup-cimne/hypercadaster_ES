@@ -3129,8 +3129,10 @@ def parse_horizontal_division_buildings_CAT_files(cadaster_code, CAT_files_dir):
         return None
 
     # Join the building space and building spaces detailed datasets. Order the items by floor.
-    building_spaces_detailed = combined_dfs[14]
-    building_spaces = combined_dfs[15]
+    # parse_CAT_file stores blank fields as null; this function relies on blank
+    # text fields being "" (filters, concat_str of references, floor sorting).
+    building_spaces_detailed = combined_dfs[14].with_columns(pl.col(pl.Utf8).fill_null(""))
+    building_spaces = combined_dfs[15].with_columns(pl.col(pl.Utf8).fill_null(""))
     building_spaces = building_spaces.with_columns(
         pl.concat_str(['building_reference', 'space1_reference'], separator=""
                       ).alias("building_space_reference"),

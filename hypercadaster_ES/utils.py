@@ -3844,7 +3844,7 @@ def flat_gdf_to_building_spaces_resolution(gdf, building_reference_col="building
                 break
 
     if not per_space_cols:
-        sys.stderr.write("[FLAT] No per-space columns found")
+        sys.stderr.write("[FLAT] No per-space columns found\n")
         return pd.DataFrame()
 
     renamed_space_cols = {
@@ -3857,11 +3857,11 @@ def flat_gdf_to_building_spaces_resolution(gdf, building_reference_col="building
         if c not in per_space_cols
     ]
 
-    sys.stderr.write(f"[FLAT] per-space columns: {len(per_space_cols)}")
+    sys.stderr.write(f"[FLAT] per-space columns: {len(per_space_cols)}\n")
 
-    sys.stderr.write(f"[FLAT] context columns: {len(context_cols)}")
+    sys.stderr.write(f"[FLAT] context columns: {len(context_cols)}\n")
 
-    sys.stderr.write("[FLAT] Counting building spaces...")
+    sys.stderr.write("[FLAT] Counting building spaces...\n")
 
     # Determine how many output rows we need.
     total_records = 0
@@ -3870,7 +3870,7 @@ def flat_gdf_to_building_spaces_resolution(gdf, building_reference_col="building
 
     for start in range(0, n_buildings, chunk_size):
         stop = min(start + chunk_size, n_buildings)
-        sys.stderr.write(f"[FLAT] counting buildings {start:,} -> {stop:,}")
+        sys.stderr.write(f"[FLAT] counting buildings {start:,} -> {stop:,}\n")
         part = gdf.iloc[start:stop]
 
         for _, row in part.iterrows():
@@ -3892,12 +3892,12 @@ def flat_gdf_to_building_spaces_resolution(gdf, building_reference_col="building
 
     gc.collect()
 
-    sys.stderr.write(f"[FLAT] Total records: {total_records:,}")
+    sys.stderr.write(f"[FLAT] Total records: {total_records:,}\n")
 
     if total_records == 0:
         return pd.DataFrame()
 
-    sys.stderr.write("[FLAT] Allocating output columns...")
+    sys.stderr.write("[FLAT] Allocating output columns...\n")
 
     output = {}
 
@@ -3914,7 +3914,7 @@ def flat_gdf_to_building_spaces_resolution(gdf, building_reference_col="building
     for start in range(0, n_buildings, chunk_size):
         stop = min(start + chunk_size, n_buildings)
 
-        sys.stderr.write(f"\n[FLAT] filling buildings {start:,} -> {stop:,}")
+        sys.stderr.write(f"[FLAT] filling buildings {start:,} -> {stop:,}\n")
 
         part = gdf.iloc[start:stop]
 
@@ -3959,14 +3959,14 @@ def flat_gdf_to_building_spaces_resolution(gdf, building_reference_col="building
 
         gc.collect()
 
-        sys.stderr.write(f"[FLAT] filled {pos:,} / {total_records:,}")
+        sys.stderr.write(f"[FLAT] filled {pos:,} / {total_records:,}\n")
 
     if pos != total_records:
         raise RuntimeError(
             f"Expected {total_records:,} records but generated {pos:,}"
         )
 
-    sys.stderr.write("\n[FLAT] Creating final DataFrame...")
+    sys.stderr.write("[FLAT] Creating final DataFrame...\n")
 
     result = pd.DataFrame(output)
 
@@ -3979,7 +3979,7 @@ def flat_gdf_to_building_spaces_resolution(gdf, building_reference_col="building
 
     gc.collect()
 
-    sys.stderr.write(f"[FLAT] Final DataFrame: {len(result):,} rows")
+    sys.stderr.write(f"[FLAT] Final DataFrame: {len(result):,} rows\n")
 
     return result
 

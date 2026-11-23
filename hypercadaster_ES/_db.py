@@ -120,6 +120,11 @@ def fetch_first(con: duckdb.DuckDBPyConnection, sql: str,
     return rows[0] if rows else None
 
 
+def _is_null_type(type_name: str) -> bool:
+    """True for DuckDB's untyped "NULL" column type (DESCRIBE shows it quoted)."""
+    return type_name.strip('"').upper() == "NULL"
+
+
 def _table_exists(con: duckdb.DuckDBPyConnection, table: str) -> bool:
     """True when ``table`` exists in the connection's own ``main`` schema.
 
@@ -501,14 +506,22 @@ def write_gdf(con: duckdb.DuckDBPyConnection, table: str, gdf: gpd.GeoDataFrame,
     con.register("_tmp_write_gdf", df)
 
     def _reconcile_schema():
-        """ADD COLUMN for every frame column the table doesn't have yet."""
-        existing = {r[0] for r in con.execute(f'DESCRIBE "{table}"').fetchall()}
+        """ADD COLUMN for every frame column the table doesn't have yet.
+
+        A column created from an all-None frame column gets DuckDB's "NULL"
+        type, which nothing can be cast into; once a frame carries a real type
+        for it, the table column is retyped to that type.
+        """
+        existing = {r[0]: str(r[1])
+                    for r in con.execute(f'DESCRIBE "{table}"').fetchall()}
         tmp_types = {r[0]: str(r[1])
                      for r in con.execute('DESCRIBE _tmp_write_gdf').fetchall()}
         for c in df.columns:
+            _ty = 'GEOMETRY' if c in geom_set else tmp_types.get(c, 'VARCHAR')
             if c not in existing:
-                _ty = 'GEOMETRY' if c in geom_set else tmp_types.get(c, 'VARCHAR')
                 con.execute(f'ALTER TABLE "{table}" ADD COLUMN "{c}" {_ty}')
+            elif (_is_null_type(existing[c]) and not _is_null_type(_ty)):
+                con.execute(f'ALTER TABLE "{table}" ALTER COLUMN "{c}" TYPE {_ty}')
 
     try:
         select_sql = _geom_select_sql(df.columns, geom_cols)
