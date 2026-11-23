@@ -1,0 +1,44 @@
+# Publishes to PyPI whenever a push to main carries a VERSION (setup.py) that
+# PyPI doesn't have yet, then tags the commit as v<VERSION>.
+name: Publish to PyPI
+
+on:
+  push:
+    branches: [main]
+    paths: [setup.py]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write   # PyPI trusted publishing
+      contents: write   # push the v<VERSION> tag
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check whether this version is already on PyPI
+        id: version
+        run: |
+          v=$(python -c "import re;print(re.search(r'VERSION = \"(.+?)\"', open('setup.py').read())[1])")
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          code=$(curl -s -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/hypercadaster_es/$v/json")
+          if [ "$code" = "200" ]; then
+            echo "Version $v already on PyPI, nothing to publish"
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build
+        if: steps.version.outputs.new == 'true'
+        run: pip install build && python -m build
+      - name: Publish
+        if: steps.version.outputs.new == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Tag release
+        if: steps.version.outputs.new == 'true'
+        run: |
+          git tag "v${{ steps.version.outputs.version }}"
+          git push origin "v${{ steps.version.outputs.version }}"
