@@ -4,6 +4,49 @@ All notable changes to hypercadaster_ES will be documented in this file. The for
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-11-24
+
+### 🐛 CAT spaces collapsed to one theoretical space per building
+
+`parse_CAT_file` stores blank fixed-width fields as null since the CAT parser
+started converting `""` to `None`, but `parse_horizontal_division_buildings_CAT_files`
+still assumed blank text was `""`: its `distribution_method_for_communal_areas == ""`
+filter matched no record, the string concatenations that build space
+references produced nulls, and the floor sort compared `None` with `str`. Every
+municipality whose CAT file was parsed from scratch after that change lost its
+horizontal division, and `add_theoretical_CAT_spaces` then filled each building
+with a single space whose reference is the building's own (on Lleida province,
+173,967 rows instead of ~415,000 spaces; parquet caches written earlier still
+held `""` and were unaffected). Text columns of record types 14 and 15 are now
+filled with `""` on entry, so old and new caches parse identically. The street
+number and km casts of the address now leave a blank value empty, as they do
+for an all-zero one, instead of failing on it (a space with no address, as in
+Santa Maria de Palautordera, 08259).
+
+Re-running affected municipalities needs the CAT tables cached in
+`building_results.duckdb` cleared first (`hc.utils.clear_cat_cache(wd)`).
+
+### 🐛 DuckDB columns created from all-null data could not be written again
+
+When the first batch written to a table carried a column that was entirely
+`None`, DuckDB typed it as `NULL`, and later batches with real values for that
+column failed to cast. `write_gdf` now retypes such a column to the incoming
+type before inserting.
+
+### 🧹 Log output
+
+The `[FLAT]` progress messages of `flat_gdf_to_building_spaces_resolution` now
+end with a newline, so each one prints on its own line.
+
+### ⚙️ Automatic PyPI releases
+
+New GitHub Actions workflow (`.github/workflows/publish.yml`): a push to `main`
+that bumps `VERSION` in `setup.py` builds the package, publishes it to PyPI via
+trusted publishing, tags the commit as `v<VERSION>` and creates the GitHub
+release, with this changelog's section for that version as release notes and the
+built wheel and sdist attached. Pushes that don't change the version publish
+nothing.
+
 ## [1.4.0] - 2026-11-17
 
 ### 🦆 DuckDB 2.0 support

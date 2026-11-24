@@ -1,5 +1,6 @@
 # Publishes to PyPI whenever a push to main carries a VERSION (setup.py) that
-# PyPI doesn't have yet, then tags the commit as v<VERSION>.
+# PyPI doesn't have yet, then tags the commit as v<VERSION>
+# and creates the GitHub release.
 name: Publish to PyPI
 
 on:
@@ -11,6 +12,8 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     environment: pypi
+    env:
+      CHANGELOG: docs/changelog.md
     permissions:
       id-token: write   # PyPI trusted publishing
       contents: write   # push the v<VERSION> tag
@@ -42,3 +45,17 @@ jobs:
         run: |
           git tag "v${{ steps.version.outputs.version }}"
           git push origin "v${{ steps.version.outputs.version }}"
+      - name: GitHub release
+        if: steps.version.outputs.new == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${{ steps.version.outputs.version }}"
+          # Release notes = this version's section of the changelog; without one,
+          # GitHub generates them from the commits since the previous release.
+          notes=(--generate-notes)
+          if [ -f "$CHANGELOG" ]; then
+            awk -v h="## [$v]" 'index($0,h)==1{f=1;next} /^## \[/{f=0} f' "$CHANGELOG" > notes.md
+            grep -q '[^[:space:]]' notes.md && notes=(--notes-file notes.md)
+          fi
+          gh release create "v$v" dist/*.whl dist/*.tar.gz --title "v$v" "${notes[@]}"

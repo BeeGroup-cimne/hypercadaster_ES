@@ -3292,12 +3292,15 @@ def parse_horizontal_division_buildings_CAT_files(cadaster_code, CAT_files_dir):
     )
 
     # Calculate the complete address
+    # Blank numbers ("" once nulls are filled, e.g. a space with no address)
+    # are left empty like the all-zero ones. The cast runs on every row before
+    # pl.when masks it, so "" is nulled first rather than cast.
     building_spaces_detailed = building_spaces_detailed.with_columns(
-        (pl.when(pl.col("street_number1") == "0000").then(pl.lit("")).otherwise(
-            pl.col("street_number1").cast(pl.Int16))).alias("street_number1"),
-        (pl.when(pl.col("street_number2") == "0000").then(pl.lit("")).otherwise(
-            pl.col("street_number2").cast(pl.Int16))).alias("street_number2"),
-        (pl.when(pl.col("km") == "00000").then(pl.lit("")).otherwise(pl.col("km").cast(pl.Int16))).alias("km")
+        (pl.when(pl.col("street_number1").is_in(["0000", ""])).then(pl.lit("")).otherwise(
+            pl.col("street_number1").replace("", None).cast(pl.Int16))).alias("street_number1"),
+        (pl.when(pl.col("street_number2").is_in(["0000", ""])).then(pl.lit("")).otherwise(
+            pl.col("street_number2").replace("", None).cast(pl.Int16))).alias("street_number2"),
+        (pl.when(pl.col("km").is_in(["00000", ""])).then(pl.lit("")).otherwise(pl.col("km").replace("", None).cast(pl.Int16))).alias("km")
     )
     # Human-readable street components for the postal address: expand the
     # two-letter cadastral street-type acronym to its literal ("CR" ->
