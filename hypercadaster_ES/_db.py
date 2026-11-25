@@ -446,6 +446,12 @@ def _df_with_wkb(gdf: gpd.GeoDataFrame, geom_cols: Iterable[str]) -> pd.DataFram
     for col in df.columns:
         if col in geom_set or df[col].dtype != object:
             continue
+        # A bool column with nulls (e.g. br__detached once the CAT undeveloped
+        # parcels are appended) turns object; keep it BOOLEAN, not a pickled
+        # BLOB, so it still matches a table created from an all-bool frame.
+        if pd.api.types.infer_dtype(df[col], skipna=True) == "boolean":
+            df[col] = df[col].astype("boolean")
+            continue
         if _object_kind(df[col]) in ("null", "str", "bytes"):
             continue
         df[col] = [None if _is_null(v) else _to_pickle_bytes(v) for v in df[col]]

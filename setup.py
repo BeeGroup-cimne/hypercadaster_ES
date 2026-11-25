@@ -3,7 +3,7 @@ from setuptools import find_packages, setup
 
 HERE = pathlib.Path(__file__).parent
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 PACKAGE_NAME = "hypercadaster_es"
 AUTHOR = "Jose Manuel Broto Vispe"
 AUTHOR_EMAIL = "jmbrotovispe@gmail.com"
@@ -104,7 +104,7 @@ INSTALL_REQUIRES = [
     # --- Socioeconomic INE datasets (EUPL-1.2) ---
     # 1.0.3 emits the Essential-Characteristics variables already translated to
     # English snake_case and adds the dwellings / empty-and-secondary censuses.
-    "social_ES>=1.0.3",
+    "social_ES>=1.0.4",
 ]
 
 

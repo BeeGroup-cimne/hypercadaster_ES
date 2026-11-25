@@ -1552,10 +1552,15 @@ def join_cadaster_building(gdf, cadaster_dir, census_tracts_dir, DEM_raster_dir,
                 # like br__building_spaces_*); other GEOMETRY columns
                 # stay as raw WKB bytes so write_gdf downstream doesn't
                 # see unexpected geopandas 'geometry' dtype columns.
+                # _br_merged is built by raw SQL, so _meta holds no CRS for it
+                # and read_gdf would return crs=None; carry the source CRS over.
                 with utils.stage_timer("merge: read _br_merged into GeoDataFrame"):
+                    _src_crs = building_gdf_.crs
                     building_gdf_ = _db_mod.read_gdf(
                         central_con, "_br_merged", geom_col="building_geometry"
                     )
+                    if building_gdf_.crs is None and _src_crs is not None:
+                        building_gdf_ = building_gdf_.set_crs(_src_crs)
 
                 # Also keep br_results for building_part_gdf downstream
                 with utils.stage_timer("merge: br_results -> pandas (building_part_gdf)"):

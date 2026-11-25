@@ -4,6 +4,80 @@ All notable changes to hypercadaster_ES will be documented in this file. The for
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-11-25
+
+### 🐛 Buildings lost their CRS with `building_parts_inference=True`
+
+The inference results are joined onto the buildings in DuckDB by a raw
+`CREATE TABLE _br_merged AS …` statement, which records no CRS in `_meta`, so
+`read_gdf` returned the buildings with `crs=None`. Buildings without a
+CartoCiudad address then failed to take theirs from the cadastral Address layer
+(`ValueError: Must pass either crs or epsg.` in `join_cadaster_building`; e.g.
+0354404CG3305N in Cubells, 25095). The CRS the buildings had before the
+round-trip is now set back on the frame read from `_br_merged`.
+
+### 🐛 `buildings` upsert failed after switching to `use_CAT_files=True`
+
+With CAT files, the undeveloped parcels appended to the buildings have no
+inference values, so boolean columns such as `br__detached` became `object`
+with nulls and `write_gdf` pickled them to BLOB. Upserting into a `buildings`
+table created by an earlier run without CAT, where the column is BOOLEAN,
+failed with `Conversion Error: Unimplemented type for cast (BLOB -> BOOLEAN)`
+(the opposite order failed the same way). Boolean columns with nulls are now
+written as nullable BOOLEAN.
+
+### 🐛 EnergyPlus IDD did not match the installed engine
+
+`_default_idd_path` only looked in `/usr/local` and `/opt`, so on macOS and
+Windows it fell back to the V9.2 IDD bundled with eppy; the IDF was then
+written as version 9.2 and `idf.run()` looked for a non-existent
+`EnergyPlus-9-2-0` install. It also picked the "latest" install by string order
+(9.6 over 24.1). The IDD now comes, in order, from `HC_ENERGYPLUS_IDD`, the
+`energyplus` executable on `PATH`, the highest-version install under
+`/Applications`, `/usr/local`, `/opt` or `C:/EnergyPlusV*`, and only then from
+eppy.
+
+### 🐛 `build_energy_model` + `idf.run()` started the year on a Sunday
+
+The RunPeriod's *Day of Week for Start Day* was only set by
+`run_behavior_scenarios`; a model built with `build_energy_model` and run directly
+left it blank, so EnergyPlus took 1 January as a Sunday whatever the weather year
+and every weekend schedule ran on the wrong days (2022 weather: Sunday instead of
+Saturday). `build_energy_model` now sets it from the attached EPW's year, as
+`run_behavior_scenarios` already did.
+
+### 🧊 `plot_idf_geometry` draws with three.js
+
+The IDF viewer is now a standalone three.js page (pinned 0.160.0, loaded from
+jsDelivr) instead of a plotly figure. It keeps the per-category colours, the
+transparencies and the true 1:1:1 metre scale, frames the camera on the building,
+draws a ground grid, shows the category under the cursor and toggles categories
+from the legend, which counts the surfaces of each.
+
+- Surfaces are layered so the picture reads correctly: windows and doors are drawn
+  first, on top of their own wall, and anything in front of them (walls, shading)
+  is blended over them; the roof is blended last, over everything it covers.
+- The `Shading` category is split into `Shading: building` (the building's own
+  reveals, balconies and awnings, drawn with `opacity`) and
+  `Shading: neighbours` (the `Shade_F*` context panels, drawn with
+  `shading_opacity`).
+- `show=True` serves the page from a one-shot local HTTP server, so it also opens
+  from PyCharm's remote-dev console, whose browser hook rejects `file://` links.
+
+**Breaking:** it returns an `IDFGeometryView` (`.html`, `.path`, `.show()`, rendered
+inline in Jupyter) instead of a plotly `Figure`. Opening the page needs an internet
+connection to load three.js, and a browser with WebGL; a failure to load is shown
+in the page's panel.
+
+### ⬆️ social_ES 1.0.4
+
+INE now serves some of the per-province census-tract population tables with an
+English `Period` column instead of `Periodo`, which `social_ES` 1.0.3 did not
+map. The whole-Spain population download stopped with `KeyError: 'Period'` and
+every `ec__*` (Essential Characteristics) column was skipped. `social_ES` 1.0.4
+maps it; `install_requires` is now `social_ES>=1.0.4` and `requirements.txt`
+pins 1.0.4.
+
 ## [1.4.1] - 2026-11-24
 
 ### 🐛 CAT spaces collapsed to one theoretical space per building

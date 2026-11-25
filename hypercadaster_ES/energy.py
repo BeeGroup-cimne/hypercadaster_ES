@@ -227,10 +227,28 @@ def _default_idd_path():
     env = os.environ.get("HC_ENERGYPLUS_IDD")
     if env and os.path.exists(env):
         return env
-    for p in ("/usr/local/EnergyPlus*/Energy+.idd", "/opt/EnergyPlus*/Energy+.idd"):
-        hits = sorted(glob.glob(p))
-        if hits:
-            return hits[-1]
+    # The IDD must come from the engine that will run the IDF: eppy derives the
+    # executable path from the IDF Version, so a bundled-9.2 IDD sends it to a
+    # non-existent EnergyPlus-9-2-0 install. Prefer the engine on PATH.
+    import shutil
+    exe = shutil.which("energyplus")
+    if exe:
+        idd = os.path.join(os.path.dirname(os.path.realpath(exe)), "Energy+.idd")
+        if os.path.exists(idd):
+            return idd
+
+    def _version_key(path):
+        nums = re.findall(r"\d+", os.path.basename(os.path.dirname(path)))
+        return tuple(int(n) for n in nums)
+
+    hits = []
+    for p in ("/Applications/EnergyPlus*/Energy+.idd",  # macOS
+              "/usr/local/EnergyPlus*/Energy+.idd",  # Linux
+              "/opt/EnergyPlus*/Energy+.idd",
+              "C:/EnergyPlusV*/Energy+.idd"):  # Windows
+        hits.extend(glob.glob(p))
+    if hits:
+        return max(hits, key=_version_key)
     import eppy
     idds = glob.glob(os.path.join(os.path.dirname(eppy.__file__),
                                   "resources", "iddfiles", "Energy+V9_2_0.idd"))
@@ -2905,6 +2923,9 @@ def build_energy_model(gdf, building_reference, wd=None, output_path=None,
                            residential_behavior=residential_behavior,
                            residential_period=residential_period,
                            behavior_seed=behavior_seed, wd=wd)
+        # Start the RunPeriod on the weather year's real weekday (blank means
+        # Sunday), so a plain idf.run() keeps weekend schedules on the weekend.
+        _set_run_period(idf, None)
 
     # Neighbour-shading filter + cap, BEFORE the model is written or returned, so
     # the .idf on disk, the 3-D plot and the simulated context are the same panels.
@@ -5350,7 +5371,8 @@ _IDF_VIEW_COLORS = {
     "Window":               "cornflowerblue",
     "Door: main":           "saddlebrown",
     "Door: parking":        "sienna",
-    "Shading":              "darkolivegreen",
+    "Shading: building":    "olivedrab",
+    "Shading: neighbours":  "darkolivegreen",
 }
 
 
@@ -5361,8 +5383,12 @@ def _surface_category(s):
     main/parking). Drives the per-category legend groups in ``plot_idf_geometry``
     so every type and subtype can be toggled independently."""
     st = getattr(s, "Surface_Type", None)
-    if st is None:
-        return "Shading"                       # Shading:*:Detailed has no type
+    if st is None:                             # Shading:*:Detailed has no type
+        # Neighbour (context) panels vs the building's own reveals, balconies,
+        # awnings and footprint remainders.
+        name = str(getattr(s, "Name", ""))
+        return ("Shading: neighbours" if name.startswith(_NEIGHBOUR_SHADE_PREFIX)
+                else "Shading: building")
     st = st.lower()
     bc = (getattr(s, "Outside_Boundary_Condition", "") or "").lower()
     if st == "wall":
@@ -5398,7 +5424,7 @@ def _idf_surfaces_by_category(idf, include_shading=True):
     out = OrderedDict()
     for s in vg._get_surfaces(idf):
         cat = _surface_category(s)
-        if cat == "Shading" and not include_shading:
+        if cat.startswith("Shading") and not include_shading:
             continue
         coords = vg.getcoords(s)
         if coords and len(coords) >= 3:
@@ -5407,35 +5433,294 @@ def _idf_surfaces_by_category(idf, include_shading=True):
     return out
 
 
+# Standalone three.js page for plot_idf_geometry. three.js is loaded from the
+# jsDelivr CDN (pinned), so viewing the page needs an internet connection.
+_THREEJS_VERSION = "0.160.0"
+_IDF_VIEW_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #ffffff;
+               font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; color: #222; }
+  #view { position: absolute; inset: 0; }
+  #panel { position: absolute; top: 10px; left: 10px; max-height: calc(100% - 20px); overflow: auto;
+           background: rgba(255,255,255,0.92); border: 1px solid #ddd; border-radius: 6px;
+           padding: 8px 10px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
+  #panel h1 { font-size: 14px; margin: 0 0 6px; }
+  #panel .hint { color: #777; font-size: 11px; margin-top: 6px; }
+  .row { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; padding: 1px 0; }
+  .sw { width: 14px; height: 14px; border: 1px solid rgba(0,0,0,0.35); border-radius: 2px; flex: none; }
+  .row.off { opacity: 0.4; }
+  #tip { position: absolute; pointer-events: none; display: none; background: rgba(30,30,30,0.85);
+         color: #fff; padding: 3px 6px; border-radius: 3px; font-size: 12px; white-space: nowrap; }
+</style>
+</head>
+<body>
+<div id="view"></div>
+<div id="panel">
+  <h1 id="ttl"></h1>
+  <div id="legend"></div>
+  <div class="hint">Drag: rotate · Right-drag: pan · Wheel: zoom<br>Click a category to toggle it<br>
+    Grid cell: <span id="cell"></span> m</div>
+</div>
+<div id="tip"></div>
+<script type="application/json" id="hc-data">__DATA__</script>
+<script>
+  // Surface load failures (no internet for the CDN, no WebGL) in the panel.
+  function hcFail(msg) {
+    const d = document.createElement("div");
+    d.style.cssText = "color:#b00020;margin-top:6px;max-width:320px";
+    d.textContent = "Viewer error: " + msg;
+    document.getElementById("panel").appendChild(d);
+  }
+  window.addEventListener("error", (e) => hcFail(e.message || "could not load three.js (offline?)"), true);
+  window.addEventListener("unhandledrejection", (e) => hcFail(String(e.reason)));
+</script>
+<script type="importmap">
+{"imports": {"three": "https://cdn.jsdelivr.net/npm/three@__V__/build/three.module.js",
+             "three/addons/": "https://cdn.jsdelivr.net/npm/three@__V__/examples/jsm/"}}
+</script>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+const DATA = JSON.parse(document.getElementById("hc-data").textContent);
+const ttl = document.getElementById("ttl");
+if (DATA.title) ttl.textContent = DATA.title; else ttl.remove();
+
+const view = document.getElementById("view");
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(view.clientWidth, view.clientHeight);
+view.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xffffff);
+scene.add(new THREE.AmbientLight(0xffffff, 1.6));
+const sun = new THREE.DirectionalLight(0xffffff, 1.4);
+sun.position.set(1, -1.5, 2);
+scene.add(sun);
+
+const box = new THREE.Box3();    // everything (sizes the grid)
+const focus = new THREE.Box3();  // the building itself (frames the camera)
+const meshes = [];
+const legend = document.getElementById("legend");
+
+for (const cat of DATA.categories) {
+  const group = new THREE.Group();
+  // Filled faces: flat-shaded, double-sided, see-through like the plotly view.
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(cat.positions, 3));
+  g.setIndex(cat.indices);
+  const flat = g.toNonIndexed();
+  flat.computeVertexNormals();
+  // Windows and doors lie in their wall's plane. Pulled towards the camera and
+  // drawn FIRST with depth writes, so their own wall can't cover them, while
+  // any roof or wall in front still blends over them and dims them.
+  const inset = cat.name === "Window" || cat.name.startsWith("Door");
+  const mat = new THREE.MeshLambertMaterial({
+    color: new THREE.Color(cat.color), side: THREE.DoubleSide,
+    transparent: cat.opacity < 1, opacity: cat.opacity, depthWrite: inset || cat.opacity >= 1,
+    polygonOffset: true, polygonOffsetFactor: inset ? -2 : 1, polygonOffsetUnits: inset ? -4 : 1,
+  });
+  const mesh = new THREE.Mesh(flat, mat);
+  // The roof is blended last, over everything it covers (walls, shading, the
+  // windows and doors under it); the rest follows three.js' depth sorting.
+  mesh.renderOrder = inset ? -1 : (cat.name === "Roof" ? 2 : 0);
+  mesh.userData.name = cat.name;
+  group.add(mesh);
+  meshes.push(mesh);
+  // Crisp polygon outlines.
+  const eg = new THREE.BufferGeometry();
+  eg.setAttribute("position", new THREE.Float32BufferAttribute(cat.edges, 3));
+  group.add(new THREE.LineSegments(eg, new THREE.LineBasicMaterial({
+    color: 0x282828, transparent: true, opacity: cat.edge_opacity })));
+  scene.add(group);
+  flat.computeBoundingBox();
+  box.union(flat.boundingBox);
+  if (!cat.context) focus.union(flat.boundingBox);
+
+  const row = document.createElement("div");
+  row.className = "row";
+  const sw = document.createElement("span");
+  sw.className = "sw";
+  sw.style.background = cat.color;
+  const label = document.createElement("span");
+  label.textContent = `${cat.name} (${cat.count})`;
+  row.append(sw, label);
+  row.addEventListener("click", () => {
+    group.visible = !group.visible;
+    row.classList.toggle("off", !group.visible);
+  });
+  legend.appendChild(row);
+}
+
+// True 1:1:1 metre scale, z up. The camera frames the building; the ground
+// grid (at the model's lowest point) spans the neighbour shading too.
+if (focus.isEmpty()) focus.copy(box);
+const size = focus.getSize(new THREE.Vector3());
+const center = focus.getCenter(new THREE.Vector3());
+const span = Math.max(size.x, size.y, size.z, 1);
+const all = box.getSize(new THREE.Vector3());
+const allCenter = box.getCenter(new THREE.Vector3());
+const cell = Math.pow(10, Math.floor(Math.log10(Math.max(all.x, all.y, 1) / 2)));
+const cells = Math.ceil((Math.max(all.x, all.y) * 1.2) / cell / 2) * 2;
+const grid = new THREE.GridHelper(cells * cell, cells, 0xbbbbbb, 0xe3e3e3);
+grid.rotation.x = Math.PI / 2;
+grid.position.set(allCenter.x, allCenter.y, box.min.z);
+scene.add(grid);
+document.getElementById("cell").textContent = cell;
+
+const camera = new THREE.PerspectiveCamera(40, view.clientWidth / view.clientHeight, span / 1000, Math.max(span, all.x, all.y) * 100);
+camera.up.set(0, 0, 1);
+const eye = new THREE.Vector3(1.5, -1.5, 1.0).normalize().multiplyScalar(span * 1.8);
+camera.position.copy(center).add(eye);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.copy(center);
+controls.enableDamping = true;
+controls.update();
+
+// Hover: name of the surface category under the cursor.
+const tip = document.getElementById("tip");
+const ray = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+renderer.domElement.addEventListener("pointermove", (ev) => {
+  const r = renderer.domElement.getBoundingClientRect();
+  ndc.set(((ev.clientX - r.left) / r.width) * 2 - 1, -((ev.clientY - r.top) / r.height) * 2 + 1);
+  ray.setFromCamera(ndc, camera);
+  const hit = ray.intersectObjects(meshes.filter((m) => m.parent.visible), false)[0];
+  if (hit) {
+    tip.textContent = hit.object.userData.name;
+    tip.style.left = `${ev.clientX + 12}px`;
+    tip.style.top = `${ev.clientY + 12}px`;
+    tip.style.display = "block";
+  } else {
+    tip.style.display = "none";
+  }
+});
+renderer.domElement.addEventListener("pointerleave", () => { tip.style.display = "none"; });
+
+window.addEventListener("resize", () => {
+  camera.aspect = view.clientWidth / view.clientHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(view.clientWidth, view.clientHeight);
+});
+renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+</script>
+</body>
+</html>
+"""
+
+
+def _open_html_in_browser(page, timeout=120):
+    """Open ``page`` in the web browser from a one-shot local HTTP server.
+
+    A ``file://`` URL is not enough: PyCharm's remote-dev ``BROWSER`` hook only
+    forwards ``http(s)`` links to the client machine (as plotly's ``fig.show``
+    does). The server answers the first request for the page, in a daemon
+    thread, and gives up after ``timeout`` seconds."""
+    import threading
+    import time
+    import webbrowser
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    body = page.encode("utf-8")
+    served = threading.Event()
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.split("?")[0] != "/":
+                self.send_response(404)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            served.set()
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    server.timeout = 1
+
+    def _serve():
+        deadline = time.time() + timeout
+        while not served.is_set() and time.time() < deadline:
+            server.handle_request()
+        server.server_close()
+
+    threading.Thread(target=_serve, daemon=True).start()
+    webbrowser.open(f"http://127.0.0.1:{server.server_port}/")
+
+
+class IDFGeometryView:
+    """The three.js page returned by :func:`plot_idf_geometry`.
+
+    ``html`` holds the standalone page and ``path`` the file it was saved to
+    (or ``None``). ``show()`` opens it in the web browser; in Jupyter it renders
+    inline. Its repr is one line, so the page isn't dumped into the console."""
+
+    def __init__(self, html, path=None):
+        self.html = html
+        self.path = path
+
+    def show(self):
+        _open_html_in_browser(self.html)
+
+    def __repr__(self):
+        where = f", saved to {self.path}" if self.path else ""
+        return f"<IDFGeometryView: {len(self.html) // 1024} KB{where}>"
+
+    def _repr_html_(self):
+        import html as _html
+        return (f'<iframe srcdoc="{_html.escape(self.html, quote=True)}" '
+                'style="width:100%;height:600px;border:0"></iframe>')
+
+
 def plot_idf_geometry(idf, output_path=None, show=False, opacity=0.8,
                       include_shading=True, title=None, shading_opacity=0.2,
                       **_ignored):
     """Render the 3-D geometry of an EnergyPlus IDF — zone walls/roofs/floors,
-    windows and neighbour shadings — as an INTERACTIVE plotly scene (rotate /
-    zoom / toggle layers), mirroring ``utils.plot_building_3d_geometry``.
+    windows and neighbour shadings — as an INTERACTIVE three.js page (rotate /
+    pan / zoom, toggle surface categories, hover for the category name).
 
     Parameters
     ----------
     idf : a ``geomeppy``/``eppy`` IDF object, or a path to an ``.idf`` file.
-    output_path : optional path to save the figure; written as interactive
+    output_path : optional path to save the viewer; written as a standalone
         ``.html`` (any other extension is coerced to ``.html``).
-    show : if True and no ``output_path``, open the figure (``fig.show``).
-    include_shading : draw ``Shading:*:Detailed`` neighbour obstructions.
+    show : if True and no ``output_path``, open the viewer in the default web
+        browser (served from a one-shot local HTTP server).
+    include_shading : draw the ``Shading:*:Detailed`` surfaces: the neighbour
+        obstructions (``Shading: neighbours``) and the building's own reveals,
+        balconies and awnings (``Shading: building``).
     opacity : fill opacity of the building surfaces (default 0.8, so a surface
         seen through one or more others reads as clearly blurred/dimmed).
-    shading_opacity : fill opacity of the neighbour ``Shading`` panels (default
+    shading_opacity : fill opacity of the neighbour shading panels (default
         0.2) — kept well below ``opacity`` so the context obstructions don't
-        compete with the building itself.
-    title : figure title.
+        compete with the building itself. The building's own shading uses
+        ``opacity``.
+    title : page title.
 
-    Returns the plotly ``Figure``.
+    Returns an :class:`IDFGeometryView` (``.html`` is the page, ``.show()``
+    opens it, and it renders inline in Jupyter).
+
+    The geometry is embedded in the page; three.js itself is loaded from the
+    jsDelivr CDN, so opening the page needs an internet connection.
 
     Party walls (``Wall: party``) and adiabatic partitions (``Wall: adiabatic``)
     are separate legend groups/colours: both share the Adiabatic boundary
     condition, but a party wall abuts the neighbour building (its outer face sees
     outdoor air) whereas an adiabatic wall is a purely internal partition.
     """
-    import plotly.graph_objects as go
+    import html as _html
+    import json
 
     if isinstance(idf, str):
         IDF = _ensure_idd()
@@ -5446,53 +5731,41 @@ def plot_idf_geometry(idf, output_path=None, show=False, opacity=0.8,
     # Stable fallback palette for categories not in _IDF_VIEW_COLORS.
     _fallback = ["#8dd3c7", "#fb8072", "#80b1d3", "#fdb462", "#b3de69",
                  "#bc80bd", "#ffed6f", "#fccde5", "#d9d9d9"]
-    traces = []
+    categories = []
     for ci, (cat, polys) in enumerate(polys_by_cat.items()):
         if not polys:
             continue
-        color = _IDF_VIEW_COLORS.get(cat, _fallback[ci % len(_fallback)])
-        # ---- filled surfaces: one Mesh3d per category (fan-triangulated) ----
-        xs, ys, zs, i, j, k = [], [], [], [], [], []
-        ex, ey, ez = [], [], []           # edge polylines (None-separated)
+        # One fan-triangulated mesh + one outline set per category.
+        positions, indices, edges = [], [], []
         for poly in polys:
-            base = len(xs)
+            base = len(positions) // 3
             for (x, y, z) in poly:
-                xs.append(x); ys.append(y); zs.append(z)
+                positions += [round(x, 3), round(y, 3), round(z, 3)]
             for t in range(1, len(poly) - 1):
-                i.append(base); j.append(base + t); k.append(base + t + 1)
-            for (x, y, z) in poly + [poly[0]]:
-                ex.append(x); ey.append(y); ez.append(z)
-            ex.append(None); ey.append(None); ez.append(None)
+                indices += [base, base + t, base + t + 1]
+            for a, b in zip(poly, poly[1:] + poly[:1]):
+                edges += [round(v, 3) for v in (*a, *b)]
         # Neighbour shading is context — render it much more transparent than the
-        # building surfaces so it never competes with them.
-        is_shading = cat == "Shading"
-        cat_opacity = shading_opacity if is_shading else opacity
-        traces.append(go.Mesh3d(
-            x=xs, y=ys, z=zs, i=i, j=j, k=k,
-            color=color, opacity=cat_opacity, flatshading=True,
-            name=cat, legendgroup=cat, showlegend=True,
-            hoverinfo="name"))
-        # ---- crisp edges: one Scatter3d per category, shares its legend group -
-        edge_col = "rgba(80,80,80,0.25)" if is_shading else "rgba(40,40,40,0.6)"
-        traces.append(go.Scatter3d(
-            x=ex, y=ey, z=ez, mode="lines",
-            line=dict(color=edge_col, width=1 if is_shading else 2),
-            legendgroup=cat, showlegend=False, hoverinfo="skip"))
+        # building surfaces so it never competes with them. The building's own
+        # shading (reveals, balconies, awnings) is drawn like the building.
+        is_shading = cat == "Shading: neighbours"
+        categories.append({
+            "name": cat,
+            "color": _IDF_VIEW_COLORS.get(cat, _fallback[ci % len(_fallback)]),
+            "opacity": float(shading_opacity if is_shading else opacity),
+            "edge_opacity": 0.25 if is_shading else 0.6,
+            "context": is_shading,
+            "count": len(polys),
+            "positions": positions, "indices": indices, "edges": edges,
+        })
 
-    fig = go.Figure(data=traces)
-    # True 1:1:1 metre scale (aspectmode='data') like plot_building_3d_geometry.
-    fig.update_layout(
-        title=title,
-        scene=dict(
-            xaxis=dict(title="x (m)"),
-            yaxis=dict(title="y (m)"),
-            zaxis=dict(title="Height (m)"),
-            aspectmode="data",
-            camera=dict(eye=dict(x=1.5, y=-1.5, z=1.0)),
-        ),
-        legend=dict(title="Surface", x=0.01, y=0.99),
-        margin=dict(l=0, r=0, b=40, t=40),
-    )
+    # "</" is escaped so the JSON can't close its <script> block early.
+    data = json.dumps({"title": title, "categories": categories},
+                      separators=(",", ":")).replace("</", "<\\/")
+    page = (_IDF_VIEW_HTML
+            .replace("__TITLE__", _html.escape(title or "IDF geometry"))
+            .replace("__V__", _THREEJS_VERSION)
+            .replace("__DATA__", data))
 
     if output_path:
         ext = output_path.rsplit(".", 1)[-1].lower() if "." in output_path else ""
@@ -5500,11 +5773,13 @@ def plot_idf_geometry(idf, output_path=None, show=False, opacity=0.8,
             output_path = (output_path.rsplit(".", 1)[0] + ".html"
                            if "." in output_path else output_path + ".html")
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        fig.write_html(output_path)
+        with open(output_path, "w", encoding="utf-8") as fh:
+            fh.write(page)
         print(f"IDF geometry plot saved to {output_path}")
-    elif show:
-        fig.show()
-    return fig
+    view = IDFGeometryView(page, output_path or None)
+    if show and not output_path:
+        view.show()
+    return view
 
 
 # =========================================================================== #
